@@ -1,0 +1,89 @@
+@import "tailwindcss";
+
+@layer utilities {
+  @media print {
+    /* Set page margins and colors */
+    @page {
+      size: auto;
+      margin: 5mm;
+    }
+
+    /* Force background colors and exact print rendering */
+    html, body {
+      background-color: #ffffff !important;
+      color: #000000 !important;
+      -webkit-print-color-adjust: exact !important;
+      print-color-adjust: exact !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      width: 100% !important;
+      height: auto !important;
+      overflow: visible !important;
+    }
+
+    /* Hide non-printable interface controls */
+    .no-print,
+    header,
+    footer,
+    nav,
+    aside,
+    button:not(.print-keep),
+    .sidebar,
+    .tab-bar,
+    input[type="file"],
+    select {
+      display: none !important;
+    }
+
+    .print\:block {
+      display: block !important;
+    }
+
+    /* Make printable area crisp, scalable, and centered */
+    .printable-area,
+    .print-container,
+    [id^="print-area-"] {
+      display: block !important;
+      width: 100% !important;
+      max-width: 100% !important;
+      margin: 0 auto !important;
+      padding: 0 !important;
+      border: none !important;
+      box-shadow: none !important;
+      background: #ffffff !important;
+      box-sizing: border-box !important;
+    }
+
+    table {
+      width: 100% !important;
+      border-collapse: collapse !important;
+      page-break-inside: auto;
+    }
+
+    tr {
+      page-break-inside: avoid;
+      page-break-after: auto;
+    }
+
+    thead {
+      display: table-header-group;
+    }
+
+    tfoot {
+      display: table-footer-group;
+    }
+
+    th, td {
+      border: 1px solid #94a3b8 !important;
+      word-wrap: break-word !important;
+    }
+
+    input {
+      border: none !important;
+      background: transparent !important;
+      box-shadow: none !important;
+      outline: none !important;
+    }
+  }
+}
+
