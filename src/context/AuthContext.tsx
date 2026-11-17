@@ -28,11 +28,42 @@ import {
 } from "../lib/firebase.ts";
 import { clearDriveSession, getIsDriveConnecting } from "../lib/googleDrive.ts";
 import {
+  clearSheetsSession,
+  getIsSheetsConnecting,
+  loadGlobalSheetSyncConfig,
+} from "../lib/googleSheetsSync.ts";
+import {
   buildDeviceRecord,
   formatDeviceShortLabel,
   syncDeviceToFirestore,
   toCompactDeviceSummary,
 } from "../lib/deviceTracker.ts";
+
+const lookupEmailInLinkedSpreadsheet = async (email: string): Promise<Record<string, any> | null> => {
+  const cleanEmail = (email || "").toLowerCase().trim();
+  if (!cleanEmail) return null;
+  try {
+    // Ensure server relay knows global spreadsheet config (in case server just restarted)
+    await loadGlobalSheetSyncConfig().catch(() => null);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(
+      `/api/sheets/lookup-email?email=${encodeURIComponent(cleanEmail)}`,
+      {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data?.found && data?.sheetUser) {
+      return data.sheetUser;
+    }
+  } catch {}
+  return null;
+};
 
 // Quota protection: deduplicate identical state writes so opening/refreshing never burns Firestore write units
 const lastSyncedCloudPayload = new Map<string, string>();
@@ -446,18 +477,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     try {
-      // Check Firestore (by UID), Real-Time Hub (by UID/email), and legacy custom_user doc (by email)
+      // Check Firestore (by UID), Real-Time Hub (by UID/email), linked Google Spreadsheet, and pre-registered docs
       const emailSlug = lowerEmail.replace(/[@.]/g, "_");
+      const sheetSlug = lowerEmail.replace(/[^a-z0-9]/g, "_");
       const legacyUid = emailSlug ? `custom_user_${emailSlug}` : "";
+      const sheetDocUid = sheetSlug ? `sheet_user_${sheetSlug}` : "";
 
-      const [uidSnap, hubUser] = await Promise.all([
+      const [uidSnap, hubUser, sheetUser] = await Promise.all([
         fetchWithTimeout(getDoc(userRef), 3500, null).catch(() => null),
         fetchUserFromRealtimeHub(lowerEmail, currentUser.uid).catch(() => null),
+        lookupEmailInLinkedSpreadsheet(lowerEmail).catch(() => null),
       ]);
 
       let firestoreData: any = uidSnap && uidSnap.exists() ? uidSnap.data() : null;
 
-      // Migrate seamlessly if the user had an existing pre-Google record under custom_user_<slug>
+      // Migrate seamlessly if pre-registered via Spreadsheet (sheet_user_<slug>) or legacy custom_user_<slug>
+      if (!firestoreData && !hubUser && sheetDocUid) {
+        try {
+          const sheetSnap: any = await fetchWithTimeout(getDoc(doc(db, "users", sheetDocUid)), 2500, null);
+          if (sheetSnap && sheetSnap.exists()) {
+            firestoreData = sheetSnap.data();
+          }
+        } catch {}
+      }
       if (!firestoreData && !hubUser && legacyUid) {
         try {
           const legacySnap: any = await fetchWithTimeout(getDoc(doc(db, "users", legacyUid)), 2500, null);
@@ -492,8 +534,38 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         } catch {}
       }
 
+      // Apply automatic registration / approval if email exists directly in the linked Google Spreadsheet
+      const isFromSpreadsheet = Boolean(sheetUser);
+      if (sheetUser) {
+        if (!resolvedProfile) {
+          resolvedProfile = {
+            ...sheetUser,
+            registeredViaSpreadsheet: true,
+            sumber: sheetUser.sumber || "Spreadsheet",
+          };
+        } else {
+          // Fill missing identity fields from Spreadsheet and promote menunggu -> aktif if Spreadsheet grants aktif
+          const shouldPromoteFromSheet =
+            resolvedProfile.statusPersetujuan === "menunggu" && sheetUser.statusPersetujuan === "aktif";
+          resolvedProfile = {
+            ...resolvedProfile,
+            namaLengkap: resolvedProfile.namaLengkap || sheetUser.namaLengkap,
+            profesi: resolvedProfile.profesi || sheetUser.profesi,
+            namaSPPG: resolvedProfile.namaSPPG || sheetUser.namaSPPG,
+            noHp: resolvedProfile.noHp || sheetUser.noHp,
+            berakhirPada: resolvedProfile.berakhirPada || sheetUser.berakhirPada,
+            statusPersetujuan: shouldPromoteFromSheet
+              ? "aktif"
+              : resolvedProfile.statusPersetujuan || sheetUser.statusPersetujuan,
+            registeredViaSpreadsheet: true,
+            sumber: resolvedProfile.sumber || "Spreadsheet",
+          };
+        }
+      }
+
       const isNewTenant = !resolvedProfile;
-      // Strict security: new tenants ALWAYS start as peran: "USER" and statusPersetujuan: "menunggu" (awaiting Odhe Gizi ACC)
+      // Strict security: new tenants ALWAYS start as peran: "USER" (no Panel Admin) and statusPersetujuan: "menunggu"
+      // unless explicitly added directly by Admin in the linked Google Spreadsheet.
       const resolvedRole = !isNewTenant && resolvedProfile.peran === "ADMIN" ? "ADMIN" : "USER";
       const resolvedStatus = isNewTenant
         ? "menunggu"
@@ -531,6 +603,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         statusPersetujuan: resolvedStatus,
         authProvider: "google",
         emailVerified: true,
+        registeredViaSpreadsheet: Boolean(isFromSpreadsheet || resolvedProfile?.registeredViaSpreadsheet),
+        sumber: resolvedProfile?.sumber || (isFromSpreadsheet ? "Spreadsheet" : "Login Google"),
         berakhirPada: resolvedProfile?.berakhirPada || getDefaultExpirationDate(),
         lastDevice: compactDev,
         lastDeviceLabel: formatDeviceShortLabel(compactDev),
@@ -673,7 +747,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-        if (getIsDriveConnecting()) {
+        if (getIsDriveConnecting() || getIsSheetsConnecting()) {
           return;
         }
         if (localStorage.getItem("custom_logged_in_uid") === DEMO_UID) {
@@ -684,6 +758,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           setUser(currentUser);
           await fetchUserProfile(currentUser);
         } else {
+          clearDriveSession();
+          clearSheetsSession();
           updateSession(null, null);
         }
         setLoading(false);
@@ -1054,6 +1130,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       setLoading(true);
       clearDriveSession();
+      clearSheetsSession();
       localStorage.removeItem(DEMO_EXPIRES_KEY);
       localStorage.removeItem("simulated_user_email");
       localStorage.removeItem("custom_logged_in_uid");
@@ -2016,9 +2093,10 @@ const removeDeletedTenantEmail = (email: string) => {
     if (!activeUid || activeUid === DEMO_UID) return userProfile;
 
     try {
-      const [snap, hubUser] = await Promise.all([
+      const [snap, hubUser, sheetUser] = await Promise.all([
         fetchWithTimeout(getDoc(doc(db, "users", activeUid)), 3500, null).catch(() => null),
         fetchUserFromRealtimeHub(activeEmail, activeUid).catch(() => null),
+        lookupEmailInLinkedSpreadsheet(activeEmail).catch(() => null),
       ]);
 
       const fsData = snap && snap.exists() ? snap.data() : null;
@@ -2029,6 +2107,33 @@ const removeDeletedTenantEmail = (email: string) => {
         latest = hubMs >= fsMs ? { ...fsData, ...hubUser } : { ...hubUser, ...fsData };
       } else {
         latest = hubUser || fsData;
+      }
+
+      // If email was just added/approved directly in the linked Google Spreadsheet, unlock immediately
+      if (sheetUser) {
+        const currentStatus = latest?.statusPersetujuan || userProfile?.statusPersetujuan || "menunggu";
+        if (!latest || (currentStatus === "menunggu" && sheetUser.statusPersetujuan === "aktif")) {
+          latest = {
+            ...(latest || {}),
+            ...sheetUser,
+            uid: activeUid,
+            id: activeUid,
+            email: activeEmail || sheetUser.email,
+            peran: latest?.peran === "ADMIN" ? "ADMIN" : sheetUser.peran || "USER",
+            statusPersetujuan: sheetUser.statusPersetujuan,
+            registeredViaSpreadsheet: true,
+            sumber: latest?.sumber || "Spreadsheet",
+            updatedAt: new Date().toISOString(),
+          };
+          syncUserToRealtimeHub(latest).catch(() => {});
+          fetchWithTimeout(
+            setDoc(doc(db, "users", activeUid), { ...latest, updatedAt: serverTimestamp() }, { merge: true })
+              .then(() => reportFirestoreWriteResult(true))
+              .catch((err) => reportFirestoreWriteResult(false, err)),
+            2500,
+            null
+          );
+        }
       }
 
       if (latest) {

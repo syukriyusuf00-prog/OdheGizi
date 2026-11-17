@@ -58,6 +58,7 @@ import {
   ExternalLink
 } from "lucide-react";
 import { DeviceRecord, getCachedLocalDevice, formatDeviceShortLabel } from "../lib/deviceTracker.ts";
+import SpreadsheetUserSyncCard from "./SpreadsheetUserSyncCard.tsx";
 
 interface AdminPanelProps {
   onClose: () => void;
@@ -239,9 +240,13 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         }
 
         const existing = existingKey ? map.get(existingKey) : null;
-        // Prefer real Firebase Auth UID over legacy custom_user_* key when merging same email
-        const incomingIsRealUid = Boolean(primaryKey && !primaryKey.startsWith("custom_user_"));
-        const existingIsLegacyUid = Boolean(existingKey && existingKey.startsWith("custom_user_"));
+        // Prefer real Firebase Auth UID over legacy custom_user_* or pre-registered sheet_user_* key when merging same email
+        const incomingIsRealUid = Boolean(
+          primaryKey && !primaryKey.startsWith("custom_user_") && !primaryKey.startsWith("sheet_user_")
+        );
+        const existingIsLegacyUid = Boolean(
+          existingKey && (existingKey.startsWith("custom_user_") || existingKey.startsWith("sheet_user_"))
+        );
         const keyToUse =
           existingKey && existingIsLegacyUid && incomingIsRealUid && primaryKey
             ? primaryKey
@@ -1095,6 +1100,45 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
     }
   };
 
+  const handleUsersImportedFromSheet = (importedUsers: any[]) => {
+    if (!Array.isArray(importedUsers) || importedUsers.length === 0) return;
+    importedUsers.forEach((u) => {
+      const uid = u?.uid || u?.id;
+      const em = (u?.email || "").toLowerCase().trim();
+      if (em) removeDeletedTenantEmail(em);
+      if (uid) hubUsersRef.current.set(uid, u);
+    });
+    setUsers((prev) => {
+      const byEmail = new Map<string, any>();
+      prev.forEach((u) => {
+        const em = (u.email || "").toLowerCase().trim();
+        if (em) byEmail.set(em, u);
+      });
+      importedUsers.forEach((u) => {
+        const em = (u.email || "").toLowerCase().trim();
+        if (!em || isMainAdminEmail(em)) return;
+        const existing = byEmail.get(em);
+        if (existing) {
+          byEmail.set(em, {
+            ...existing,
+            ...u,
+            uid:
+              existing.uid && !existing.uid.startsWith("sheet_user_") && !existing.uid.startsWith("custom_user_")
+                ? existing.uid
+                : u.uid,
+            id:
+              existing.uid && !existing.uid.startsWith("sheet_user_") && !existing.uid.startsWith("custom_user_")
+                ? existing.uid
+                : u.uid,
+          });
+        } else {
+          byEmail.set(em, u);
+        }
+      });
+      return Array.from(byEmail.values());
+    });
+  };
+
   // Filter users by search query
   const filteredUsers = users.filter((u) => {
     const q = searchQuery.toLowerCase();
@@ -1280,6 +1324,12 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
           </label>
         </div>
       )}
+
+      {/* Bidirectional Google Sheets User Synchronization Hub */}
+      <SpreadsheetUserSyncCard
+        users={users}
+        onUsersImportedFromSheet={handleUsersImportedFromSheet}
+      />
 
       {/* 4 Stats Cards matching Image 1 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

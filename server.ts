@@ -251,9 +251,36 @@ const sendVerificationEmail = async (params: {
   return { delivered: false, provider: "preview" };
 };
 
+interface ServerSheetSyncConfig {
+  sheetUrl: string;
+  spreadsheetId: string;
+  gid: string;
+  sheetTitle: string;
+  spreadsheetTitle: string;
+  updatedAt: string;
+  updatedBy?: string;
+}
+
+interface ServerSheetUserRow {
+  rowNumber: number;
+  email: string;
+  namaLengkap: string;
+  profesi: string;
+  namaSPPG: string;
+  noHp: string;
+  peran: "USER" | "ADMIN";
+  statusPersetujuan: "aktif" | "menunggu" | "diblokir";
+  berakhirPada: string;
+  loginTerakhir: string;
+  sumber: string;
+}
+
 const REALTIME_CACHE_FILE = path.join("/tmp", "sispermbg_realtime_hub_v1.json");
 const realtimeUsers = new Map<string, Record<string, any>>();
 const realtimeDevices = new Map<string, Record<string, any>>();
+const cachedSheetUsers = new Map<string, ServerSheetUserRow>();
+let sheetSyncConfig: ServerSheetSyncConfig | null = null;
+let lastPublicSheetFetchAt = 0;
 const sseClients = new Set<express.Response>();
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -276,6 +303,17 @@ const loadRealtimeCacheFromDisk = () => {
         }
       });
     }
+    if (parsed?.sheetSyncConfig && typeof parsed.sheetSyncConfig.spreadsheetId === "string") {
+      sheetSyncConfig = parsed.sheetSyncConfig;
+    }
+    if (Array.isArray(parsed?.cachedSheetUsers)) {
+      parsed.cachedSheetUsers.forEach((su: any) => {
+        const em = normalizeEmail(su?.email);
+        if (em && isValidEmail(em)) {
+          cachedSheetUsers.set(em, { ...su, email: em });
+        }
+      });
+    }
   } catch (err) {
     console.warn("[RealtimeHub] Notice loading cache:", err);
   }
@@ -290,12 +328,319 @@ const schedulePersistRealtimeCache = () => {
         updatedAt: new Date().toISOString(),
         users: Array.from(realtimeUsers.values()).slice(0, 500),
         devices: Array.from(realtimeDevices.values()).slice(0, 500),
+        sheetSyncConfig,
+        cachedSheetUsers: Array.from(cachedSheetUsers.values()).slice(0, 1000),
       };
       fs.writeFileSync(REALTIME_CACHE_FILE, JSON.stringify(payload), "utf8");
     } catch (err) {
       console.warn("[RealtimeHub] Notice writing cache:", err);
     }
   }, 300);
+};
+
+const parseCsvRows = (csvText: string): string[][] => {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < csvText.length; i++) {
+    const ch = csvText[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (csvText[i + 1] === '"') {
+          cell += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cell += ch;
+      }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (ch === "\r") {
+      if (csvText[i + 1] === "\n") i++;
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else if (ch === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += ch;
+    }
+  }
+  if (cell.length > 0 || row.length > 0) {
+    row.push(cell);
+    rows.push(row);
+  }
+  return rows;
+};
+
+const normalizeServerSheetStatus = (raw: unknown): "aktif" | "menunggu" | "diblokir" => {
+  const val = String(raw ?? "").trim().toLowerCase();
+  if (
+    val === "diblokir" ||
+    val === "blokir" ||
+    val === "blocked" ||
+    val === "nonaktif" ||
+    val === "non-aktif" ||
+    val === "ditolak" ||
+    val === "suspend" ||
+    val === "suspended"
+  ) {
+    return "diblokir";
+  }
+  if (
+    val === "menunggu" ||
+    val === "pending" ||
+    val === "wait" ||
+    val === "waiting" ||
+    val === "belum acc" ||
+    val === "belum disetujui"
+  ) {
+    return "menunggu";
+  }
+  return "aktif";
+};
+
+const getDefaultSheetExpDate = (): string => {
+  const d = new Date();
+  d.setFullYear(d.getFullYear() + 1);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+
+const parseSheetRowsOnServer = (rows: string[][]): ServerSheetUserRow[] => {
+  if (!Array.isArray(rows) || rows.length === 0) return [];
+  const firstRow = rows[0].map((c) => String(c ?? "").trim().toLowerCase());
+  const firstRowHasEmail = firstRow.some((c) => isValidEmail(c));
+
+  const findHeader = (patterns: RegExp[]): number => {
+    for (let i = 0; i < firstRow.length; i++) {
+      if (firstRow[i] && patterns.some((rx) => rx.test(firstRow[i]))) return i;
+    }
+    return -1;
+  };
+
+  let hasHeader = false;
+  let emailIdx = 0;
+  let namaIdx = 1;
+  let profesiIdx = 2;
+  let sppgIdx = 3;
+  let hpIdx = 4;
+  let peranIdx = 5;
+  let statusIdx = 6;
+  let berakhirIdx = 7;
+  let loginIdx = 8;
+  let sumberIdx = 9;
+
+  if (!firstRowHasEmail) {
+    const hEmail = findHeader([/\bemail\b/, /e-mail/, /gmail/, /alamat\s*email/, /\bakun\b/]);
+    const hNama = findHeader([/nama\s*lengkap/, /^nama$/, /nama\s*pengguna/, /full\s*name/, /^name$/]);
+    const hStatus = findHeader([/status/, /\bacc\b/, /persetujuan/, /approval/]);
+    if (hEmail >= 0 || hNama >= 0 || hStatus >= 0) {
+      hasHeader = true;
+      emailIdx = hEmail >= 0 ? hEmail : 0;
+      namaIdx = hNama >= 0 ? hNama : emailIdx === 0 ? 1 : 0;
+      profesiIdx = findHeader([/profesi/, /jabatan/, /pekerjaan/]);
+      sppgIdx = findHeader([/sppg/, /lembaga/, /instansi/, /dapur/, /unit/]);
+      hpIdx = findHeader([/no\.?\s*hp/, /^hp$/, /whatsapp/, /\bwa\b/, /telepon/, /phone/, /kontak/]);
+      peranIdx = findHeader([/^peran$/, /^role$/, /hak\s*akses/, /level/]);
+      statusIdx = hStatus;
+      berakhirIdx = findHeader([/berakhir/, /masa\s*aktif/, /expir/, /kadaluarsa/, /berlaku/]);
+      loginIdx = findHeader([/login\s*terakhir/, /last\s*login/, /terakhir\s*masuk/]);
+      sumberIdx = findHeader([/sumber/, /source/]);
+    }
+  }
+
+  if (!hasHeader) {
+    for (let r = 0; r < Math.min(rows.length, 15); r++) {
+      const idx = (rows[r] || []).findIndex((c) => isValidEmail(normalizeEmail(c)));
+      if (idx >= 0) {
+        emailIdx = idx;
+        namaIdx = idx === 0 ? 1 : 0;
+        break;
+      }
+    }
+  }
+
+  const startIdx = hasHeader ? 1 : 0;
+  const byEmail = new Map<string, ServerSheetUserRow>();
+
+  for (let i = startIdx; i < rows.length; i++) {
+    const row = rows[i] || [];
+    let email = normalizeEmail(row[emailIdx]);
+    if (!isValidEmail(email)) {
+      const fallbackCell = row.find((c) => isValidEmail(normalizeEmail(c)));
+      email = normalizeEmail(fallbackCell);
+    }
+    if (!isValidEmail(email)) continue;
+
+    const getVal = (colIdx: number) => (colIdx >= 0 && colIdx < row.length ? String(row[colIdx] ?? "").trim() : "");
+    const rawName = getVal(namaIdx);
+    const safeName =
+      rawName && normalizeEmail(rawName) !== email ? rawName : email.split("@")[0] || "Pengguna SISPERMBG";
+    const rawRole = getVal(peranIdx).toUpperCase();
+
+    byEmail.set(email, {
+      rowNumber: i + 1,
+      email,
+      namaLengkap: safeName.slice(0, 160),
+      profesi: (getVal(profesiIdx) || "Ahli Gizi / Pengelola SPPG").slice(0, 120),
+      namaSPPG: getVal(sppgIdx).slice(0, 160),
+      noHp: getVal(hpIdx).slice(0, 40),
+      peran: rawRole === "ADMIN" || rawRole === "ADMINISTRATOR" ? "ADMIN" : "USER",
+      statusPersetujuan: normalizeServerSheetStatus(getVal(statusIdx)),
+      berakhirPada: (getVal(berakhirIdx) || getDefaultSheetExpDate()).slice(0, 32),
+      loginTerakhir: getVal(loginIdx).slice(0, 64),
+      sumber: (getVal(sumberIdx) || "Spreadsheet").slice(0, 64),
+    });
+  }
+
+  return Array.from(byEmail.values());
+};
+
+const mergeSheetUsersIntoRealtimeHub = (sheetUsers: ServerSheetUserRow[]) => {
+  const nowIso = new Date().toISOString();
+  for (const su of sheetUsers) {
+    const email = normalizeEmail(su.email);
+    if (!isValidEmail(email)) continue;
+    cachedSheetUsers.set(email, su);
+
+    let existingKey = "";
+    let existingVal: Record<string, any> | null = null;
+    for (const [k, u] of realtimeUsers.entries()) {
+      if (normalizeEmail(u.email) === email) {
+        existingKey = k;
+        existingVal = u;
+        break;
+      }
+    }
+
+    if (existingVal && existingKey) {
+      // Preserve real Firebase UID; promote menunggu -> aktif if spreadsheet explicitly grants aktif
+      const mergedUser: Record<string, any> = {
+        ...existingVal,
+        namaLengkap: existingVal.namaLengkap || su.namaLengkap,
+        profesi: existingVal.profesi || su.profesi,
+        namaSPPG: existingVal.namaSPPG || su.namaSPPG,
+        noHp: existingVal.noHp || su.noHp,
+        berakhirPada: existingVal.berakhirPada || su.berakhirPada,
+        peran: existingVal.peran === "ADMIN" ? "ADMIN" : su.peran,
+        statusPersetujuan:
+          existingVal.statusPersetujuan === "menunggu" && su.statusPersetujuan === "aktif"
+            ? "aktif"
+            : existingVal.statusPersetujuan || su.statusPersetujuan,
+        registeredViaSpreadsheet: true,
+        sumber: existingVal.sumber || su.sumber || "Spreadsheet",
+        updatedAt: nowIso,
+      };
+      realtimeUsers.set(existingKey, mergedUser);
+      broadcastRealtimeEvent("user_upsert", mergedUser);
+    } else {
+      const sheetUid = `sheet_user_${email.replace(/[^a-z0-9]/g, "_")}`;
+      const createdUser: Record<string, any> = {
+        uid: sheetUid,
+        id: sheetUid,
+        email,
+        namaLengkap: su.namaLengkap,
+        profesi: su.profesi,
+        namaSPPG: su.namaSPPG,
+        noHp: su.noHp,
+        peran: su.peran,
+        statusPersetujuan: su.statusPersetujuan,
+        berakhirPada: su.berakhirPada,
+        authProvider: "google",
+        emailVerified: true,
+        registeredViaSpreadsheet: true,
+        sumber: su.sumber || "Spreadsheet",
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        loginTerakhir: su.loginTerakhir || null,
+      };
+      realtimeUsers.set(sheetUid, createdUser);
+      broadcastRealtimeEvent("user_upsert", createdUser);
+    }
+  }
+  schedulePersistRealtimeCache();
+};
+
+const fetchPublicGoogleSheetUsers = async (params: {
+  spreadsheetId: string;
+  gid?: string;
+  sheetTitle?: string;
+}): Promise<{
+  ok: boolean;
+  users: ServerSheetUserRow[];
+  requiresOAuth?: boolean;
+  error?: string;
+}> => {
+  const spreadsheetId = clampField(params.spreadsheetId, 128);
+  if (!spreadsheetId || !/^[a-zA-Z0-9_-]+$/.test(spreadsheetId)) {
+    return { ok: false, users: [], error: "ID Spreadsheet tidak valid." };
+  }
+
+  const query = new URLSearchParams({ tqx: "out:csv" });
+  if (params.sheetTitle) {
+    query.set("sheet", params.sheetTitle);
+  } else if (params.gid) {
+    query.set("gid", params.gid);
+  }
+
+  const csvUrl = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(
+    spreadsheetId
+  )}/gviz/tq?${query.toString()}`;
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 7000);
+    const res = await fetch(csvUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    const contentType = (res.headers.get("content-type") || "").toLowerCase();
+    const text = await res.text();
+
+    // Private sheets redirect to Google login HTML page instead of returning CSV
+    if (
+      !res.ok ||
+      contentType.includes("text/html") ||
+      text.trim().startsWith("<!DOCTYPE") ||
+      text.trim().startsWith("<html")
+    ) {
+      return {
+        ok: false,
+        users: [],
+        requiresOAuth: true,
+        error:
+          "Spreadsheet bersifat privat. Hubungkan Google Sheets di Panel Admin atau ubah izin berbagi spreadsheet menjadi 'Siapa saja yang memiliki link dapat melihat'.",
+      };
+    }
+
+    const parsedRows = parseCsvRows(text);
+    const users = parseSheetRowsOnServer(parsedRows);
+    lastPublicSheetFetchAt = Date.now();
+    if (users.length > 0) {
+      mergeSheetUsersIntoRealtimeHub(users);
+    }
+    return { ok: true, users };
+  } catch (err: any) {
+    return {
+      ok: false,
+      users: [],
+      error: err?.message || "Gagal mengambil data spreadsheet.",
+    };
+  }
 };
 
 const broadcastRealtimeEvent = (eventType: string, payload: unknown) => {
@@ -353,6 +698,11 @@ const sanitizeRealtimeUser = (raw: Record<string, any>): Record<string, any> | n
     statusPersetujuan: clampField(raw.statusPersetujuan ?? prev.statusPersetujuan ?? "menunggu", 32) || "menunggu",
     berakhirPada: clampField(raw.berakhirPada ?? prev.berakhirPada ?? "", 32),
     authProvider: clampField(raw.authProvider ?? prev.authProvider ?? "", 32) || undefined,
+    sumber: clampField(raw.sumber ?? prev.sumber ?? "", 64) || undefined,
+    registeredViaSpreadsheet:
+      typeof raw.registeredViaSpreadsheet === "boolean"
+        ? raw.registeredViaSpreadsheet
+        : Boolean(prev.registeredViaSpreadsheet),
     emailVerified: typeof raw.emailVerified === "boolean" ? raw.emailVerified : Boolean(prev.emailVerified),
     verificationStatus: clampField(raw.verificationStatus ?? prev.verificationStatus ?? "", 32) || undefined,
     emailVerifiedAt: clampField(raw.emailVerifiedAt ?? prev.emailVerifiedAt ?? "", 64) || undefined,
@@ -523,12 +873,17 @@ async function startServer() {
       res.status(400).json({ ok: false, error: "Data pengguna tidak valid." });
       return;
     }
-    // Remove duplicate keys with same email so a Google Firebase UID replaces legacy custom_user_* cleanly
+    // Remove duplicate keys with same email so a Google Firebase UID replaces legacy custom_user_* or sheet_user_* cleanly
     const targetEmail = normalizeEmail(sanitized.email);
-    const isRealFirebaseUid = !sanitized.uid.startsWith("custom_user_");
+    const isRealFirebaseUid =
+      !sanitized.uid.startsWith("custom_user_") && !sanitized.uid.startsWith("sheet_user_");
     for (const [existingKey, existingVal] of realtimeUsers.entries()) {
       if (existingKey !== sanitized.uid && normalizeEmail(existingVal.email) === targetEmail) {
-        if (isRealFirebaseUid || existingKey.startsWith("custom_user_")) {
+        if (
+          isRealFirebaseUid ||
+          existingKey.startsWith("custom_user_") ||
+          existingKey.startsWith("sheet_user_")
+        ) {
           realtimeUsers.delete(existingKey);
         }
       }
@@ -549,6 +904,9 @@ async function startServer() {
         realtimeUsers.delete(k);
         removedUids.push(k);
       }
+    }
+    if (email) {
+      cachedSheetUsers.delete(email);
     }
     schedulePersistRealtimeCache();
     broadcastRealtimeEvent("user_delete", { uid, email, removedUids });
@@ -578,6 +936,111 @@ async function startServer() {
       broadcastRealtimeEvent("device_delete", { deviceId });
     }
     res.json({ ok: true, deviceId });
+  });
+
+  // 1c. Google Sheets Bidirectional User Sync Config & Live Lookup Routes
+  app.get("/api/realtime/sheet-config", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      ok: true,
+      config: sheetSyncConfig,
+      cachedSheetUsersCount: cachedSheetUsers.size,
+      serverTime: new Date().toISOString(),
+    });
+  });
+
+  app.post("/api/realtime/sheet-config", (req, res) => {
+    const body = parseJsonBodySafe(req.body);
+    const spreadsheetId = clampField(body.spreadsheetId, 128);
+    if (!spreadsheetId || !/^[a-zA-Z0-9_-]+$/.test(spreadsheetId)) {
+      res.status(400).json({ ok: false, error: "ID Google Spreadsheet tidak valid." });
+      return;
+    }
+    sheetSyncConfig = {
+      sheetUrl: clampField(body.sheetUrl, 512) || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+      spreadsheetId,
+      gid: clampField(body.gid, 40),
+      sheetTitle: clampField(body.sheetTitle, 120),
+      spreadsheetTitle: clampField(body.spreadsheetTitle, 200),
+      updatedAt: new Date().toISOString(),
+      updatedBy: clampField(body.updatedBy, 160) || undefined,
+    };
+    lastPublicSheetFetchAt = 0; // Force fresh lookup on next login
+    schedulePersistRealtimeCache();
+    broadcastRealtimeEvent("sheet_config_update", sheetSyncConfig);
+    res.json({ ok: true, config: sheetSyncConfig });
+  });
+
+  app.post("/api/realtime/sheet-users-cache", (req, res) => {
+    const body = parseJsonBodySafe(req.body);
+    const incomingUsers = Array.isArray(body.users) ? body.users : [];
+    const normalized: ServerSheetUserRow[] = [];
+    for (const item of incomingUsers) {
+      const email = normalizeEmail(item?.email);
+      if (!isValidEmail(email)) continue;
+      normalized.push({
+        rowNumber: Number(item?.rowNumber) || 0,
+        email,
+        namaLengkap: clampField(item?.namaLengkap, 160) || email.split("@")[0] || "Pengguna SISPERMBG",
+        profesi: clampField(item?.profesi, 120) || "Ahli Gizi / Pengelola SPPG",
+        namaSPPG: clampField(item?.namaSPPG, 160),
+        noHp: clampField(item?.noHp, 40),
+        peran: String(item?.peran || "").toUpperCase() === "ADMIN" ? "ADMIN" : "USER",
+        statusPersetujuan: normalizeServerSheetStatus(item?.statusPersetujuan),
+        berakhirPada: clampField(item?.berakhirPada, 32) || getDefaultSheetExpDate(),
+        loginTerakhir: clampField(item?.loginTerakhir, 64),
+        sumber: clampField(item?.sumber, 64) || "Spreadsheet",
+      });
+    }
+    if (normalized.length > 0) {
+      mergeSheetUsersIntoRealtimeHub(normalized);
+    }
+    res.json({ ok: true, cachedCount: normalized.length, totalCached: cachedSheetUsers.size });
+  });
+
+  app.get("/api/sheets/read-public", async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const spreadsheetId = clampField(req.query.spreadsheetId, 128) || sheetSyncConfig?.spreadsheetId || "";
+    const gid = clampField(req.query.gid, 40) || sheetSyncConfig?.gid || "";
+    const sheetTitle = clampField(req.query.sheetTitle, 120) || sheetSyncConfig?.sheetTitle || "";
+
+    if (!spreadsheetId) {
+      res.status(400).json({ ok: false, error: "Link Google Spreadsheet belum dikonfigurasi." });
+      return;
+    }
+
+    const result = await fetchPublicGoogleSheetUsers({ spreadsheetId, gid, sheetTitle });
+    res.json({
+      ...result,
+      rowCount: result.users.length,
+      serverTime: new Date().toISOString(),
+    });
+  });
+
+  app.get("/api/sheets/lookup-email", async (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const email = normalizeEmail(req.query.email);
+    if (!isValidEmail(email)) {
+      res.status(400).json({ ok: false, found: false, error: "Email tidak valid." });
+      return;
+    }
+
+    // Refresh live from public/shared Google Sheet (throttled to every 15s) so newly added spreadsheet emails take effect immediately
+    if (sheetSyncConfig?.spreadsheetId && Date.now() - lastPublicSheetFetchAt > 15_000) {
+      await fetchPublicGoogleSheetUsers({
+        spreadsheetId: sheetSyncConfig.spreadsheetId,
+        gid: sheetSyncConfig.gid,
+        sheetTitle: sheetSyncConfig.sheetTitle,
+      }).catch(() => {});
+    }
+
+    const match = cachedSheetUsers.get(email) || null;
+    res.json({
+      ok: true,
+      found: Boolean(match),
+      sheetUser: match,
+      hasLinkedSpreadsheet: Boolean(sheetSyncConfig?.spreadsheetId),
+    });
   });
 
   // 2. Send 6-Digit Email Verification Code on Registration
