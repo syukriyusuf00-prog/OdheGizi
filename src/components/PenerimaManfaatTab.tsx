@@ -77,7 +77,7 @@ export default function PenerimaManfaatTab({
   setKopLine3 = () => {},
   kopLine4 = "Alamat : Jln. Poros Lagadi-Tondasi, Desa Ondoke, Kec. Sawerigadi, Kab. Muna Barat",
   setKopLine4 = () => {},
-  leftLogo = "/src/assets/images/logo_sppg_1782256222616.jpg",
+  leftLogo = "/assets/images/app_logo_sppg.png",
   setLeftLogo = () => {},
   rightLogo = "",
   setRightLogo = () => {},

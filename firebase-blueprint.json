@@ -57,9 +57,150 @@
           "type": "string",
           "format": "date-time",
           "description": "Timestamp of the user's last login."
+        },
+        "emailVerified": {
+          "type": "boolean",
+          "description": "Whether the user verified their email address via 6-digit OTP code."
+        },
+        "verificationStatus": {
+          "type": "string",
+          "enum": ["pending_otp", "verified"],
+          "description": "Email OTP verification status."
+        },
+        "emailVerifiedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp when email verification succeeded."
+        },
+        "activatedBy": {
+          "type": "string",
+          "description": "Activation method (email_otp or admin_manual)."
+        },
+        "lastDeviceId": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "ID of the last device used by this user."
+        },
+        "lastDeviceLabel": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Human-readable label of the user's last active device."
         }
       },
       "required": ["uid", "email"]
+    },
+    "DeviceSession": {
+      "title": "DeviceSession",
+      "description": "Tracks each connected device automatically in real time for Admin Panel visibility.",
+      "type": "object",
+      "properties": {
+        "deviceId": {
+          "type": "string",
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Unique persistent device identifier."
+        },
+        "deviceType": {
+          "type": "string",
+          "enum": ["Mobile", "Tablet", "Desktop / Laptop"],
+          "description": "Form factor of the connected device."
+        },
+        "deviceModel": {
+          "type": "string",
+          "maxLength": 100,
+          "description": "Detected hardware or platform model."
+        },
+        "osName": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Operating system name and version."
+        },
+        "browserName": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Browser name and major version."
+        },
+        "screenResolution": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Screen width x height."
+        },
+        "viewportSize": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Browser viewport width x height."
+        },
+        "language": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Browser language locale."
+        },
+        "timezone": {
+          "type": "string",
+          "maxLength": 80,
+          "description": "Device IANA timezone."
+        },
+        "ipAddress": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Network IP address observed by the server."
+        },
+        "userAgent": {
+          "type": "string",
+          "maxLength": 320,
+          "description": "Trimmed browser User-Agent string."
+        },
+        "sessionState": {
+          "type": "string",
+          "enum": ["guest", "registering", "active", "demo"],
+          "description": "Current session state of the device."
+        },
+        "userUid": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Associated user UID if signed in or registering."
+        },
+        "userEmail": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "Associated user email if signed in or registering."
+        },
+        "userName": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Associated user full name."
+        },
+        "namaSPPG": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Associated SPPG name."
+        },
+        "peran": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Role of the user on this device."
+        },
+        "statusPersetujuan": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Approval status of the user on this device."
+        },
+        "isOnline": {
+          "type": "boolean",
+          "description": "Whether the device is currently active."
+        },
+        "firstSeenAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "First time this device accessed the application."
+        },
+        "lastSeenAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Most recent heartbeat timestamp."
+        }
+      },
+      "required": ["deviceId", "deviceType", "osName", "browserName", "sessionState", "lastSeenAt"]
     },
     "AppState": {
       "title": "AppState",
@@ -95,6 +236,14 @@
     "/users/{userId}/states/{stateKey}": {
       "schema": "AppState",
       "description": "Sub-collection storing serialized application states to prevent cache clear losses."
+    },
+    "/users/{userId}/devices/{deviceId}": {
+      "schema": "DeviceSession",
+      "description": "Sub-collection tracking all devices linked to a specific user."
+    },
+    "/devices/{deviceId}": {
+      "schema": "DeviceSession",
+      "description": "Top-level real-time device registry read automatically by Admin Panel."
     }
   }
 }

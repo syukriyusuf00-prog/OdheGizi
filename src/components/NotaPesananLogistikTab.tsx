@@ -142,7 +142,7 @@ export default function NotaPesananLogistikTab({
   paperSize = "A4",
   setPaperSize = () => {},
 }: NotaPesananLogistikTabProps) {
-  const logoSrc = leftLogo || rightLogo || localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || "/src/assets/images/logo_sppg_1782256222616.jpg";
+  const logoSrc = leftLogo || localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || "/assets/images/app_logo_sppg.png";
 
   const totalDays = Math.max(profile?.periodeDates?.length || 10, 1);
 
@@ -1834,7 +1834,7 @@ export default function NotaPesananLogistikTab({
                     setLogoLeftOffsetX(0);
                     setLogoLeftOffsetY(0);
                     setLogoLeftWidth(80);
-                    setLogoLeft("/src/assets/images/logo_sppg_1782256222616.jpg");
+                    setLogoLeft("/assets/images/app_logo_sppg.png");
                   }}
                   className="w-full py-1 text-slate-500 hover:text-slate-800 bg-slate-100 hover:bg-slate-200 rounded transition font-bold text-[10px]"
                 >
@@ -2178,7 +2178,7 @@ export default function NotaPesananLogistikTab({
                       }}
                       referrerPolicy="no-referrer"
                       onError={(e) => {
-                        (e.target as HTMLImageElement).src = "/src/assets/images/logo_sppg_1782256222616.jpg";
+                        (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
                       }}
                     />
                   </div>

@@ -44,6 +44,40 @@ service cloud.firestore {
       return userId == 'admin_sukriyusuf82' || userId == 'admin_syukriyusuf82' || userId == 'syukriyusuf82_simulated_uid' || userId.matches('^custom_user_.*') || userId.matches('^admin_.*');
     }
 
+    function isValidDevicePayload(deviceId, data) {
+      return isValidId(deviceId)
+        && data.keys().hasAll(['deviceId', 'deviceType', 'osName', 'browserName', 'sessionState', 'lastSeenAt'])
+        && data.keys().hasOnly([
+          'deviceId', 'deviceType', 'deviceModel', 'osName', 'browserName',
+          'screenResolution', 'viewportSize', 'language', 'timezone', 'ipAddress',
+          'userAgent', 'sessionState', 'userUid', 'userEmail', 'userName',
+          'namaSPPG', 'peran', 'statusPersetujuan', 'isOnline', 'firstSeenAt',
+          'lastSeenAt', 'updatedAt'
+        ])
+        && data.deviceId == deviceId
+        && data.deviceId is string && data.deviceId.size() <= 64
+        && data.deviceType is string && data.deviceType in ['Mobile', 'Tablet', 'Desktop / Laptop']
+        && data.osName is string && data.osName.size() <= 80
+        && data.browserName is string && data.browserName.size() <= 80
+        && data.sessionState is string && data.sessionState in ['guest', 'registering', 'active', 'demo']
+        && data.lastSeenAt is string && data.lastSeenAt.size() <= 64
+        && (!('deviceModel' in data) || (data.deviceModel is string && data.deviceModel.size() <= 100))
+        && (!('screenResolution' in data) || (data.screenResolution is string && data.screenResolution.size() <= 40))
+        && (!('viewportSize' in data) || (data.viewportSize is string && data.viewportSize.size() <= 40))
+        && (!('language' in data) || (data.language is string && data.language.size() <= 32))
+        && (!('timezone' in data) || (data.timezone is string && data.timezone.size() <= 80))
+        && (!('ipAddress' in data) || (data.ipAddress is string && data.ipAddress.size() <= 64))
+        && (!('userAgent' in data) || (data.userAgent is string && data.userAgent.size() <= 320))
+        && (!('userUid' in data) || data.userUid == null || (data.userUid is string && data.userUid.size() <= 128))
+        && (!('userEmail' in data) || data.userEmail == null || (data.userEmail is string && data.userEmail.size() <= 256))
+        && (!('userName' in data) || data.userName == null || (data.userName is string && data.userName.size() <= 160))
+        && (!('namaSPPG' in data) || data.namaSPPG == null || (data.namaSPPG is string && data.namaSPPG.size() <= 160))
+        && (!('peran' in data) || data.peran == null || (data.peran is string && data.peran.size() <= 32))
+        && (!('statusPersetujuan' in data) || data.statusPersetujuan == null || (data.statusPersetujuan is string && data.statusPersetujuan.size() <= 32))
+        && (!('isOnline' in data) || data.isOnline is bool)
+        && (!('firstSeenAt' in data) || (data.firstSeenAt is string && data.firstSeenAt.size() <= 64));
+    }
+
     // 4. Global configurations and settings collection (e.g. global logo, global TKPI)
     match /configs/{configId} {
       allow read, write: if true;
@@ -53,7 +87,15 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
-    // 5. User accounts and state slices
+    // 5. Real-time device registry read automatically by Panel Admin
+    match /devices/{deviceId} {
+      allow get: if isValidId(deviceId);
+      allow list: if true;
+      allow create, update: if isValidId(deviceId) && isValidDevicePayload(deviceId, incoming());
+      allow delete: if isValidId(deviceId);
+    }
+
+    // 6. User accounts and state slices
     match /users/{userId} {
       allow read, write: if true;
 

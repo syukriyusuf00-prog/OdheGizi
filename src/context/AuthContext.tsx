@@ -18,19 +18,30 @@ import {
 } from "firebase/firestore";
 import { auth, googleAuthProvider, db, handleFirestoreError, OperationType } from "../lib/firebase.ts";
 import { clearDriveSession, getIsDriveConnecting } from "../lib/googleDrive.ts";
+import {
+  buildDeviceRecord,
+  formatDeviceShortLabel,
+  syncDeviceToFirestore,
+  toCompactDeviceSummary,
+} from "../lib/deviceTracker.ts";
 
 const DEMO_DURATION_MS = 5 * 60 * 1000;
 const DEMO_UID = "demo_user_5min";
 const DEMO_EMAIL = "demo@sispermbg.id";
 const DEMO_EXPIRES_KEY = "sisper_demo_expires_at";
+export const PENDING_OTP_STORAGE_KEY = "sisper_pending_otp_session";
 
 const PRESERVED_SISPER_KEYS = new Set([
   "sisper_user_profile",
   "sisper_global_app_logo",
   "sisper_global_app_logo_right",
+  "sisper_global_app_logo_version",
   "sisper_global_admin_tkpi",
   "sisper_demo_expires_at",
   "sisper_demo_just_logged_in",
+  "sisper_device_id",
+  "sisper_device_first_seen",
+  "sisper_current_device_info",
 ]);
 
 export const clearPerUserWorksheetStorage = () => {
@@ -67,6 +78,23 @@ const buildDemoProfile = () => ({
   berakhirPada: "2099-12-31",
 });
 
+export interface OtpDispatchResult {
+  ok: boolean;
+  deliveryMode: "email" | "preview";
+  provider: "resend" | "smtp" | "preview";
+  recipientEmail: string;
+  verificationToken: string;
+  expiresAt: number;
+  expiresInSeconds: number;
+  message: string;
+  emailSubject?: string;
+  previewCode?: string;
+  smtpWarning?: string | null;
+  uid: string;
+  namaLengkap: string;
+  namaSPPG: string;
+}
+
 interface AuthContextType {
   user: User | null;
   userProfile: any | null;
@@ -83,7 +111,19 @@ interface AuthContextType {
     profesi: string;
     namaSPPG: string;
     sandi: string;
-  }) => Promise<void>;
+  }) => Promise<OtpDispatchResult>;
+  resendVerificationCode: (params: {
+    email: string;
+    namaLengkap?: string;
+    namaSPPG?: string;
+    uid?: string;
+  }) => Promise<OtpDispatchResult>;
+  verifyRegistrationCode: (params: {
+    email: string;
+    code: string;
+    verificationToken: string;
+    autoLogin?: boolean;
+  }) => Promise<any>;
   registerThreeRoles: (data: {
     namaSPPG: string;
     sandi: string;
@@ -481,6 +521,78 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => window.clearInterval(timer);
   }, [isDemo]);
 
+  // Automatic Real-Time Device Registration & Heartbeat (visible immediately in Panel Admin)
+  useEffect(() => {
+    const pushDeviceHeartbeat = (online: boolean) => {
+      const currentUid = userProfile?.uid || user?.uid || null;
+      const currentEmail = userProfile?.email || user?.email || null;
+      const currentName = userProfile?.namaLengkap || user?.displayName || null;
+      const currentSppg = userProfile?.namaSPPG || null;
+      const currentRole = isDemo ? "DEMO" : (userProfile?.peran || (currentUid ? "USER" : null));
+      const currentStatus = isDemo ? "aktif" : (userProfile?.statusPersetujuan || null);
+
+      const sessionState = isDemo
+        ? "demo"
+        : currentUid
+        ? "active"
+        : sessionStorage.getItem(PENDING_OTP_STORAGE_KEY)
+        ? "registering"
+        : "guest";
+
+      syncDeviceToFirestore({
+        sessionState,
+        userUid: currentUid,
+        userEmail: currentEmail,
+        userName: currentName,
+        namaSPPG: currentSppg,
+        peran: currentRole,
+        statusPersetujuan: currentStatus,
+        isOnline: online,
+      }).catch(() => {});
+    };
+
+    pushDeviceHeartbeat(true);
+
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        pushDeviceHeartbeat(true);
+      }
+    }, 45_000);
+
+    const handleVisibility = () => {
+      pushDeviceHeartbeat(document.visibilityState === "visible");
+    };
+    const handleFocus = () => pushDeviceHeartbeat(true);
+    const handleOnline = () => pushDeviceHeartbeat(true);
+    const handleOffline = () => pushDeviceHeartbeat(false);
+    const handlePageHide = () => pushDeviceHeartbeat(false);
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleFocus);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    window.addEventListener("pagehide", handlePageHide);
+
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleFocus);
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+      window.removeEventListener("pagehide", handlePageHide);
+    };
+  }, [
+    user?.uid,
+    user?.email,
+    userProfile?.uid,
+    userProfile?.email,
+    userProfile?.namaLengkap,
+    userProfile?.namaSPPG,
+    userProfile?.peran,
+    userProfile?.statusPersetujuan,
+    isDemo,
+  ]);
+
   // Real-time synchronization of user profile status and expiration date from Firestore
   useEffect(() => {
     const activeUid = userProfile?.uid || user?.uid || localStorage.getItem("custom_logged_in_uid");
@@ -639,6 +751,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
       updateSession(null, null);
       clearPerUserWorksheetStorage();
+      syncDeviceToFirestore({
+        sessionState: "guest",
+        userUid: null,
+        userEmail: null,
+        userName: null,
+        namaSPPG: null,
+        peran: null,
+        statusPersetujuan: null,
+        isOnline: true,
+      }).catch(() => {});
       setLoading(false);
     } catch (error) {
       console.error("Sign-out failed:", error);
@@ -744,13 +866,72 @@ const removeDeletedTenantEmail = (email: string) => {
     }
   };
 
+  const dispatchVerificationEmail = async (params: {
+    email: string;
+    namaLengkap?: string;
+    namaSPPG?: string;
+    uid?: string;
+  }): Promise<OtpDispatchResult> => {
+    const lowerEmail = params.email.toLowerCase().trim();
+    const customUid = params.uid || `custom_user_${lowerEmail.replace(/[@.]/g, "_")}`;
+
+    const resp = await fetch("/api/auth/send-verification-code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: lowerEmail,
+        namaLengkap: params.namaLengkap || "",
+        namaSPPG: params.namaSPPG || "",
+        uid: customUid,
+      }),
+    });
+
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok || !json?.ok) {
+      throw new Error(json?.error || "Gagal mengirim email kode verifikasi. Silakan coba lagi.");
+    }
+
+    const result: OtpDispatchResult = {
+      ok: true,
+      deliveryMode: json.deliveryMode === "email" ? "email" : "preview",
+      provider: json.provider || "preview",
+      recipientEmail: json.recipientEmail || lowerEmail,
+      verificationToken: json.verificationToken,
+      expiresAt: json.expiresAt,
+      expiresInSeconds: json.expiresInSeconds || 600,
+      message: json.message || `Kode verifikasi 6 digit telah dikirim ke ${lowerEmail}.`,
+      emailSubject: json.emailSubject,
+      previewCode: json.previewCode,
+      smtpWarning: json.smtpWarning || null,
+      uid: customUid,
+      namaLengkap: params.namaLengkap || "",
+      namaSPPG: params.namaSPPG || "",
+    };
+
+    try {
+      sessionStorage.setItem(PENDING_OTP_STORAGE_KEY, JSON.stringify(result));
+    } catch {}
+
+    return result;
+  };
+
+  const resendVerificationCode = async (params: {
+    email: string;
+    namaLengkap?: string;
+    namaSPPG?: string;
+    uid?: string;
+  }): Promise<OtpDispatchResult> => {
+    setAuthError(null);
+    return dispatchVerificationEmail(params);
+  };
+
   const registerCustomUser = async (formData: {
     namaLengkap: string;
     email: string;
     profesi: string;
     namaSPPG: string;
     sandi: string;
-  }) => {
+  }): Promise<OtpDispatchResult> => {
     setAuthError(null);
     try {
       const lowerEmail = formData.email.toLowerCase().trim();
@@ -760,68 +941,259 @@ const removeDeletedTenantEmail = (email: string) => {
         throw new Error("Kata sandi minimal 6 karakter demi keamanan akun Anda.");
       }
 
-      const customUid = isAdminEmail 
+      const customUid = isAdminEmail
         ? "admin_syukriyusuf82"
         : `custom_user_${lowerEmail.replace(/[@.]/g, "_")}`;
-        
+
       const userRef = doc(db, "users", customUid);
-      
+
       // 1. Duplicate check in remote Firestore (6000ms timeout)
-      let remoteUserExists = false;
+      let existingRemoteData: any = null;
       if (!isAdminEmail) {
         try {
           const userSnap: any = await fetchWithTimeout(getDoc(userRef), 6000, null);
           if (userSnap && userSnap.exists()) {
-            remoteUserExists = true;
+            existingRemoteData = userSnap.data();
           }
         } catch (checkErr) {
           console.warn("Pemeriksaan Firestore pengguna ganda notice:", checkErr);
         }
       }
 
-      if (remoteUserExists) {
-        throw new Error(`Email "${lowerEmail}" sudah terdaftar di sistem. Silakan langsung masuk atau hubungi Administrator jika perlu bantuan.`);
+      if (existingRemoteData) {
+        if (existingRemoteData.statusPersetujuan === "aktif") {
+          throw new Error(`Email "${lowerEmail}" sudah terdaftar dan aktif di sistem. Silakan langsung masuk.`);
+        }
+        if (existingRemoteData.statusPersetujuan === "diblokir") {
+          throw new Error(`Akun dengan email "${lowerEmail}" saat ini diblokir oleh Administrator.`);
+        }
+        // If still waiting OTP verification, allow refreshing registration details and resending OTP code
       }
 
-      // 2. Remote doc does not exist (meaning never registered or deleted by Admin) -> Purge stale local cache
+      // 2. Purge deleted-email marker & stale local cache
       removeDeletedTenantEmail(lowerEmail);
       localStorage.removeItem(`offline_user_${customUid}`);
       localStorage.removeItem(`offline_user_custom_user_${lowerEmail.replace(/[@.]/g, "_")}`);
 
+      // 3. Detect current device automatically so Panel Admin reads it immediately upon registration
+      const deviceRecord = await buildDeviceRecord({
+        sessionState: "registering",
+        userUid: customUid,
+        userEmail: isAdminEmail ? "syukriyusuf82@gmail.com" : lowerEmail,
+        userName: isAdminEmail ? "LA ODE MUHAMMAD SUKRI YUSUF" : formData.namaLengkap,
+        namaSPPG: isAdminEmail ? "SPPG MUNA BARAT SAWERIGADI ONDOKE" : formData.namaSPPG,
+        peran: isAdminEmail ? "ADMIN" : "USER",
+        statusPersetujuan: isAdminEmail ? "aktif" : "menunggu",
+        isOnline: true,
+      });
+      const compactDevice = toCompactDeviceSummary(deviceRecord);
+
       const nowIso = new Date().toISOString();
+      const nextYear = new Date();
+      nextYear.setFullYear(nextYear.getFullYear() + 1);
+      const defaultExpDate = `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, "0")}-${String(nextYear.getDate()).padStart(2, "0")}`;
+
       const profileData = {
         uid: customUid,
         email: isAdminEmail ? "syukriyusuf82@gmail.com" : lowerEmail,
-        namaLengkap: isAdminEmail ? "LA ODE MUHAMMAD SUKRI YUSUF" : formData.namaLengkap,
-        profesi: isAdminEmail ? "AHLI GIZI" : formData.profesi,
-        namaSPPG: isAdminEmail ? "SPPG MUNA BARAT SAWERIGADI ONDOKE" : formData.namaSPPG,
+        namaLengkap: isAdminEmail ? "LA ODE MUHAMMAD SUKRI YUSUF" : formData.namaLengkap.trim(),
+        profesi: isAdminEmail ? "AHLI GIZI" : formData.profesi.trim(),
+        namaSPPG: isAdminEmail ? "SPPG MUNA BARAT SAWERIGADI ONDOKE" : formData.namaSPPG.trim(),
         sandi: isAdminEmail ? "Syukri@123" : formData.sandi,
         peran: isAdminEmail ? ("ADMIN" as const) : ("USER" as const),
-        statusPersetujuan: isAdminEmail ? ("aktif" as const) : ("menunggu" as const), // Waiting list for non-admin
-        berakhirPada: isAdminEmail ? "2035-12-31" : "2027-12-31",
-        createdAt: nowIso,
+        statusPersetujuan: isAdminEmail ? ("aktif" as const) : ("menunggu" as const),
+        emailVerified: isAdminEmail,
+        verificationStatus: isAdminEmail ? ("verified" as const) : ("pending_otp" as const),
+        berakhirPada: isAdminEmail ? "2035-12-31" : defaultExpDate,
+        lastDevice: compactDevice,
+        lastDeviceLabel: formatDeviceShortLabel(compactDevice),
+        lastDeviceId: deviceRecord.deviceId,
+        lastDeviceSeenAt: nowIso,
+        createdAt: existingRemoteData?.createdAt || nowIso,
         updatedAt: nowIso,
-        loginTerakhir: null
+        loginTerakhir: null,
       };
 
-      // 3. Store in local storage so registration is instant and durable
+      // 4. Store locally & persist to Firestore immediately
       localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(profileData));
 
-      // 4. Fire Firestore write with extended timeout to ensure persistent save
       try {
         await setDoc(userRef, profileData, { merge: true });
       } catch (dbErr) {
         console.warn("Operasi setDoc Firestore di latar belakang tertunda:", dbErr);
       }
 
+      // 5. Sync device presence automatically to /devices & /users/{uid}/devices
+      syncDeviceToFirestore({
+        sessionState: "registering",
+        userUid: customUid,
+        userEmail: profileData.email,
+        userName: profileData.namaLengkap,
+        namaSPPG: profileData.namaSPPG,
+        peran: profileData.peran,
+        statusPersetujuan: profileData.statusPersetujuan,
+        isOnline: true,
+      }).catch(() => {});
+
       try {
         window.dispatchEvent(new CustomEvent("sisper_user_registered", { detail: profileData }));
-      } catch (e) {}
+      } catch {}
+
+      // 6. Automatically send 6-digit verification code email via server endpoint
+      const otpResult = await dispatchVerificationEmail({
+        email: profileData.email,
+        namaLengkap: profileData.namaLengkap,
+        namaSPPG: profileData.namaSPPG,
+        uid: customUid,
+      });
+
+      return otpResult;
     } catch (error: any) {
       console.error("Gagal melakukan registrasi:", error);
       setAuthError(error?.message || String(error));
       throw error;
     }
+  };
+
+  const verifyRegistrationCode = async (params: {
+    email: string;
+    code: string;
+    verificationToken: string;
+    autoLogin?: boolean;
+  }): Promise<any> => {
+    setAuthError(null);
+    const lowerEmail = params.email.toLowerCase().trim();
+    const cleanCode = params.code.replace(/\D/g, "").trim();
+
+    if (!/^\d{6}$/.test(cleanCode)) {
+      throw new Error("Masukkan 6 digit angka kode verifikasi yang dikirim ke email Anda.");
+    }
+
+    const resp = await fetch("/api/auth/verify-code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: lowerEmail,
+        code: cleanCode,
+        verificationToken: params.verificationToken,
+      }),
+    });
+
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok || !json?.verified) {
+      throw new Error(json?.error || "Kode verifikasi tidak valid. Silakan periksa kembali kode Anda.");
+    }
+
+    const customUid = isMainAdminEmail(lowerEmail)
+      ? "admin_syukriyusuf82"
+      : (json.uid || `custom_user_${lowerEmail.replace(/[@.]/g, "_")}`);
+    const userRef = doc(db, "users", customUid);
+
+    let existingProfile: any = null;
+    try {
+      const localRaw = localStorage.getItem(`offline_user_${customUid}`);
+      if (localRaw) existingProfile = JSON.parse(localRaw);
+    } catch {}
+
+    try {
+      const snap: any = await fetchWithTimeout(getDoc(userRef), 5000, null);
+      if (snap && snap.exists()) {
+        existingProfile = { ...existingProfile, ...snap.data() };
+      }
+    } catch {}
+
+    const nowIso = new Date().toISOString();
+    const nextYear = new Date();
+    nextYear.setFullYear(nextYear.getFullYear() + 1);
+    const defaultExpDate = `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, "0")}-${String(nextYear.getDate()).padStart(2, "0")}`;
+
+    const deviceRecord = await buildDeviceRecord({
+      sessionState: "active",
+      userUid: customUid,
+      userEmail: lowerEmail,
+      userName: existingProfile?.namaLengkap || lowerEmail.split("@")[0],
+      namaSPPG: existingProfile?.namaSPPG || "",
+      peran: isMainAdminEmail(lowerEmail) ? "ADMIN" : (existingProfile?.peran || "USER"),
+      statusPersetujuan: "aktif",
+      isOnline: true,
+    });
+    const compactDevice = toCompactDeviceSummary(deviceRecord);
+
+    const activatedProfile = {
+      ...(existingProfile || {}),
+      uid: customUid,
+      email: lowerEmail,
+      namaLengkap: existingProfile?.namaLengkap || lowerEmail.split("@")[0],
+      profesi: existingProfile?.profesi || "Ahli Gizi",
+      namaSPPG: existingProfile?.namaSPPG || "",
+      peran: isMainAdminEmail(lowerEmail) ? ("ADMIN" as const) : (existingProfile?.peran || ("USER" as const)),
+      statusPersetujuan: "aktif" as const,
+      emailVerified: true,
+      verificationStatus: "verified" as const,
+      emailVerifiedAt: nowIso,
+      activatedBy: "email_otp",
+      berakhirPada: existingProfile?.berakhirPada || defaultExpDate,
+      lastDevice: compactDevice,
+      lastDeviceLabel: formatDeviceShortLabel(compactDevice),
+      lastDeviceId: deviceRecord.deviceId,
+      lastDeviceSeenAt: nowIso,
+      updatedAt: nowIso,
+      loginTerakhir: nowIso,
+    };
+
+    // 1. Persist activation directly to Firestore so Admin Panel reflects "Aktif" instantaneously
+    try {
+      await setDoc(
+        userRef,
+        {
+          ...activatedProfile,
+          loginTerakhir: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    } catch (dbErr) {
+      console.warn("Notice updating verified activation to Firestore:", dbErr);
+    }
+
+    // 2. Persist locally & clear pending OTP session
+    localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(activatedProfile));
+    try {
+      sessionStorage.removeItem(PENDING_OTP_STORAGE_KEY);
+    } catch {}
+
+    // 3. Notify AdminPanel listeners immediately
+    try {
+      window.dispatchEvent(new CustomEvent("sisper_user_registered", { detail: activatedProfile }));
+    } catch {}
+
+    // 4. Sync active device presence immediately to /devices & /users/{uid}/devices
+    await syncDeviceToFirestore({
+      sessionState: "active",
+      userUid: customUid,
+      userEmail: lowerEmail,
+      userName: activatedProfile.namaLengkap,
+      namaSPPG: activatedProfile.namaSPPG,
+      peran: activatedProfile.peran,
+      statusPersetujuan: "aktif",
+      isOnline: true,
+    });
+
+    // 5. Auto-login into fresh empty workspace so account is immediately active & usable
+    if (params.autoLogin !== false) {
+      clearPerUserWorksheetStorage();
+      updateSession(
+        {
+          uid: customUid,
+          email: lowerEmail,
+          displayName: activatedProfile.namaLengkap,
+          emailVerified: true,
+        } as any,
+        activatedProfile
+      );
+    }
+
+    return activatedProfile;
   };
 
   const loginWithEmailPassword = async (email: string, sandi?: string) => {
@@ -1026,8 +1398,21 @@ const removeDeletedTenantEmail = (email: string) => {
         setDoc(userRef, { sandi: enteredSandi }, { merge: true }).catch(() => {});
       }
 
-      // 5. Status Validation (Waiting List / Blocked / Expired)
+      // 5. Status Validation (Waiting OTP Verification / Waiting List / Blocked / Expired)
       if (data.statusPersetujuan === "menunggu" || data.statusPersetujuan === "pending") {
+        if (data.verificationStatus === "pending_otp" || data.emailVerified === false) {
+          const pendingErr: any = new Error(
+            `Email ${lowerEmail} belum diverifikasi. Silakan masukkan kode verifikasi 6 digit yang dikirim ke email Anda untuk langsung mengaktifkan akun.`
+          );
+          pendingErr.code = "PENDING_EMAIL_OTP";
+          pendingErr.pendingUser = {
+            uid: customUid,
+            email: lowerEmail,
+            namaLengkap: data.namaLengkap || "",
+            namaSPPG: data.namaSPPG || "",
+          };
+          throw pendingErr;
+        }
         throw new Error(`Akun Anda (${lowerEmail}) saat ini berada dalam DAFTAR TUNGGU (menunggu persetujuan Admin). Silakan hubungi Administrator untuk pengaktifan akun.`);
       }
 
@@ -1048,13 +1433,24 @@ const removeDeletedTenantEmail = (email: string) => {
         emailVerified: true
       } as any, data);
       
-      // Background non-blocking timestamp update
+      // Background non-blocking timestamp + active device update
       setDoc(userRef, {
         loginTerakhir: serverTimestamp(),
         updatedAt: serverTimestamp()
       }, { merge: true }).catch((err) => {
         console.warn("Gagal sinkron login terakhir ke Firestore:", err);
       });
+
+      syncDeviceToFirestore({
+        sessionState: "active",
+        userUid: customUid,
+        userEmail: data.email,
+        userName: data.namaLengkap,
+        namaSPPG: data.namaSPPG,
+        peran: data.peran || "USER",
+        statusPersetujuan: data.statusPersetujuan || "aktif",
+        isOnline: true,
+      }).catch(() => {});
       
     } catch (error: any) {
       console.error("Gagal masuk:", error);
@@ -1207,6 +1603,8 @@ const removeDeletedTenantEmail = (email: string) => {
       loadStateFromCloud,
       registerUser,
       registerCustomUser,
+      resendVerificationCode,
+      verifyRegistrationCode,
       registerThreeRoles,
       loginWithEmailPassword,
       resetUserPassword,

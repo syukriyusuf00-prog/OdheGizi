@@ -383,7 +383,7 @@ export default function KopSuratConfigSection({
                   {isAdmin ? (
                     <button
                       type="button"
-                      onClick={() => setLeftLogo("/src/assets/images/logo_sppg_1782256222616.jpg")}
+                      onClick={() => setLeftLogo("/assets/images/app_logo_sppg.png")}
                       className="text-[10px] text-indigo-600 hover:underline font-bold flex items-center gap-1 cursor-pointer"
                     >
                       <RotateCcw className="w-3 h-3" /> Reset Standar

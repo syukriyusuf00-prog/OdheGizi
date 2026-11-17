@@ -616,12 +616,12 @@ export default function CekGiziTab({
                     {/* The cropped white card effect with doctor photo on the right half */}
                     <div className="absolute left-0 top-0 h-full w-[45%] bg-white z-0"></div>
                     <img 
-                      src="/src/assets/images/doctor_profile_1783236264580.jpg" 
+                      src={leftLogo || "/assets/images/app_logo_sppg.png"} 
                       alt="Ahli Gizi" 
-                      className="w-14 h-14 rounded-full object-cover border border-slate-100 relative z-10 mr-1.5"
+                      className="w-14 h-14 rounded-full object-cover border border-slate-100 relative z-10 mr-1.5 bg-white"
                       referrerPolicy="no-referrer"
                       onError={(e) => {
-                        (e.target as HTMLImageElement).src = "/src/assets/images/logo_sppg_1782256222616.jpg";
+                        (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
                       }}
                     />
                   </div>

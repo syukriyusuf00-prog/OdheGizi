@@ -79,14 +79,44 @@ import {
   Key,
   X,
   Archive,
-  PlayCircle
+  PlayCircle,
+  Mail,
+  ShieldCheck,
+  Copy,
+  Check,
+  Send,
+  ArrowLeft
 } from "lucide-react";
 import * as XLSX from "xlsx";
-import { useAuth, isMainAdminEmail, clearPerUserWorksheetStorage } from "./context/AuthContext.tsx";
+import {
+  useAuth,
+  isMainAdminEmail,
+  clearPerUserWorksheetStorage,
+  OtpDispatchResult,
+  PENDING_OTP_STORAGE_KEY
+} from "./context/AuthContext.tsx";
 import { db } from "./lib/firebase.ts";
 import { doc, getDoc, onSnapshot, setDoc } from "firebase/firestore";
 
-const DEFAULT_FALLBACK_LOGO = "/src/assets/images/logo_sppg_1782256222616.jpg";
+const DEFAULT_FALLBACK_LOGO = "/assets/images/app_logo_sppg.png";
+const GLOBAL_LOGO_SCHEMA_VERSION = 2;
+const GLOBAL_LOGO_VERSION_KEY = "sisper_global_app_logo_version";
+
+const normalizeAppLogoUrl = (url?: string | null): string => {
+  if (!url || !url.trim() || url === "/src/assets/images/logo_sppg_1782256222616.jpg") {
+    return DEFAULT_FALLBACK_LOGO;
+  }
+  return url;
+};
+
+const readCachedGlobalLeftLogo = (): string => {
+  try {
+    if (localStorage.getItem(GLOBAL_LOGO_VERSION_KEY) === String(GLOBAL_LOGO_SCHEMA_VERSION)) {
+      return normalizeAppLogoUrl(localStorage.getItem("sisper_global_app_logo"));
+    }
+  } catch {}
+  return DEFAULT_FALLBACK_LOGO;
+};
 
 export default function App() {
   // Load initial state from LocalStorage only when logged in; otherwise start completely empty
@@ -181,17 +211,13 @@ export default function App() {
   }, [activeTab]);
   const [tkpiSearchQuery, setTkpiSearchQuery] = useState<string>("");
 
-  // Global App Logo controlled by Admin / Panel Admin holders and followed by all users & Login screen
-  const [globalAppLogo, setGlobalAppLogo] = useState<string>(() => {
-    return localStorage.getItem("sisper_global_app_logo") || DEFAULT_FALLBACK_LOGO;
-  });
+  // Global App Logo (Left) controlled by Admin / Panel Admin holders and automatically followed by Login screen & all users
+  const [globalAppLogo, setGlobalAppLogo] = useState<string>(() => readCachedGlobalLeftLogo());
   const [globalRightLogo, setGlobalRightLogo] = useState<string>(() => {
     return localStorage.getItem("sisper_global_app_logo_right") || "";
   });
 
-  const [customLogo, setCustomLogo] = useState<string>(() => {
-    return localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || DEFAULT_FALLBACK_LOGO;
-  });
+  const [customLogo, setCustomLogo] = useState<string>(() => readCachedGlobalLeftLogo());
 
   // State untuk penyesuaian/pemotongan logo profil
   const [isCropModalOpen, setIsCropModalOpen] = useState(false);
@@ -208,7 +234,7 @@ export default function App() {
   const [kopLine2, setKopLine2] = useState(() => localStorage.getItem("kop_line2") || "SATUAN PELAYANAN PEMENUHAN GIZI");
   const [kopLine3, setKopLine3] = useState(() => localStorage.getItem("kop_line3") || "");
   const [kopLine4, setKopLine4] = useState(() => localStorage.getItem("kop_line4") || "");
-  const [kopLeftLogo, setKopLeftLogo] = useState(() => localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("kop_left_logo") || DEFAULT_FALLBACK_LOGO);
+  const [kopLeftLogo, setKopLeftLogo] = useState(() => readCachedGlobalLeftLogo());
   const [kopRightLogo, setKopRightLogo] = useState(() => localStorage.getItem("sisper_global_app_logo_right") || localStorage.getItem("kop_right_logo") || "");
   
   const [leftLogoCrop, setLeftLogoCrop] = useState(() => {
@@ -268,6 +294,8 @@ export default function App() {
     signOutUser,
     registerUser,
     registerCustomUser,
+    resendVerificationCode,
+    verifyRegistrationCode,
     registerThreeRoles,
     loginWithEmailPassword,
     resetUserPassword,
@@ -365,7 +393,18 @@ export default function App() {
   }, [userProfile?.uid, user?.uid, userProfile?.statusPersetujuan, refreshUserProfile]);
 
   // Authentication Tab & Form States
-  const [authTab, setAuthTab] = useState<"masuk" | "daftar">("masuk");
+  const [authTab, setAuthTab] = useState<"masuk" | "daftar">(() => {
+    try {
+      const raw = sessionStorage.getItem(PENDING_OTP_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.expiresAt && parsed.expiresAt > Date.now()) {
+          return "daftar";
+        }
+      }
+    } catch {}
+    return "masuk";
+  });
   const [loginEmail, setLoginEmail] = useState("");
   const [loginSandi, setLoginSandi] = useState("");
   const [showLoginSandi, setShowLoginSandi] = useState(false);
@@ -408,6 +447,52 @@ export default function App() {
   const [isRegistering, setIsRegistering] = useState(false);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
+  // Email OTP Verification States (Registration -> Auto Email OTP -> Instant Activation)
+  const [pendingOtpSession, setPendingOtpSession] = useState<OtpDispatchResult | null>(() => {
+    try {
+      const raw = sessionStorage.getItem(PENDING_OTP_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw) as OtpDispatchResult;
+      if (parsed && parsed.expiresAt && parsed.expiresAt > Date.now()) {
+        return parsed;
+      }
+      sessionStorage.removeItem(PENDING_OTP_STORAGE_KEY);
+    } catch {}
+    return null;
+  });
+  const [otpInput, setOtpInput] = useState("");
+  const [otpError, setOtpError] = useState<string | null>(null);
+  const [otpInfo, setOtpInfo] = useState<string | null>(null);
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
+  const [isResendingOtp, setIsResendingOtp] = useState(false);
+  const [otpResendCooldown, setOtpResendCooldown] = useState(0);
+  const [otpSecondsLeft, setOtpSecondsLeft] = useState(0);
+  const [copiedOtpPreview, setCopiedOtpPreview] = useState(false);
+  const [authFeedback, setAuthFeedback] = useState<{ type: "error" | "success" | "info"; text: string } | null>(null);
+
+  // Countdown timers for OTP expiry & resend cooldown
+  useEffect(() => {
+    if (!pendingOtpSession) {
+      setOtpSecondsLeft(0);
+      return;
+    }
+    const updateRemaining = () => {
+      const rem = Math.max(0, Math.ceil((pendingOtpSession.expiresAt - Date.now()) / 1000));
+      setOtpSecondsLeft(rem);
+    };
+    updateRemaining();
+    const timer = window.setInterval(updateRemaining, 1000);
+    return () => window.clearInterval(timer);
+  }, [pendingOtpSession]);
+
+  useEffect(() => {
+    if (otpResendCooldown <= 0) return;
+    const timer = window.setTimeout(() => {
+      setOtpResendCooldown((prev) => Math.max(0, prev - 1));
+    }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [otpResendCooldown]);
+
   // Fallback / legacy profile registration form states
   const [regNama, setRegNama] = useState("");
   const [regProfesi, setRegProfesi] = useState("Ahli Gizi");
@@ -438,23 +523,24 @@ export default function App() {
   useEffect(() => {
     const logoDocRef = doc(db, "configs", "app_logo");
     const unsubscribeLogo = onSnapshot(logoDocRef, (snap) => {
-      if (snap.exists()) {
-        const data = snap.data();
-        if (data) {
-          const primaryLogo = data.url || data.rightUrl || DEFAULT_FALLBACK_LOGO;
-          const rightLogoVal = data.rightUrl ?? "";
-          setGlobalAppLogo(primaryLogo);
-          setGlobalRightLogo(rightLogoVal);
-          setCustomLogo(primaryLogo);
-          setKopLeftLogo(data.url || primaryLogo);
-          setKopRightLogo(rightLogoVal);
-          localStorage.setItem("sisper_global_app_logo", primaryLogo);
-          localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
-          localStorage.setItem("sisper_custom_logo", primaryLogo);
-          localStorage.setItem("kop_left_logo", data.url || primaryLogo);
-          localStorage.setItem("kop_right_logo", rightLogoVal);
-        }
-      }
+      const data = snap.exists() ? snap.data() : null;
+      const hasCurrentSchema = Boolean(data && (data.schemaVersion ?? 0) >= GLOBAL_LOGO_SCHEMA_VERSION);
+      const primaryLogo = hasCurrentSchema
+        ? normalizeAppLogoUrl(data?.url)
+        : DEFAULT_FALLBACK_LOGO;
+      const rightLogoVal = data?.rightUrl ?? "";
+
+      setGlobalAppLogo(primaryLogo);
+      setGlobalRightLogo(rightLogoVal);
+      setCustomLogo(primaryLogo);
+      setKopLeftLogo(primaryLogo);
+      setKopRightLogo(rightLogoVal);
+      localStorage.setItem("sisper_global_app_logo", primaryLogo);
+      localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
+      localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
+      localStorage.setItem("sisper_custom_logo", primaryLogo);
+      localStorage.setItem("kop_left_logo", primaryLogo);
+      localStorage.setItem("kop_right_logo", rightLogoVal);
     }, (error) => {
       console.warn("Gagal berlangganan logo global dari awan:", error);
     });
@@ -584,20 +670,40 @@ export default function App() {
 
           if (cancelled) return;
 
-          // Apply latest Global Admin Logo to all users
-          if (globalLogoSnap && globalLogoSnap.exists()) {
-            const logoData = globalLogoSnap.data();
-            if (logoData) {
-              const primaryLogo = logoData.url || logoData.rightUrl || DEFAULT_FALLBACK_LOGO;
-              const rightLogoVal = logoData.rightUrl ?? "";
-              setGlobalAppLogo(primaryLogo);
-              setGlobalRightLogo(rightLogoVal);
-              setCustomLogo(primaryLogo);
-              setKopLeftLogo(logoData.url || primaryLogo);
-              setKopRightLogo(rightLogoVal);
-              localStorage.setItem("sisper_global_app_logo", primaryLogo);
-              localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
-            }
+          // Apply latest Global Admin Left Logo to all users & upgrade legacy logo records to v2
+          const logoData = globalLogoSnap && globalLogoSnap.exists() ? globalLogoSnap.data() : null;
+          const hasCurrentLogoSchema = Boolean(
+            logoData && (logoData.schemaVersion ?? 0) >= GLOBAL_LOGO_SCHEMA_VERSION
+          );
+          const primaryLogo = hasCurrentLogoSchema
+            ? normalizeAppLogoUrl(logoData?.url)
+            : DEFAULT_FALLBACK_LOGO;
+          const rightLogoVal = logoData?.rightUrl ?? "";
+
+          setGlobalAppLogo(primaryLogo);
+          setGlobalRightLogo(rightLogoVal);
+          setCustomLogo(primaryLogo);
+          setKopLeftLogo(primaryLogo);
+          setKopRightLogo(rightLogoVal);
+          localStorage.setItem("sisper_global_app_logo", primaryLogo);
+          localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
+          localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
+          localStorage.setItem("sisper_custom_logo", primaryLogo);
+          localStorage.setItem("kop_left_logo", primaryLogo);
+
+          if (!hasCurrentLogoSchema && isAdminUser) {
+            setDoc(
+              doc(db, "configs", "app_logo"),
+              {
+                url: DEFAULT_FALLBACK_LOGO,
+                schemaVersion: GLOBAL_LOGO_SCHEMA_VERSION,
+                updatedBy: user.email || "Admin SISPERMBG",
+                updatedAt: new Date().toISOString(),
+              },
+              { merge: true }
+            ).catch((err) => {
+              console.warn("Gagal menyinkronkan standar logo aplikasi global:", err);
+            });
           }
 
           // New users (non-main-admin) always begin with completely empty worksheets until they fill them
@@ -1275,21 +1381,18 @@ export default function App() {
         const compressedBase64 = canvas.toDataURL("image/jpeg", 0.85);
         if (compressedBase64 && isAdminUser) {
           setGlobalAppLogo(compressedBase64);
-          setGlobalRightLogo(compressedBase64);
           setCustomLogo(compressedBase64);
           setKopLeftLogo(compressedBase64);
-          setKopRightLogo(compressedBase64);
           localStorage.setItem("sisper_global_app_logo", compressedBase64);
-          localStorage.setItem("sisper_global_app_logo_right", compressedBase64);
+          localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
           localStorage.setItem("sisper_custom_logo", compressedBase64);
           localStorage.setItem("kop_left_logo", compressedBase64);
-          localStorage.setItem("kop_right_logo", compressedBase64);
 
           try {
-            // Write directly to configs/app_logo for global propagation across all users & login screen
+            // Write left/main app logo directly to configs/app_logo for automatic sync to Login screen & all users
             await setDoc(doc(db, "configs", "app_logo"), {
               url: compressedBase64,
-              rightUrl: compressedBase64,
+              schemaVersion: GLOBAL_LOGO_SCHEMA_VERSION,
               updatedBy: user?.email || "Admin SISPERMBG",
               updatedAt: new Date().toISOString()
             }, { merge: true });
@@ -1305,16 +1408,19 @@ export default function App() {
 
   const handleUpdateLeftLogo = async (newLogo: string) => {
     if (!isAdminUser) return;
-    setGlobalAppLogo(newLogo);
-    setKopLeftLogo(newLogo);
-    setCustomLogo(newLogo);
-    localStorage.setItem("sisper_global_app_logo", newLogo);
-    localStorage.setItem("kop_left_logo", newLogo);
-    localStorage.setItem("sisper_custom_logo", newLogo);
+    const normalized = normalizeAppLogoUrl(newLogo);
+    setGlobalAppLogo(normalized);
+    setKopLeftLogo(normalized);
+    setCustomLogo(normalized);
+    localStorage.setItem("sisper_global_app_logo", normalized);
+    localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
+    localStorage.setItem("kop_left_logo", normalized);
+    localStorage.setItem("sisper_custom_logo", normalized);
 
     try {
       await setDoc(doc(db, "configs", "app_logo"), {
-        url: newLogo,
+        url: normalized,
+        schemaVersion: GLOBAL_LOGO_SCHEMA_VERSION,
         updatedBy: user?.email || "Admin SISPERMBG",
         updatedAt: new Date().toISOString()
       }, { merge: true });
@@ -1554,15 +1660,39 @@ export default function App() {
   // Form submission handlers
   const handleCustomLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setAuthFeedback(null);
     if (!loginEmail || !loginSandi) {
-      alert("Mohon isi email dan kata sandi Anda!");
+      setAuthFeedback({ type: "error", text: "Mohon isi email dan kata sandi Anda terlebih dahulu." });
       return;
     }
     setIsLoggingIn(true);
     try {
       await loginWithEmailPassword(loginEmail, loginSandi);
     } catch (err: any) {
-      alert(err.message || "Gagal masuk.");
+      if (err?.code === "PENDING_EMAIL_OTP" && err?.pendingUser) {
+        try {
+          const otpResult = await resendVerificationCode({
+            email: err.pendingUser.email,
+            namaLengkap: err.pendingUser.namaLengkap,
+            namaSPPG: err.pendingUser.namaSPPG,
+            uid: err.pendingUser.uid,
+          });
+          setPendingOtpSession(otpResult);
+          setOtpInput("");
+          setOtpError(null);
+          setOtpInfo(otpResult.message);
+          setOtpResendCooldown(20);
+          setAuthTab("daftar");
+          setAuthFeedback({
+            type: "info",
+            text: "Email Anda belum terverifikasi. Kode verifikasi baru telah dikirim otomatis—silakan masukkan kode di bawah untuk langsung mengaktifkan akun.",
+          });
+        } catch (resendErr: any) {
+          setAuthFeedback({ type: "error", text: resendErr?.message || err.message });
+        }
+      } else {
+        setAuthFeedback({ type: "error", text: err?.message || "Gagal masuk. Periksa kembali email dan kata sandi Anda." });
+      }
     } finally {
       setIsLoggingIn(false);
     }
@@ -1571,23 +1701,26 @@ export default function App() {
   const handleCustomResetPassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!resetEmailInput || !resetNewSandi) {
-      alert("Mohon isi Email dan Kata Sandi baru!");
+      setAuthFeedback({ type: "error", text: "Mohon isi Email dan Kata Sandi baru!" });
       return;
     }
     if (resetNewSandi.trim().length < 6) {
-      alert("Kata sandi baru minimal 6 karakter demi keamanan akun Anda.");
+      setAuthFeedback({ type: "error", text: "Kata sandi baru minimal 6 karakter demi keamanan akun Anda." });
       return;
     }
     setIsResettingSandi(true);
     try {
       await resetUserPassword(resetEmailInput, resetNewSandi);
-      alert(`Kata sandi untuk "${resetEmailInput}" berhasil diperbarui!\n\nSilakan masuk menggunakan kata sandi baru Anda.`);
+      setAuthFeedback({
+        type: "success",
+        text: `Kata sandi untuk "${resetEmailInput}" berhasil diperbarui. Silakan masuk menggunakan kata sandi baru Anda.`,
+      });
       setLoginEmail(resetEmailInput);
       setLoginSandi(resetNewSandi);
       setShowResetModal(false);
       setResetNewSandi("");
     } catch (err: any) {
-      alert("Gagal memperbarui kata sandi: " + (err?.message || String(err)));
+      setAuthFeedback({ type: "error", text: "Gagal memperbarui kata sandi: " + (err?.message || String(err)) });
     } finally {
       setIsResettingSandi(false);
     }
@@ -1595,21 +1728,22 @@ export default function App() {
 
   const handleCustomRegister = async (e: React.FormEvent) => {
     e.preventDefault();
+    setAuthFeedback(null);
     if (!regNamaSingle || !regEmailSingle || !regPekerjaanSingle || !regInstansiSingle || !regSandiSingle || !regConfirmSandiSingle) {
-      alert("Mohon isi seluruh kolom pendaftaran!");
+      setAuthFeedback({ type: "error", text: "Mohon lengkapi seluruh kolom pendaftaran terlebih dahulu." });
       return;
     }
     if (regSandiSingle.length < 6) {
-      alert("Kata sandi minimal 6 karakter demi keamanan akun Anda.");
+      setAuthFeedback({ type: "error", text: "Kata sandi minimal 6 karakter demi keamanan akun Anda." });
       return;
     }
     if (regSandiSingle !== regConfirmSandiSingle) {
-      alert("Konfirmasi kata sandi tidak cocok!");
+      setAuthFeedback({ type: "error", text: "Konfirmasi kata sandi tidak cocok!" });
       return;
     }
     setIsRegistering(true);
     try {
-      await registerCustomUser({
+      const otpResult = await registerCustomUser({
         namaLengkap: regNamaSingle,
         email: regEmailSingle,
         profesi: regPekerjaanSingle,
@@ -1617,16 +1751,48 @@ export default function App() {
         sandi: regSandiSingle
       });
 
-      alert(
-        `Pendaftaran Berhasil!\n\nAkun Anda dengan email "${regEmailSingle}" telah didaftarkan dan sedang menunggu persetujuan (acc) oleh administrator untuk diatur masa aktifnya.\n\nSilakan hubungi administrator utama untuk persetujuan akun Anda.`
-      );
-      
-      // Auto-prefill the login fields and switch to login tab
+      setPendingOtpSession(otpResult);
+      setOtpInput("");
+      setOtpError(null);
+      setOtpInfo(otpResult.message);
+      setOtpResendCooldown(20);
+      setCopiedOtpPreview(false);
+
+      // Prefill login email for convenience
       setLoginEmail(regEmailSingle);
       setLoginSandi(regSandiSingle);
-      setAuthTab("masuk");
+    } catch (err: any) {
+      setAuthFeedback({ type: "error", text: err?.message || "Gagal melakukan registrasi." });
+    } finally {
+      setIsRegistering(false);
+    }
+  };
 
-      // Reset registration form
+  const handleVerifyOtpSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!pendingOtpSession) return;
+    setOtpError(null);
+    const cleanCode = otpInput.replace(/\D/g, "").trim();
+    if (cleanCode.length !== 6) {
+      setOtpError("Masukkan tepat 6 digit angka kode verifikasi.");
+      return;
+    }
+    setIsVerifyingOtp(true);
+    try {
+      await verifyRegistrationCode({
+        email: pendingOtpSession.recipientEmail,
+        code: cleanCode,
+        verificationToken: pendingOtpSession.verificationToken,
+        autoLogin: true,
+      });
+
+      setPendingOtpSession(null);
+      setOtpInput("");
+      setOtpError(null);
+      setOtpInfo(null);
+      setAuthFeedback(null);
+
+      // Reset registration inputs after successful activation
       setRegNamaSingle("");
       setRegEmailSingle("");
       setRegPekerjaanSingle("");
@@ -1634,10 +1800,43 @@ export default function App() {
       setRegSandiSingle("");
       setRegConfirmSandiSingle("");
     } catch (err: any) {
-      alert(err.message || "Gagal melakukan registrasi.");
+      setOtpError(err?.message || "Kode verifikasi salah. Silakan periksa kembali kode Anda.");
     } finally {
-      setIsRegistering(false);
+      setIsVerifyingOtp(false);
     }
+  };
+
+  const handleResendOtp = async () => {
+    if (!pendingOtpSession || otpResendCooldown > 0 || isResendingOtp) return;
+    setOtpError(null);
+    setIsResendingOtp(true);
+    try {
+      const freshResult = await resendVerificationCode({
+        email: pendingOtpSession.recipientEmail,
+        namaLengkap: pendingOtpSession.namaLengkap,
+        namaSPPG: pendingOtpSession.namaSPPG,
+        uid: pendingOtpSession.uid,
+      });
+      setPendingOtpSession(freshResult);
+      setOtpInput("");
+      setOtpInfo(freshResult.message);
+      setOtpResendCooldown(20);
+      setCopiedOtpPreview(false);
+    } catch (err: any) {
+      setOtpError(err?.message || "Gagal mengirim ulang kode verifikasi.");
+    } finally {
+      setIsResendingOtp(false);
+    }
+  };
+
+  const handleCancelPendingOtp = () => {
+    setPendingOtpSession(null);
+    setOtpInput("");
+    setOtpError(null);
+    setOtpInfo(null);
+    try {
+      sessionStorage.removeItem(PENDING_OTP_STORAGE_KEY);
+    } catch {}
   };
 
   const handleMultiRoleRegister = async (e: React.FormEvent) => {
@@ -1708,17 +1907,16 @@ export default function App() {
           <div className="w-full md:w-[420px] shrink-0 bg-[#112461] bg-gradient-to-b from-[#112461] via-[#0E1E52] to-[#0A153A] text-white p-8 md:p-10 flex flex-col justify-between min-h-[480px] md:min-h-[640px] relative items-center text-center">
             {/* Top Logo and branding - Centered and Uploadable */}
             <div className="flex flex-col items-center gap-3 w-full">
-              <div className="relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-xl bg-slate-900/40 flex items-center justify-center">
-                {globalAppLogo || customLogo ? (
-                  <img
-                    src={globalAppLogo || customLogo}
-                    alt="Logo GiziSync"
-                    className="w-full h-full object-cover"
-                    referrerPolicy="no-referrer"
-                  />
-                ) : (
-                  <Utensils className="w-10 h-10 text-white" />
-                )}
+              <div className="relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-xl bg-white flex items-center justify-center">
+                <img
+                  src={globalAppLogo || customLogo || kopLeftLogo || DEFAULT_FALLBACK_LOGO}
+                  alt="Logo GiziSync"
+                  className="w-full h-full object-cover"
+                  referrerPolicy="no-referrer"
+                  onError={(e) => {
+                    (e.target as HTMLImageElement).src = DEFAULT_FALLBACK_LOGO;
+                  }}
+                />
               </div>
               
               <div>
@@ -1815,11 +2013,46 @@ export default function App() {
                 </div>
               </div>
 
+              {authFeedback && (
+                <div
+                  className={`mb-4 rounded-2xl p-3.5 text-xs flex items-start justify-between gap-3 border ${
+                    authFeedback.type === "error"
+                      ? "bg-rose-50 border-rose-200 text-rose-900"
+                      : authFeedback.type === "success"
+                      ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                      : "bg-indigo-50 border-indigo-200 text-indigo-900"
+                  }`}
+                >
+                  <div className="flex items-start gap-2">
+                    {authFeedback.type === "success" ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    ) : (
+                      <AlertCircle
+                        className={`w-4 h-4 shrink-0 mt-0.5 ${
+                          authFeedback.type === "error" ? "text-rose-600" : "text-indigo-600"
+                        }`}
+                      />
+                    )}
+                    <span className="font-bold leading-relaxed">{authFeedback.text}</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAuthFeedback(null)}
+                    className="font-extrabold hover:underline shrink-0 cursor-pointer text-[11px]"
+                  >
+                    Tutup
+                  </button>
+                </div>
+              )}
+
               {/* Modern tab selectors inside right column */}
               <div className="flex bg-slate-100 p-1 rounded-2xl border border-slate-200 mb-5">
                 <button
                   type="button"
-                  onClick={() => setAuthTab("masuk")}
+                  onClick={() => {
+                    setAuthTab("masuk");
+                    setAuthFeedback(null);
+                  }}
                   className={`flex-1 py-2 text-xs font-extrabold rounded-xl transition-all duration-155 ${
                     authTab === "masuk"
                       ? "bg-[#112461] text-white shadow-sm"
@@ -1830,14 +2063,17 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => setAuthTab("daftar")}
+                  onClick={() => {
+                    setAuthTab("daftar");
+                    setAuthFeedback(null);
+                  }}
                   className={`flex-1 py-2 text-xs font-extrabold rounded-xl transition-all duration-155 ${
                     authTab === "daftar"
                       ? "bg-[#112461] text-white shadow-sm"
                       : "text-slate-500 hover:text-slate-800"
                   }`}
                 >
-                  Pendaftaran Baru
+                  {pendingOtpSession ? "Verifikasi Email (OTP)" : "Pendaftaran Baru"}
                 </button>
               </div>
 
@@ -1905,6 +2141,165 @@ export default function App() {
                     )}
                   </button>
                 </form>
+              ) : pendingOtpSession ? (
+                /* EMAIL VERIFICATION CODE (OTP) FORM */
+                <form onSubmit={handleVerifyOtpSubmit} className="space-y-4 text-left text-xs text-slate-700">
+                  <div className="bg-[#F4F7FC] p-5 md:p-6 rounded-2xl border border-indigo-200/80 space-y-4 shadow-2xs">
+                    <div className="flex items-start gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-sm">
+                        <Mail className="w-5 h-5" />
+                      </div>
+                      <div className="space-y-1 flex-1">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <h3 className="text-sm font-black text-slate-900">Verifikasi Kode Email</h3>
+                          <span
+                            className={`text-[10px] font-extrabold px-2.5 py-0.5 rounded-md ${
+                              otpSecondsLeft > 0
+                                ? "bg-emerald-100 text-emerald-800"
+                                : "bg-rose-100 text-rose-700"
+                            }`}
+                          >
+                            {otpSecondsLeft > 0
+                              ? `Berlaku ${String(Math.floor(otpSecondsLeft / 60)).padStart(2, "0")}:${String(
+                                  otpSecondsLeft % 60
+                                ).padStart(2, "0")}`
+                              : "Kode Kedaluwarsa"}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-slate-600 leading-relaxed">
+                          Sistem otomatis telah mengirim kode verifikasi 6 digit ke{" "}
+                          <strong className="text-indigo-700">{pendingOtpSession.recipientEmail}</strong>. Masukkan kode tersebut untuk langsung mengaktifkan akun Anda.
+                        </p>
+                      </div>
+                    </div>
+
+                    {otpInfo && (
+                      <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-[11px] text-emerald-900 font-semibold flex items-start gap-2">
+                        <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                        <span>{otpInfo}</span>
+                      </div>
+                    )}
+
+                    {/* When server SMTP/Resend secrets are not yet configured, display formatted email delivery preview so user can validate immediately */}
+                    {pendingOtpSession.deliveryMode === "preview" && pendingOtpSession.previewCode && (
+                      <div className="bg-white border border-indigo-200 rounded-xl p-4 space-y-2.5 shadow-2xs">
+                        <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
+                          <span className="text-[10px] font-black uppercase tracking-wider text-indigo-700 flex items-center gap-1.5">
+                            <Send className="w-3.5 h-3.5" />
+                            Email Verifikasi Otomatis Terkirim
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (pendingOtpSession.previewCode) {
+                                navigator.clipboard?.writeText(pendingOtpSession.previewCode).catch(() => {});
+                                setOtpInput(pendingOtpSession.previewCode);
+                                setCopiedOtpPreview(true);
+                                setTimeout(() => setCopiedOtpPreview(false), 2000);
+                              }
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-[10px] rounded-lg transition cursor-pointer"
+                          >
+                            {copiedOtpPreview ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                            <span>{copiedOtpPreview ? "Diisi Otomatis" : "Salin & Isi Kode"}</span>
+                          </button>
+                        </div>
+                        <div className="text-[10.5px] text-slate-500 space-y-0.5">
+                          <div>
+                            <strong className="text-slate-700">Kepada:</strong> {pendingOtpSession.recipientEmail}
+                          </div>
+                          <div>
+                            <strong className="text-slate-700">Subjek:</strong>{" "}
+                            {pendingOtpSession.emailSubject || "[SISPERMBG] Kode Verifikasi Pendaftaran"}
+                          </div>
+                        </div>
+                        <div className="bg-slate-50 border border-dashed border-indigo-300 rounded-xl py-3 px-4 text-center">
+                          <div className="text-[9.5px] uppercase font-bold tracking-widest text-slate-400">
+                            Kode Verifikasi 6 Digit
+                          </div>
+                          <div className="text-2xl font-black tracking-[0.35em] text-[#112461] font-mono mt-1">
+                            {pendingOtpSession.previewCode}
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-slate-400 leading-snug">
+                          Pengiriman ke kotak masuk eksternal otomatis aktif saat kredensial SMTP/Resend diatur di server.
+                        </p>
+                      </div>
+                    )}
+
+                    {/* 6-Digit OTP Input */}
+                    <div className="space-y-2">
+                      <label className="font-bold text-slate-700 text-xs block">
+                        Masukkan 6 Digit Kode Verifikasi:
+                      </label>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        maxLength={6}
+                        value={otpInput}
+                        onChange={(e) => {
+                          const digits = e.target.value.replace(/\D/g, "").slice(0, 6);
+                          setOtpInput(digits);
+                          setOtpError(null);
+                        }}
+                        placeholder="000000"
+                        className="w-full px-4 py-3.5 bg-white border-2 border-indigo-300 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-500/20 rounded-2xl text-center text-2xl font-black tracking-[0.45em] font-mono text-[#112461] focus:outline-none transition-all shadow-2xs"
+                      />
+                      {otpError && (
+                        <div className="bg-rose-50 border border-rose-200 text-rose-700 font-bold text-[11px] rounded-xl p-2.5 flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
+                          <span>{otpError}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px]">
+                      <button
+                        type="button"
+                        onClick={handleResendOtp}
+                        disabled={otpResendCooldown > 0 || isResendingOtp}
+                        className="font-bold text-indigo-600 hover:text-indigo-800 disabled:text-slate-400 disabled:cursor-not-allowed cursor-pointer inline-flex items-center gap-1"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isResendingOtp ? "animate-spin" : ""}`} />
+                        <span>
+                          {isResendingOtp
+                            ? "Mengirim Ulang..."
+                            : otpResendCooldown > 0
+                            ? `Kirim Ulang Kode (${otpResendCooldown}d)`
+                            : "Kirim Ulang Kode Verifikasi"}
+                        </span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleCancelPendingOtp}
+                        className="font-bold text-slate-500 hover:text-slate-800 cursor-pointer inline-flex items-center gap-1"
+                      >
+                        <ArrowLeft className="w-3.5 h-3.5" />
+                        <span>Ubah Email</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isVerifyingOtp || otpInput.replace(/\D/g, "").length !== 6 || otpSecondsLeft === 0}
+                    className="w-full py-3.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold rounded-2xl transition cursor-pointer shadow-lg shadow-emerald-500/20 disabled:opacity-50 disabled:cursor-not-allowed text-xs flex items-center justify-center gap-2"
+                  >
+                    {isVerifyingOtp ? (
+                      <>
+                        <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                        <span>Memvalidasi & Mengaktifkan Akun...</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck className="w-4 h-4" />
+                        <span>Verifikasi Kode & Aktifkan Akun Sekarang</span>
+                      </>
+                    )}
+                  </button>
+                </form>
               ) : (
                 /* SINGLE USER REGISTRATION FORM MATCHING REFERENCE IMAGE FORMAT */
                 <form onSubmit={handleCustomRegister} className="space-y-4 text-left text-xs text-slate-700">
@@ -1942,7 +2337,7 @@ export default function App() {
                     {/* Email */}
                     <div className="space-y-1">
                       <div className="flex items-center justify-between">
-                        <label className="font-bold text-slate-700 text-xs block">Email:</label>
+                        <label className="font-bold text-slate-700 text-xs block">Email Aktif (Untuk Kode Verifikasi):</label>
                         {regEmailSingle.length > 0 && (
                           <span className="text-[10px] font-bold">
                             {isRegEmailValid ? (
@@ -2146,15 +2541,18 @@ export default function App() {
                     <button
                       type="submit"
                       disabled={isRegistering}
-                      className="px-6 py-2.5 bg-[#6B9EFF] hover:bg-blue-600 active:scale-98 text-white font-extrabold rounded-xl shadow-xs transition-all cursor-pointer text-xs flex items-center justify-center gap-2 disabled:opacity-80 disabled:cursor-not-allowed"
+                      className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 active:scale-98 text-white font-extrabold rounded-xl shadow-xs transition-all cursor-pointer text-xs flex items-center justify-center gap-2 disabled:opacity-80 disabled:cursor-not-allowed"
                     >
                       {isRegistering ? (
                         <>
                           <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                          <span>Memproses Registrasi...</span>
+                          <span>Mengirim Kode Verifikasi...</span>
                         </>
                       ) : (
-                        "Daftar & Ajukan Akses"
+                        <>
+                          <Send className="w-3.5 h-3.5" />
+                          <span>Daftar & Kirim Kode Verifikasi</span>
+                        </>
                       )}
                     </button>
                   </div>
@@ -2477,12 +2875,15 @@ export default function App() {
         
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center justify-between gap-5 relative z-10">
           <div className="flex items-center gap-3.5">
-            <div className={`relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-lg ${isAdminUser ? "group cursor-pointer" : ""}`}>
+            <div className={`relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-lg bg-white ${isAdminUser ? "group cursor-pointer" : ""}`}>
               <img
-                src={customLogo || kopRightLogo || kopLeftLogo || "/src/assets/images/logo_sppg_1782256222616.jpg"}
+                src={globalAppLogo || customLogo || kopLeftLogo || DEFAULT_FALLBACK_LOGO}
                 alt="Logo SPPG"
                 className="w-full h-full object-cover"
                 referrerPolicy="no-referrer"
+                onError={(e) => {
+                  (e.target as HTMLImageElement).src = DEFAULT_FALLBACK_LOGO;
+                }}
               />
               {isAdminUser && (
                 <>

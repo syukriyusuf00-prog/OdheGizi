@@ -1140,7 +1140,7 @@ export default function DashboardOutputs({
                     className="w-16 h-16 object-contain" 
                     referrerPolicy="no-referrer"
                     onError={(e) => {
-                      (e.target as HTMLImageElement).src = "/src/assets/images/logo_sppg_1782256222616.jpg";
+                      (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
                     }}
                   />
                 </div>

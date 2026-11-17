@@ -463,7 +463,7 @@ export default function MasterMenuTab({
     );
   };
 
-  const defaultLogoSrc = customLogo || "/src/assets/images/logo_sppg_1782256222616.jpg";
+  const defaultLogoSrc = customLogo || "/assets/images/app_logo_sppg.png";
 
   const bannerCategoryTitle = useMemo(() => {
     if (!activePlan) return "";
@@ -1205,7 +1205,7 @@ export default function MasterMenuTab({
                 referrerPolicy="no-referrer"
                 onError={(e) => {
                   (e.target as HTMLImageElement).src =
-                    "/src/assets/images/logo_sppg_1782256222616.jpg";
+                    "/assets/images/app_logo_sppg.png";
                 }}
               />
             </div>

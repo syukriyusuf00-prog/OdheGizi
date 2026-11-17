@@ -32,8 +32,17 @@ import {
   Briefcase,
   Building,
   Key,
-  Camera
+  Camera,
+  Smartphone,
+  Tablet,
+  Laptop,
+  Monitor,
+  Globe,
+  Wifi,
+  WifiOff,
+  MailCheck
 } from "lucide-react";
+import { DeviceRecord, getCachedLocalDevice, formatDeviceShortLabel } from "../lib/deviceTracker.ts";
 
 interface AdminPanelProps {
   onClose: () => void;
@@ -112,13 +121,25 @@ const getOfflineUsers = () => {
 
 export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo }: AdminPanelProps) {
   const [users, setUsers] = useState<any[]>([]);
+  const [devices, setDevices] = useState<DeviceRecord[]>(() => {
+    const localDev = getCachedLocalDevice();
+    return localDev ? [localDev] : [];
+  });
+  const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "Desktop / Laptop" | "Mobile" | "Tablet" | "guest" | "demo">("all");
+  const [deviceSearchQuery, setDeviceSearchQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
-  const [activeTab, setActiveTab] = useState<"manajemen" | "riwayat" | "diagnostik">(() => {
+  const [activeTab, setActiveTab] = useState<"manajemen" | "perangkat" | "riwayat" | "diagnostik">(() => {
     return (localStorage.getItem("sisper_admin_tab") as any) || "manajemen";
   });
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [selectedUserUids, setSelectedUserUids] = useState<string[]>([]);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowTick(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     localStorage.setItem("sisper_admin_tab", activeTab);
@@ -275,6 +296,148 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       window.removeEventListener("sisper_user_registered", handleRegistered);
     };
   }, [refreshTrigger]);
+
+  // Real-time automatic subscription to ALL connected devices (/devices collection)
+  useEffect(() => {
+    const mergeDeviceList = (remoteList: DeviceRecord[]) => {
+      const map = new Map<string, DeviceRecord>();
+      const localDev = getCachedLocalDevice();
+      if (localDev?.deviceId) {
+        map.set(localDev.deviceId, localDev);
+      }
+      remoteList.forEach((d) => {
+        if (!d?.deviceId) return;
+        const prev = map.get(d.deviceId);
+        if (!prev) {
+          map.set(d.deviceId, d);
+        } else {
+          const prevTime = new Date(prev.lastSeenAt || 0).getTime();
+          const nextTime = new Date(d.lastSeenAt || 0).getTime();
+          map.set(d.deviceId, nextTime >= prevTime ? { ...prev, ...d } : { ...d, ...prev });
+        }
+      });
+
+      const sorted = Array.from(map.values()).sort((a, b) => {
+        const ta = new Date(a.lastSeenAt || 0).getTime();
+        const tb = new Date(b.lastSeenAt || 0).getTime();
+        return tb - ta;
+      });
+      setDevices(sorted);
+    };
+
+    mergeDeviceList([]);
+
+    const devicesCol = collection(db, "devices");
+    const unsubscribeDevices = onSnapshot(
+      devicesCol,
+      (snapshot) => {
+        const list: DeviceRecord[] = snapshot.docs.map((docSnap) => {
+          const data = docSnap.data() as DeviceRecord;
+          return {
+            ...data,
+            deviceId: data.deviceId || docSnap.id,
+          };
+        });
+        mergeDeviceList(list);
+      },
+      (err) => {
+        console.warn("Firestore devices listener notice:", err);
+      }
+    );
+
+    const handleLocalDeviceUpdate = (e: any) => {
+      if (e?.detail?.deviceId) {
+        setDevices((prev) => {
+          const incoming = e.detail as DeviceRecord;
+          const exists = prev.some((d) => d.deviceId === incoming.deviceId);
+          const next = exists
+            ? prev.map((d) => (d.deviceId === incoming.deviceId ? { ...d, ...incoming } : d))
+            : [incoming, ...prev];
+          return next.sort(
+            (a, b) => new Date(b.lastSeenAt || 0).getTime() - new Date(a.lastSeenAt || 0).getTime()
+          );
+        });
+      }
+    };
+
+    window.addEventListener("sisper_device_updated", handleLocalDeviceUpdate);
+    return () => {
+      unsubscribeDevices();
+      window.removeEventListener("sisper_device_updated", handleLocalDeviceUpdate);
+    };
+  }, [refreshTrigger]);
+
+  const isDeviceLiveOnline = (dev?: Partial<DeviceRecord> | null) => {
+    if (!dev || dev.isOnline === false || !dev.lastSeenAt) return false;
+    const seenMs = new Date(dev.lastSeenAt).getTime();
+    if (Number.isNaN(seenMs)) return false;
+    return nowTick - seenMs < 3 * 60 * 1000;
+  };
+
+  const formatRelativeTime = (iso?: string | null) => {
+    if (!iso) return "-";
+    const ms = new Date(iso).getTime();
+    if (Number.isNaN(ms)) return "-";
+    const diffSec = Math.max(0, Math.floor((nowTick - ms) / 1000));
+    if (diffSec < 45) return "Baru saja";
+    if (diffSec < 3600) return `${Math.floor(diffSec / 60)} mnt lalu`;
+    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} jam lalu`;
+    return `${Math.floor(diffSec / 86400)} hari lalu`;
+  };
+
+  const handleDeleteDeviceRecord = async (deviceId: string) => {
+    if (!deviceId) return;
+    try {
+      await deleteDoc(doc(db, "devices", deviceId));
+      setDevices((prev) => prev.filter((d) => d.deviceId !== deviceId));
+    } catch (err) {
+      console.warn("Gagal menghapus catatan perangkat:", err);
+    }
+  };
+
+  const getDevicesForUser = (userItem: any): DeviceRecord[] => {
+    const emailLower = (userItem?.email || "").toLowerCase().trim();
+    const matched = devices.filter(
+      (d) =>
+        (d.userUid && (d.userUid === userItem.uid || d.userUid === userItem.id)) ||
+        (emailLower && d.userEmail && d.userEmail.toLowerCase().trim() === emailLower)
+    );
+    if (matched.length > 0) return matched;
+    if (userItem?.lastDevice?.deviceId) {
+      return [
+        {
+          deviceId: userItem.lastDevice.deviceId,
+          deviceType: userItem.lastDevice.deviceType || "Desktop / Laptop",
+          deviceModel: userItem.lastDevice.deviceModel || "Perangkat Web",
+          osName: userItem.lastDevice.osName || "-",
+          browserName: userItem.lastDevice.browserName || "-",
+          screenResolution: userItem.lastDevice.screenResolution || "-",
+          viewportSize: "-",
+          language: "id-ID",
+          timezone: userItem.lastDevice.timezone || "-",
+          ipAddress: userItem.lastDevice.ipAddress || "-",
+          userAgent: "",
+          sessionState: "active",
+          userUid: userItem.uid,
+          userEmail: userItem.email,
+          userName: userItem.namaLengkap,
+          namaSPPG: userItem.namaSPPG,
+          peran: userItem.peran,
+          statusPersetujuan: userItem.statusPersetujuan,
+          isOnline: Boolean(userItem.lastDevice.isOnline),
+          firstSeenAt: userItem.lastDevice.lastSeenAt || userItem.createdAt || "",
+          lastSeenAt: userItem.lastDevice.lastSeenAt || userItem.lastDeviceSeenAt || "",
+        },
+      ];
+    }
+    return [];
+  };
+
+  const renderDeviceIcon = (deviceType?: string, className = "w-3.5 h-3.5") => {
+    if (deviceType === "Mobile") return <Smartphone className={className} />;
+    if (deviceType === "Tablet") return <Tablet className={className} />;
+    return <Laptop className={className} />;
+  };
 
   // Handle setting explicit approval status (ACC / Menunggu / Blokir)
   const handleSetStatus = async (userId: string, newStatus: "aktif" | "menunggu" | "diblokir") => {
@@ -748,10 +911,34 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
     }
   };
 
-  // Calculate metrics based on actual non-admin tenants
+  // Calculate metrics based on actual non-admin tenants & live devices
   const tenantUsers = users.filter(u => u.uid !== "admin_syukriyusuf82" && u.uid !== "admin_sukriyusuf82" && !isMainAdminEmail(u.email));
   const totalUsersCount = tenantUsers.length;
   const activeUsersCount = tenantUsers.filter(u => u.statusPersetujuan === "aktif").length;
+  const emailVerifiedCount = tenantUsers.filter(u => u.emailVerified === true || u.activatedBy === "email_otp").length;
+  const onlineDevicesCount = devices.filter(d => isDeviceLiveOnline(d)).length;
+
+  const filteredDevices = devices.filter((d) => {
+    if (deviceFilter === "online" && !isDeviceLiveOnline(d)) return false;
+    if (deviceFilter === "Desktop / Laptop" && d.deviceType !== "Desktop / Laptop") return false;
+    if (deviceFilter === "Mobile" && d.deviceType !== "Mobile") return false;
+    if (deviceFilter === "Tablet" && d.deviceType !== "Tablet") return false;
+    if (deviceFilter === "guest" && d.sessionState !== "guest" && d.sessionState !== "registering") return false;
+    if (deviceFilter === "demo" && d.sessionState !== "demo") return false;
+
+    const q = deviceSearchQuery.toLowerCase().trim();
+    if (!q) return true;
+    return (
+      (d.deviceModel || "").toLowerCase().includes(q) ||
+      (d.osName || "").toLowerCase().includes(q) ||
+      (d.browserName || "").toLowerCase().includes(q) ||
+      (d.deviceId || "").toLowerCase().includes(q) ||
+      (d.ipAddress || "").toLowerCase().includes(q) ||
+      (d.userEmail || "").toLowerCase().includes(q) ||
+      (d.userName || "").toLowerCase().includes(q) ||
+      (d.namaSPPG || "").toLowerCase().includes(q)
+    );
+  });
   
   // Calculate users logged in last 24h
   const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
@@ -806,12 +993,15 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       {onUploadGlobalLogo && (
         <div className="bg-white p-4 rounded-2xl border border-indigo-200/80 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
           <div className="flex items-center gap-3.5">
-            <div className="w-14 h-14 rounded-full border-2 border-emerald-400 overflow-hidden bg-slate-100 shrink-0 flex items-center justify-center shadow-xs">
+            <div className="w-14 h-14 rounded-full border-2 border-emerald-400 overflow-hidden bg-white shrink-0 flex items-center justify-center shadow-xs">
               <img
-                src={globalLogoUrl || "/src/assets/images/logo_sppg_1782256222616.jpg"}
+                src={globalLogoUrl || "/assets/images/app_logo_sppg.png"}
                 alt="Logo Aplikasi Global"
                 className="w-full h-full object-cover"
                 referrerPolicy="no-referrer"
+                onError={(e) => {
+                  (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
+                }}
               />
             </div>
             <div>
@@ -856,7 +1046,14 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
           </div>
           <div>
             <p className="text-xs font-semibold text-slate-400">Pengguna Aktif</p>
-            <p className="text-2xl font-extrabold text-slate-900">{activeUsersCount}</p>
+            <div className="flex items-baseline gap-2">
+              <p className="text-2xl font-extrabold text-slate-900">{activeUsersCount}</p>
+              {emailVerifiedCount > 0 && (
+                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded">
+                  {emailVerifiedCount} OTP
+                </span>
+              )}
+            </div>
           </div>
         </div>
 
@@ -871,23 +1068,34 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
           </div>
         </div>
 
-        {/* Status Sistem */}
-        <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-xs flex items-center gap-4">
+        {/* Perangkat Terdeteksi Otomatis */}
+        <button
+          type="button"
+          onClick={() => setActiveTab("perangkat")}
+          className="bg-white p-5 rounded-2xl border border-slate-100 hover:border-teal-300 shadow-xs flex items-center gap-4 text-left transition cursor-pointer"
+          title="Klik untuk melihat seluruh device yang terbaca otomatis"
+        >
           <div className="p-3.5 bg-teal-50 text-teal-600 rounded-xl">
-            <Activity className="w-6 h-6 animate-pulse" />
+            <Monitor className="w-6 h-6" />
           </div>
           <div>
-            <p className="text-xs font-semibold text-slate-400">Status Sistem</p>
-            <p className="text-2xl font-extrabold text-teal-600">Healthy</p>
+            <p className="text-xs font-semibold text-slate-400">Perangkat Terbaca</p>
+            <div className="flex items-center gap-2">
+              <p className="text-2xl font-extrabold text-slate-900">{devices.length}</p>
+              <span className="inline-flex items-center gap-1 text-[10px] font-extrabold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                {onlineDevicesCount} Online
+              </span>
+            </div>
           </div>
-        </div>
+        </button>
       </div>
 
-      {/* Navigation Sub-Tabs matching Image 1 */}
-      <div className="flex border-b border-slate-200">
+      {/* Navigation Sub-Tabs */}
+      <div className="flex flex-wrap border-b border-slate-200">
         <button
           onClick={() => setActiveTab("manajemen")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition ${
+          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
             activeTab === "manajemen"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-900"
@@ -897,8 +1105,23 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
           Manajemen Pengguna
         </button>
         <button
+          onClick={() => setActiveTab("perangkat")}
+          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
+            activeTab === "perangkat"
+              ? "border-indigo-600 text-indigo-600"
+              : "border-transparent text-slate-500 hover:text-slate-900"
+          }`}
+        >
+          <Monitor className="w-4 h-4" />
+          Perangkat (Device)
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-800">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+            {devices.length}
+          </span>
+        </button>
+        <button
           onClick={() => setActiveTab("riwayat")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition ${
+          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
             activeTab === "riwayat"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-900"
@@ -909,7 +1132,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         </button>
         <button
           onClick={() => setActiveTab("diagnostik")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition ${
+          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
             activeTab === "diagnostik"
               ? "border-indigo-600 text-indigo-600"
               : "border-transparent text-slate-500 hover:text-slate-900"
@@ -981,8 +1204,9 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                     </th>
                     <th className="p-4">Email / Tenant ID</th>
                     <th className="p-4">Data Diri & SPPG</th>
+                    <th className="p-4">Perangkat (Device)</th>
                     <th className="p-4 text-center">Peran</th>
-                    <th className="p-4 text-center">Status Persetujuan</th>
+                    <th className="p-4 text-center">Status & Verifikasi</th>
                     <th className="p-4 text-center">Berakhir Pada</th>
                     <th className="p-4 text-center">Login Terakhir</th>
                     <th className="p-4 text-center">Aksi</th>
@@ -991,14 +1215,14 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                 <tbody className="divide-y divide-slate-100 text-slate-700">
                   {loading ? (
                     <tr>
-                      <td colSpan={8} className="p-8 text-center text-slate-400">
+                      <td colSpan={9} className="p-8 text-center text-slate-400">
                         <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-indigo-500" />
                         Sedang menyinkronkan data dari Firestore...
                       </td>
                     </tr>
                   ) : filteredUsers.length === 0 ? (
                     <tr>
-                      <td colSpan={8} className="p-8 text-center text-slate-400">
+                      <td colSpan={9} className="p-8 text-center text-slate-400">
                         Tidak ada tenant atau pengguna ditemukan.
                       </td>
                     </tr>
@@ -1050,6 +1274,70 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                           )}
                         </td>
 
+                        {/* Perangkat (Device) Terdeteksi Otomatis */}
+                        <td className="p-4">
+                          {(() => {
+                            const userDevs = getDevicesForUser(item);
+                            if (userDevs.length === 0) {
+                              return <span className="text-[10.5px] text-slate-400 italic">Belum terdeteksi</span>;
+                            }
+                            return (
+                              <div className="space-y-1.5 max-w-[220px]">
+                                {userDevs.slice(0, 2).map((dev) => {
+                                  const live = isDeviceLiveOnline(dev);
+                                  return (
+                                    <div
+                                      key={dev.deviceId}
+                                      className="p-1.5 rounded-lg bg-slate-50 border border-slate-200/80 text-[10px] space-y-0.5"
+                                    >
+                                      <div className="flex items-center justify-between gap-1.5">
+                                        <span className="font-bold text-slate-800 flex items-center gap-1 truncate">
+                                          {renderDeviceIcon(dev.deviceType, "w-3 h-3 text-indigo-500 shrink-0")}
+                                          <span className="truncate">{dev.deviceModel || dev.osName}</span>
+                                        </span>
+                                        <span
+                                          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-extrabold shrink-0 ${
+                                            live
+                                              ? "bg-emerald-100 text-emerald-700"
+                                              : "bg-slate-200/80 text-slate-600"
+                                          }`}
+                                        >
+                                          <span
+                                            className={`w-1.5 h-1.5 rounded-full ${
+                                              live ? "bg-emerald-500 animate-pulse" : "bg-slate-400"
+                                            }`}
+                                          ></span>
+                                          {live ? "Online" : formatRelativeTime(dev.lastSeenAt)}
+                                        </span>
+                                      </div>
+                                      <div className="text-slate-500 truncate">
+                                        {dev.osName} · {dev.browserName}
+                                      </div>
+                                      {dev.ipAddress && dev.ipAddress !== "-" && (
+                                        <div className="text-[9.5px] font-mono text-slate-400 truncate">
+                                          IP: {dev.ipAddress}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                                {userDevs.length > 2 && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setDeviceSearchQuery(item.email || "");
+                                      setActiveTab("perangkat");
+                                    }}
+                                    className="text-[10px] font-bold text-indigo-600 hover:underline cursor-pointer"
+                                  >
+                                    +{userDevs.length - 2} perangkat lainnya
+                                  </button>
+                                )}
+                              </div>
+                            );
+                          })()}
+                        </td>
+
                         {/* Peran / Role */}
                         <td className="p-4 text-center">
                           <button
@@ -1064,15 +1352,29 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                           </button>
                         </td>
 
-                        {/* Status Persetujuan */}
+                        {/* Status Persetujuan & Verifikasi Email */}
                         <td className="p-4 text-center">
                           <div className="flex flex-col items-center gap-1.5">
                             {item.statusPersetujuan === "aktif" ? (
                               <div className="flex flex-col items-center gap-1">
                                 <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-extrabold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">
-                                  <CheckCircle className="w-3 h-3 text-emerald-600" />
-                                  Disetujui (ACC)
+                                  {item.emailVerified || item.activatedBy === "email_otp" ? (
+                                    <>
+                                      <MailCheck className="w-3 h-3 text-emerald-600" />
+                                      Aktif · Verifikasi Email
+                                    </>
+                                  ) : (
+                                    <>
+                                      <CheckCircle className="w-3 h-3 text-emerald-600" />
+                                      Disetujui (ACC)
+                                    </>
+                                  )}
                                 </span>
+                                {item.emailVerifiedAt && (
+                                  <span className="text-[9.5px] text-emerald-700 font-medium">
+                                    OTP: {formatTimestamp(item.emailVerifiedAt)}
+                                  </span>
+                                )}
                                 <button
                                   onClick={() => handleSetStatus(item.uid || item.id, "diblokir")}
                                   className="text-[10px] text-rose-600 hover:text-rose-800 font-bold underline cursor-pointer"
@@ -1083,6 +1385,12 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                               </div>
                             ) : item.statusPersetujuan === "menunggu" || item.statusPersetujuan === "pending" ? (
                               <div className="flex flex-col items-center gap-1">
+                                {item.verificationStatus === "pending_otp" && (
+                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[9.5px] font-extrabold rounded-full bg-amber-100 text-amber-800 border border-amber-300">
+                                    <Mail className="w-2.5 h-2.5" />
+                                    Menunggu Kode OTP
+                                  </span>
+                                )}
                                 <button
                                   onClick={() => handleSetStatus(item.uid || item.id, "aktif")}
                                   className="inline-flex items-center gap-1 px-3 py-1 text-xs font-black rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition shadow-sm cursor-pointer animate-pulse"
@@ -1205,13 +1513,225 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         </div>
       )}
 
+      {activeTab === "perangkat" && (
+        <div className="space-y-4">
+          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs space-y-3">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
+                  <Monitor className="w-4 h-4 text-indigo-600" />
+                  Monitoring Perangkat (Device) Otomatis Real-Time
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Setiap perangkat (HP, Tablet, Laptop/PC) yang mengakses, mendaftar, atau masuk ke aplikasi terbaca otomatis secara real-time.
+                </p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <div className="relative w-full sm:w-64">
+                  <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400" />
+                  <input
+                    type="text"
+                    value={deviceSearchQuery}
+                    onChange={(e) => setDeviceSearchQuery(e.target.value)}
+                    placeholder="Cari device, OS, browser, email, IP..."
+                    className="w-full pl-9 pr-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:bg-white"
+                  />
+                </div>
+                <button
+                  onClick={() => setRefreshTrigger((prev) => prev + 1)}
+                  className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  Segarkan
+                </button>
+              </div>
+            </div>
+
+            {/* Device Category Filters */}
+            <div className="flex flex-wrap gap-1.5 pt-1">
+              {[
+                { id: "all", label: `Semua (${devices.length})` },
+                { id: "online", label: `Online (${onlineDevicesCount})` },
+                { id: "Desktop / Laptop", label: `Desktop / Laptop (${devices.filter((d) => d.deviceType === "Desktop / Laptop").length})` },
+                { id: "Mobile", label: `Mobile / HP (${devices.filter((d) => d.deviceType === "Mobile").length})` },
+                { id: "Tablet", label: `Tablet (${devices.filter((d) => d.deviceType === "Tablet").length})` },
+                { id: "guest", label: `Halaman Masuk / Daftar (${devices.filter((d) => d.sessionState === "guest" || d.sessionState === "registering").length})` },
+                { id: "demo", label: `Demo (${devices.filter((d) => d.sessionState === "demo").length})` },
+              ].map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => setDeviceFilter(f.id as any)}
+                  className={`px-3 py-1.5 rounded-lg text-[11px] font-bold transition cursor-pointer ${
+                    deviceFilter === f.id
+                      ? "bg-indigo-600 text-white shadow-2xs"
+                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                  }`}
+                >
+                  {f.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Real-Time Devices Table */}
+          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-2xs">
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-left text-xs font-sans">
+                <thead className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
+                  <tr>
+                    <th className="p-4">Perangkat & Sistem</th>
+                    <th className="p-4">Pengguna / Sesi</th>
+                    <th className="p-4 text-center">Status Koneksi</th>
+                    <th className="p-4">Jaringan & Layar</th>
+                    <th className="p-4">Terakhir Aktif</th>
+                    <th className="p-4 text-center">Aksi</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 text-slate-700">
+                  {filteredDevices.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="p-8 text-center text-slate-400">
+                        Belum ada perangkat yang sesuai dengan filter saat ini.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredDevices.map((dev) => {
+                      const live = isDeviceLiveOnline(dev);
+                      return (
+                        <tr key={dev.deviceId} className="hover:bg-slate-50/60 transition">
+                          <td className="p-4">
+                            <div className="flex items-start gap-2.5">
+                              <div
+                                className={`p-2 rounded-xl shrink-0 ${
+                                  live ? "bg-indigo-50 text-indigo-600" : "bg-slate-100 text-slate-500"
+                                }`}
+                              >
+                                {renderDeviceIcon(dev.deviceType, "w-4 h-4")}
+                              </div>
+                              <div className="space-y-0.5">
+                                <div className="font-extrabold text-slate-900 flex items-center gap-1.5">
+                                  <span>{dev.deviceModel || dev.deviceType}</span>
+                                  <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
+                                    {dev.deviceType}
+                                  </span>
+                                </div>
+                                <div className="text-[11px] text-slate-600 font-medium">
+                                  {dev.osName} · {dev.browserName}
+                                </div>
+                                <div className="text-[10px] font-mono text-slate-400">
+                                  ID: {dev.deviceId}
+                                </div>
+                              </div>
+                            </div>
+                          </td>
+
+                          <td className="p-4 space-y-0.5">
+                            {dev.userEmail ? (
+                              <>
+                                <div className="font-bold text-slate-900 flex items-center gap-1.5">
+                                  <User className="w-3 h-3 text-slate-400" />
+                                  <span>{dev.userName || dev.userEmail}</span>
+                                </div>
+                                <div className="text-[11px] text-indigo-700 font-semibold">{dev.userEmail}</div>
+                                {dev.namaSPPG && (
+                                  <div className="text-[10px] text-slate-500 flex items-center gap-1">
+                                    <Building className="w-3 h-3 text-slate-400" />
+                                    {dev.namaSPPG}
+                                  </div>
+                                )}
+                                <div className="flex items-center gap-1.5 pt-0.5">
+                                  <span className="text-[9.5px] font-extrabold uppercase px-1.5 py-0.5 rounded bg-purple-50 text-purple-700">
+                                    {dev.peran || "USER"}
+                                  </span>
+                                  {dev.sessionState === "registering" && (
+                                    <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
+                                      Verifikasi OTP
+                                    </span>
+                                  )}
+                                  {dev.sessionState === "demo" && (
+                                    <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-teal-100 text-teal-800">
+                                      Demo 5 Menit
+                                    </span>
+                                  )}
+                                </div>
+                              </>
+                            ) : (
+                              <div className="space-y-1">
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 font-bold text-[10px]">
+                                  Halaman Masuk / Tamu
+                                </span>
+                                <div className="text-[10px] text-slate-400">Belum masuk ke akun</div>
+                              </div>
+                            )}
+                          </td>
+
+                          <td className="p-4 text-center">
+                            {live ? (
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 font-extrabold text-[10.5px]">
+                                <Wifi className="w-3 h-3 text-emerald-600" />
+                                Online
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-bold text-[10.5px]">
+                                <WifiOff className="w-3 h-3 text-slate-400" />
+                                Offline
+                              </span>
+                            )}
+                          </td>
+
+                          <td className="p-4 space-y-0.5 text-[11px]">
+                            <div className="font-mono font-bold text-slate-700 flex items-center gap-1">
+                              <Globe className="w-3 h-3 text-slate-400" />
+                              {dev.ipAddress || "-"}
+                            </div>
+                            <div className="text-[10px] text-slate-500">
+                              Layar: {dev.screenResolution || "-"} · {dev.timezone || "-"}
+                            </div>
+                          </td>
+
+                          <td className="p-4 space-y-0.5">
+                            <div className="font-bold text-slate-800 text-[11px]">
+                              {formatRelativeTime(dev.lastSeenAt)}
+                            </div>
+                            <div className="text-[10px] font-mono text-slate-500">
+                              {formatTimestamp(dev.lastSeenAt)}
+                            </div>
+                            {dev.firstSeenAt && (
+                              <div className="text-[9.5px] text-slate-400">
+                                Pertama: {formatTimestamp(dev.firstSeenAt)}
+                              </div>
+                            )}
+                          </td>
+
+                          <td className="p-4 text-center">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteDeviceRecord(dev.deviceId)}
+                              className="p-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg transition cursor-pointer"
+                              title="Hapus catatan perangkat ini"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
       {activeTab === "riwayat" && (
         <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
           <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
             <History className="w-4 h-4 text-indigo-500" />
             Riwayat Aktivitas Login Tenant
           </h3>
-          <p className="text-xs text-slate-500">Aktivitas autentikasi masuk terbaru yang tercatat secara real-time di Firestore.</p>
+          <p className="text-xs text-slate-500">Aktivitas autentikasi masuk terbaru beserta perangkat yang tercatat secara real-time di Firestore.</p>
           
           <div className="overflow-x-auto border border-slate-100 rounded-lg">
             <table className="w-full text-left text-xs">
@@ -1219,19 +1739,37 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                 <tr>
                   <th className="p-3">Email Pengguna</th>
                   <th className="p-3">SPPG / Instansi</th>
+                  <th className="p-3">Perangkat & IP</th>
                   <th className="p-3">Peran</th>
                   <th className="p-3">Waktu Login</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-50 font-mono text-slate-600">
-                {users.filter(u => u.loginTerakhir).map((user, idx) => (
-                  <tr key={idx} className="hover:bg-slate-50/50">
-                    <td className="p-3 font-sans font-medium text-slate-800">{user.email}</td>
-                    <td className="p-3 font-sans text-xs">{user.namaSPPG || "SPPG Pusat"}</td>
-                    <td className="p-3"><span className="bg-purple-50 text-purple-700 px-1.5 py-0.5 rounded text-[10px]">{user.peran || "USER"}</span></td>
-                    <td className="p-3">{formatTimestamp(user.loginTerakhir)}</td>
-                  </tr>
-                ))}
+                {users.filter(u => u.loginTerakhir).map((user, idx) => {
+                  const userDevs = getDevicesForUser(user);
+                  const latestDev = userDevs[0];
+                  return (
+                    <tr key={idx} className="hover:bg-slate-50/50">
+                      <td className="p-3 font-sans font-medium text-slate-800">{user.email}</td>
+                      <td className="p-3 font-sans text-xs">{user.namaSPPG || "SPPG Pusat"}</td>
+                      <td className="p-3 font-sans text-[11px] text-slate-600">
+                        {latestDev ? (
+                          <div className="flex items-center gap-1.5">
+                            {renderDeviceIcon(latestDev.deviceType, "w-3.5 h-3.5 text-indigo-500 shrink-0")}
+                            <span>
+                              {formatDeviceShortLabel(latestDev)}
+                              {latestDev.ipAddress && latestDev.ipAddress !== "-" ? ` (${latestDev.ipAddress})` : ""}
+                            </span>
+                          </div>
+                        ) : (
+                          user.lastDeviceLabel || "-"
+                        )}
+                      </td>
+                      <td className="p-3"><span className="bg-purple-50 text-purple-700 px-1.5 py-0.5 rounded text-[10px]">{user.peran || "USER"}</span></td>
+                      <td className="p-3">{formatTimestamp(user.loginTerakhir)}</td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
