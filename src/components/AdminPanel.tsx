@@ -187,7 +187,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       namaLengkap: "LA ODE MUHAMMAD SUKRI YUSUF",
       profesi: "AHLI GIZI",
       namaSPPG: "SPPG MUNA BARAT SAWERIGADI ONDOKE",
-      noHp: "0822271059251",
+      noHp: "082271095251",
       peran: "ADMIN",
       statusPersetujuan: "aktif",
       berakhirPada: "2035-12-31"
@@ -239,7 +239,13 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         }
 
         const existing = existingKey ? map.get(existingKey) : null;
-        const keyToUse = existingKey || primaryKey || `custom_user_${userEmail.replace(/[@.]/g, "_")}`;
+        // Prefer real Firebase Auth UID over legacy custom_user_* key when merging same email
+        const incomingIsRealUid = Boolean(primaryKey && !primaryKey.startsWith("custom_user_"));
+        const existingIsLegacyUid = Boolean(existingKey && existingKey.startsWith("custom_user_"));
+        const keyToUse =
+          existingKey && existingIsLegacyUid && incomingIsRealUid && primaryKey
+            ? primaryKey
+            : existingKey || primaryKey || `custom_user_${userEmail.replace(/[@.]/g, "_")}`;
 
         if (!existing) {
           map.set(keyToUse, {
@@ -249,6 +255,10 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
             statusPersetujuan: u.statusPersetujuan || "menunggu",
           });
           return;
+        }
+
+        if (existingKey && existingKey !== keyToUse) {
+          map.delete(existingKey);
         }
 
         const existingUpdated = Math.max(
@@ -265,10 +275,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         const newer = incomingUpdated >= existingUpdated ? u : existing;
         const older = incomingUpdated >= existingUpdated ? existing : u;
 
-        let finalStatus = newer.statusPersetujuan || older.statusPersetujuan || "menunggu";
-        if (older.statusPersetujuan === "aktif" && newer.statusPersetujuan === "menunggu" && !newer.verificationStatus) {
-          finalStatus = "aktif";
-        }
+        const finalStatus = newer.statusPersetujuan || older.statusPersetujuan || "menunggu";
 
         const merged = {
           ...older,
@@ -613,40 +620,45 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
 
       const userEmail = (userObj?.email || "").toLowerCase().trim();
       const emailSlug = userEmail.replace(/[@.]/g, '_');
-      const customUid = `custom_user_${emailSlug}`;
+      const legacyCustomUid = emailSlug ? `custom_user_${emailSlug}` : "";
+      const targetUid = userObj?.uid || userObj?.id || userId || legacyCustomUid;
 
       const updates: any = {
         statusPersetujuan: newStatus,
         updatedAt: new Date().toISOString()
       };
 
-      if (newStatus === "aktif" && (!userObj?.berakhirPada || userObj.berakhirPada < todayStr)) {
-        const nextYear = new Date();
-        nextYear.setFullYear(now.getFullYear() + 1);
-        const defaultExp = `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, '0')}-${String(nextYear.getDate()).padStart(2, '0')}`;
-        updates.berakhirPada = defaultExp;
+      if (newStatus === "aktif") {
+        updates.activatedBy = "admin_acc";
+        if (!userObj?.berakhirPada || userObj.berakhirPada < todayStr) {
+          const nextYear = new Date();
+          nextYear.setFullYear(now.getFullYear() + 1);
+          const defaultExp = `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, '0')}-${String(nextYear.getDate()).padStart(2, '0')}`;
+          updates.berakhirPada = defaultExp;
+        }
       }
 
       const fullUserData = {
         ...(userObj || {}),
         ...updates,
-        uid: customUid,
+        uid: targetUid,
+        id: targetUid,
         email: userEmail || userObj?.email || ""
       };
 
-      // 1. Instant local state update (0ms UI latency)
+      // 1. Instant local state & live hub cache update (0ms UI latency)
+      hubUsersRef.current.set(targetUid, fullUserData);
       setUsers(prev => prev.map(u => 
-        (u.uid === userId || u.id === userId || (u.email && (u.email || "").toLowerCase().trim() === userEmail)) 
+        (u.uid === userId || u.id === userId || u.uid === targetUid || (userEmail && (u.email || "").toLowerCase().trim() === userEmail)) 
           ? { ...u, ...fullUserData } 
           : u
       ));
 
-      // 2. Instant offline storage persistence across all key variations
+      // 2. Instant offline storage persistence
       const keysToUpdate = Array.from(new Set([
+        `offline_user_${targetUid}`,
         `offline_user_${userId}`,
-        `offline_user_${customUid}`,
-        userObj?.uid ? `offline_user_${userObj.uid}` : '',
-        emailSlug ? `offline_user_custom_user_${emailSlug}` : ''
+        legacyCustomUid && targetUid === legacyCustomUid ? `offline_user_${legacyCustomUid}` : ''
       ].filter(Boolean)));
 
       keysToUpdate.forEach((k) => {
@@ -672,21 +684,9 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         } catch (e) {}
       }
 
-      // Also update currently active user session if this is the active user
-      const currentActiveUid = localStorage.getItem("custom_logged_in_uid");
-      if (currentActiveUid === userId || currentActiveUid === customUid || currentActiveUid === userObj?.uid) {
-        const activeProfile = localStorage.getItem("sisper_user_profile");
-        if (activeProfile) {
-          try {
-            const parsed = JSON.parse(activeProfile);
-            localStorage.setItem("sisper_user_profile", JSON.stringify({ ...parsed, ...fullUserData }));
-          } catch (e) {}
-        }
-      }
-
-      // 3. Real-time hub broadcast + background cloud sync to Firestore
+      // 3. Real-time hub broadcast (instant tenant unlock on mobile/laptop) + Firestore persistence
       syncUserToRealtimeHub(fullUserData).catch(() => {});
-      const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid, userObj?.id].filter(Boolean)));
+      const docIdsToUpdate = Array.from(new Set([targetUid, userId, userObj?.uid, userObj?.id].filter(Boolean)));
       for (const docId of docIdsToUpdate) {
         try {
           const userRef = doc(db, "users", docId);
@@ -713,17 +713,26 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       userId === "admin_sukriyusuf82" ||
       isMainAdminEmail(userObj?.email)
     ) {
-      alert("Peran Administrator Utama dilindungi dan tidak dapat diubah.");
       return;
     }
 
     const nextRole = currentRole === "ADMIN" ? "USER" : "ADMIN";
-    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId) ? { ...u, peran: nextRole } : u));
-
+    const nowIso = new Date().toISOString();
     const userEmail = (userObj?.email || "").toLowerCase().trim();
-    const emailSlug = userEmail.replace(/[@.]/g, '_');
-    const customUid = `custom_user_${emailSlug}`;
-    const docIds = Array.from(new Set([userId, customUid, userObj?.uid, userObj?.id].filter(Boolean)));
+    const targetUid = userObj?.uid || userObj?.id || userId;
+    const updatedUser = {
+      ...(userObj || {}),
+      uid: targetUid,
+      id: targetUid,
+      email: userEmail || userObj?.email || "",
+      peran: nextRole,
+      updatedAt: nowIso,
+    };
+
+    hubUsersRef.current.set(targetUid, updatedUser);
+    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId || u.uid === targetUid) ? { ...u, peran: nextRole, updatedAt: nowIso } : u));
+
+    const docIds = Array.from(new Set([targetUid, userId, userObj?.uid, userObj?.id].filter(Boolean)));
 
     docIds.forEach((id) => {
       const k = `offline_user_${id}`;
@@ -731,32 +740,21 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
-          localStorage.setItem(k, JSON.stringify({ ...parsed, peran: nextRole }));
+          localStorage.setItem(k, JSON.stringify({ ...parsed, peran: nextRole, updatedAt: nowIso }));
         } catch (e) {}
       }
     });
 
-    const activeUid = localStorage.getItem("custom_logged_in_uid");
-    if (activeUid && docIds.includes(activeUid)) {
-      const activeProf = localStorage.getItem("sisper_user_profile");
-      if (activeProf) {
-        try {
-          const parsed = JSON.parse(activeProf);
-          localStorage.setItem("sisper_user_profile", JSON.stringify({ ...parsed, peran: nextRole }));
-        } catch (e) {}
-      }
-    }
-
     if (userObj) {
-      syncUserToRealtimeHub({ ...userObj, peran: nextRole, uid: customUid }).catch(() => {});
+      syncUserToRealtimeHub(updatedUser).catch(() => {});
     }
     for (const docId of docIds) {
       try {
         await fetchWithTimeout(
           setDoc(doc(db, "users", docId), {
             peran: nextRole,
-            updatedAt: new Date().toISOString()
-          }, { merge: true }),
+            updatedAt: nowIso
+          }, { merge: true }).then(() => reportFirestoreWriteResult(true)),
           2500,
           null
         );
@@ -770,15 +768,22 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
   // Handle update expiration date
   const handleUpdateExpiration = async (userId: string, dateStr: string) => {
     const userObj = users.find(u => u.uid === userId || u.id === userId);
-    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId) ? { ...u, berakhirPada: dateStr } : u));
-    
-    const userEmail = (userObj?.email || "").toLowerCase().trim();
-    const emailSlug = userEmail.replace(/[@.]/g, '_');
-    const customUid = `custom_user_${emailSlug}`;
+    const nowIso = new Date().toISOString();
+    const targetUid = userObj?.uid || userObj?.id || userId;
+    const updatedUser = {
+      ...(userObj || {}),
+      uid: targetUid,
+      id: targetUid,
+      berakhirPada: dateStr,
+      updatedAt: nowIso,
+    };
+
+    hubUsersRef.current.set(targetUid, updatedUser);
+    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId || u.uid === targetUid) ? { ...u, berakhirPada: dateStr, updatedAt: nowIso } : u));
 
     const keysToUpdate = Array.from(new Set([
+      `offline_user_${targetUid}`,
       `offline_user_${userId}`,
-      `offline_user_${customUid}`,
       userObj?.uid ? `offline_user_${userObj.uid}` : ''
     ].filter(Boolean)));
 
@@ -787,22 +792,22 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       if (savedStr) {
         try {
           const parsed = JSON.parse(savedStr);
-          localStorage.setItem(k, JSON.stringify({ ...parsed, berakhirPada: dateStr }));
+          localStorage.setItem(k, JSON.stringify({ ...parsed, berakhirPada: dateStr, updatedAt: nowIso }));
         } catch (e) {}
       }
     });
 
     if (userObj) {
-      syncUserToRealtimeHub({ ...userObj, berakhirPada: dateStr, uid: customUid }).catch(() => {});
+      syncUserToRealtimeHub(updatedUser).catch(() => {});
     }
-    const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid].filter(Boolean)));
+    const docIdsToUpdate = Array.from(new Set([targetUid, userId, userObj?.uid].filter(Boolean)));
     for (const docId of docIdsToUpdate) {
       try {
         const userRef = doc(db, "users", docId);
         await fetchWithTimeout(setDoc(userRef, {
           berakhirPada: dateStr,
-          updatedAt: new Date().toISOString()
-        }, { merge: true }), 1500, null);
+          updatedAt: nowIso
+        }, { merge: true }).then(() => reportFirestoreWriteResult(true)), 1500, null);
       } catch (err) {
         reportFirestoreWriteResult(false, err);
         console.warn("Tanggal kedaluwarsa diperbarui lokal:", err);
@@ -824,16 +829,23 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
     const pastStr = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
-    
-    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId) ? { ...u, berakhirPada: pastStr, statusPersetujuan: "diblokir" } : u));
+    const nowIso = new Date().toISOString();
+    const targetUid = userObj?.uid || userObj?.id || userId;
+    const updatedUser = {
+      ...(userObj || {}),
+      uid: targetUid,
+      id: targetUid,
+      berakhirPada: pastStr,
+      statusPersetujuan: "diblokir",
+      updatedAt: nowIso,
+    };
 
-    const userEmail = (userObj?.email || "").toLowerCase().trim();
-    const emailSlug = userEmail.replace(/[@.]/g, '_');
-    const customUid = `custom_user_${emailSlug}`;
+    hubUsersRef.current.set(targetUid, updatedUser);
+    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId || u.uid === targetUid) ? { ...u, berakhirPada: pastStr, statusPersetujuan: "diblokir", updatedAt: nowIso } : u));
 
     const keysToUpdate = Array.from(new Set([
+      `offline_user_${targetUid}`,
       `offline_user_${userId}`,
-      `offline_user_${customUid}`,
       userObj?.uid ? `offline_user_${userObj.uid}` : ''
     ].filter(Boolean)));
 
@@ -842,15 +854,15 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       if (savedStr) {
         try {
           const parsed = JSON.parse(savedStr);
-          localStorage.setItem(k, JSON.stringify({ ...parsed, berakhirPada: pastStr, statusPersetujuan: "diblokir" }));
+          localStorage.setItem(k, JSON.stringify({ ...parsed, berakhirPada: pastStr, statusPersetujuan: "diblokir", updatedAt: nowIso }));
         } catch (e) {}
       }
     });
 
     if (userObj) {
-      syncUserToRealtimeHub({ ...userObj, berakhirPada: pastStr, statusPersetujuan: "diblokir", uid: customUid }).catch(() => {});
+      syncUserToRealtimeHub(updatedUser).catch(() => {});
     }
-    const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid].filter(Boolean)));
+    const docIdsToUpdate = Array.from(new Set([targetUid, userId, userObj?.uid].filter(Boolean)));
     for (const docId of docIdsToUpdate) {
       try {
         const userRef = doc(db, "users", docId);
@@ -859,7 +871,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
             berakhirPada: pastStr,
             statusPersetujuan: "diblokir",
             updatedAt: serverTimestamp()
-          }, { merge: true }),
+          }, { merge: true }).then(() => reportFirestoreWriteResult(true)),
           2500,
           null
         );
@@ -935,7 +947,9 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
 
       // 1. Mark email as deleted & delete from Real-Time Hub + Firestore
       addDeletedTenantEmail(lowerEmail);
-      deleteUserFromRealtimeHub(customUid, lowerEmail).catch(() => {});
+      hubUsersRef.current.delete(userId);
+      hubUsersRef.current.delete(customUid);
+      deleteUserFromRealtimeHub(userId, lowerEmail).catch(() => {});
       for (const id of idsToDelete) {
         try {
           await fetchWithTimeout(deleteDoc(doc(db, "users", id)), 2500, null);
@@ -995,7 +1009,8 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         const emailSlug = lowerEmail.replace(/[@.]/g, "_");
         const customUid = `custom_user_${emailSlug}`;
         const idsToDelete = Array.from(new Set([u.uid, u.id, customUid].filter(Boolean)));
-        deleteUserFromRealtimeHub(customUid, lowerEmail).catch(() => {});
+        idsToDelete.forEach((id) => hubUsersRef.current.delete(id));
+        deleteUserFromRealtimeHub(u.uid || customUid, lowerEmail).catch(() => {});
 
         for (const id of idsToDelete) {
           try {
@@ -1043,7 +1058,8 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         const emailSlug = lowerEmail.replace(/[@.]/g, "_");
         const customUid = `custom_user_${emailSlug}`;
         const idsToDelete = Array.from(new Set([u.uid, u.id, customUid].filter(Boolean)));
-        deleteUserFromRealtimeHub(customUid, lowerEmail).catch(() => {});
+        idsToDelete.forEach((id) => hubUsersRef.current.delete(id));
+        deleteUserFromRealtimeHub(u.uid || customUid, lowerEmail).catch(() => {});
 
         for (const id of idsToDelete) {
           try {
@@ -1112,7 +1128,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
   const tenantUsers = users.filter(u => u.uid !== "admin_syukriyusuf82" && u.uid !== "admin_sukriyusuf82" && !isMainAdminEmail(u.email));
   const totalUsersCount = tenantUsers.length;
   const activeUsersCount = tenantUsers.filter(u => u.statusPersetujuan === "aktif").length;
-  const emailVerifiedCount = tenantUsers.filter(u => u.emailVerified === true || u.activatedBy === "email_otp").length;
+  const pendingUsersCount = tenantUsers.filter(u => u.statusPersetujuan === "menunggu" || u.statusPersetujuan === "pending").length;
   const onlineDevicesCount = devices.filter(d => isDeviceLiveOnline(d)).length;
 
   const filteredDevices = devices.filter((d) => {
@@ -1284,12 +1300,12 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
             <CheckCircle className="w-6 h-6" />
           </div>
           <div>
-            <p className="text-xs font-semibold text-slate-400">Pengguna Aktif</p>
+            <p className="text-xs font-semibold text-slate-400">Pengguna Aktif (ACC)</p>
             <div className="flex items-baseline gap-2">
-              <p className="text-2xl font-extrabold text-slate-900">{activeUsersCount}</p>
-              {emailVerifiedCount > 0 && (
-                <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded">
-                  {emailVerifiedCount} OTP
+              <p className="text-2xl font-extrabold text-slate-900 tabular-nums">{activeUsersCount}</p>
+              {pendingUsersCount > 0 && (
+                <span className="text-[10px] font-bold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
+                  {pendingUsersCount} Menunggu ACC
                 </span>
               )}
             </div>
@@ -1591,54 +1607,58 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                           </button>
                         </td>
 
-                        {/* Status Persetujuan & Verifikasi Email */}
+                        {/* Status Persetujuan (ACC Admin) */}
                         <td className="p-4 text-center">
                           <div className="flex flex-col items-center gap-1.5">
                             {item.statusPersetujuan === "aktif" ? (
                               <div className="flex flex-col items-center gap-1">
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-extrabold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">
-                                  {item.emailVerified || item.activatedBy === "email_otp" ? (
-                                    <>
-                                      <MailCheck className="w-3 h-3 text-emerald-600" />
-                                      Aktif · Verifikasi Email
-                                    </>
-                                  ) : (
-                                    <>
-                                      <CheckCircle className="w-3 h-3 text-emerald-600" />
-                                      Disetujui (ACC)
-                                    </>
-                                  )}
+                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-extrabold rounded-md bg-emerald-100 text-emerald-800 border border-emerald-300">
+                                  <CheckCircle className="w-3 h-3 text-emerald-600" />
+                                  Disetujui (ACC)
                                 </span>
-                                {item.emailVerifiedAt && (
-                                  <span className="text-[9.5px] text-emerald-700 font-medium">
-                                    OTP: {formatTimestamp(item.emailVerifiedAt)}
+                                {item.authProvider === "google" && (
+                                  <span className="text-[9.5px] text-slate-500 font-semibold">
+                                    Akun Email Google
                                   </span>
                                 )}
-                                <button
-                                  onClick={() => handleSetStatus(item.uid || item.id, "diblokir")}
-                                  className="text-[10px] text-rose-600 hover:text-rose-800 font-bold underline cursor-pointer"
-                                  title="Putuskan akses pengguna ini"
-                                >
-                                  Putuskan Akses
-                                </button>
+                                {!isMainAdminEmail(item.email) && item.uid !== "admin_syukriyusuf82" && (
+                                  <div className="flex items-center gap-2 pt-0.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSetStatus(item.uid || item.id, "menunggu")}
+                                      className="text-[10px] text-amber-700 hover:text-amber-900 font-bold underline cursor-pointer"
+                                      title="Kembalikan status ke Menunggu ACC"
+                                    >
+                                      Tahan (Menunggu)
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSetStatus(item.uid || item.id, "diblokir")}
+                                      className="text-[10px] text-rose-600 hover:text-rose-800 font-bold underline cursor-pointer"
+                                      title="Putuskan akses pengguna ini"
+                                    >
+                                      Putuskan
+                                    </button>
+                                  </div>
+                                )}
                               </div>
                             ) : item.statusPersetujuan === "menunggu" || item.statusPersetujuan === "pending" ? (
-                              <div className="flex flex-col items-center gap-1">
-                                {item.verificationStatus === "pending_otp" && (
-                                  <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[9.5px] font-extrabold rounded-full bg-amber-100 text-amber-800 border border-amber-300">
-                                    <Mail className="w-2.5 h-2.5" />
-                                    Menunggu Kode OTP
-                                  </span>
-                                )}
+                              <div className="flex flex-col items-center gap-1.5">
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-extrabold rounded-md bg-amber-100 text-amber-800 border border-amber-300">
+                                  <Clock className="w-3 h-3 text-amber-600" />
+                                  Menunggu ACC
+                                </span>
                                 <button
+                                  type="button"
                                   onClick={() => handleSetStatus(item.uid || item.id, "aktif")}
-                                  className="inline-flex items-center gap-1 px-3 py-1 text-xs font-black rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition shadow-sm cursor-pointer animate-pulse"
-                                  title="Klik untuk menyetujui (ACC) dan memberi akses"
+                                  className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-black rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition shadow-sm cursor-pointer"
+                                  title="Klik untuk menyetujui (ACC) dan membuka akses penuh dashboard pengguna ini"
                                 >
                                   <CheckCircle className="w-3.5 h-3.5 text-white" />
                                   ACC / Setujui
                                 </button>
                                 <button
+                                  type="button"
                                   onClick={() => handleSetStatus(item.uid || item.id, "diblokir")}
                                   className="text-[10px] text-rose-600 hover:text-rose-800 font-bold cursor-pointer"
                                 >
@@ -1646,17 +1666,25 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                                 </button>
                               </div>
                             ) : (
-                              <div className="flex flex-col items-center gap-1">
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-extrabold rounded-full bg-rose-100 text-rose-800 border border-rose-300">
+                              <div className="flex flex-col items-center gap-1.5">
+                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-extrabold rounded-md bg-rose-100 text-rose-800 border border-rose-300">
                                   <XCircle className="w-3 h-3 text-rose-600" />
                                   Diblokir
                                 </span>
                                 <button
+                                  type="button"
                                   onClick={() => handleSetStatus(item.uid || item.id, "aktif")}
-                                  className="px-2.5 py-0.5 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-[10px] rounded transition cursor-pointer shadow-xs"
+                                  className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-[10px] rounded-md transition cursor-pointer shadow-xs"
                                   title="Aktifkan kembali akses akun"
                                 >
                                   Buka Akses (ACC)
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSetStatus(item.uid || item.id, "menunggu")}
+                                  className="text-[10px] text-amber-700 hover:text-amber-900 font-bold underline cursor-pointer"
+                                >
+                                  Set Menunggu
                                 </button>
                               </div>
                             )}
@@ -1723,23 +1751,27 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                           {formatTimestamp(item.loginTerakhir)}
                         </td>
 
-                        {/* Actions (Reset Sandi & Delete) */}
+                        {/* Actions */}
                         <td className="p-4 text-center">
                           <div className="flex items-center justify-center gap-1.5">
-                            <button
-                              onClick={() => handleAdminResetPassword(item.uid || item.id, item.email)}
-                              className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition"
-                              title="Lihat / Reset Kata Sandi Pengguna"
-                            >
-                              <Key className="w-3.5 h-3.5" />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteUser(item.uid, item.email)}
-                              className="p-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg transition"
-                              title="Hapus Pengguna Permanen"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
+                            {item.sandi && item.authProvider !== "google" && (
+                              <button
+                                onClick={() => handleAdminResetPassword(item.uid || item.id, item.email)}
+                                className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition cursor-pointer"
+                                title="Lihat / Reset Kata Sandi Legacy"
+                              >
+                                <Key className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            {!isMainAdminEmail(item.email) && item.uid !== "admin_syukriyusuf82" && (
+                              <button
+                                onClick={() => handleDeleteUser(item.uid, item.email)}
+                                className="p-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg transition cursor-pointer"
+                                title="Hapus Pengguna Permanen"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
                           </div>
                         </td>
                       </tr>

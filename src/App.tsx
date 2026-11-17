@@ -82,18 +82,15 @@ import {
   PlayCircle,
   Mail,
   ShieldCheck,
-  Copy,
-  Check,
-  Send,
-  ArrowLeft
+  ExternalLink,
+  UserCheck,
+  Building2
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import {
   useAuth,
   isMainAdminEmail,
-  clearPerUserWorksheetStorage,
-  OtpDispatchResult,
-  PENDING_OTP_STORAGE_KEY
+  clearPerUserWorksheetStorage
 } from "./context/AuthContext.tsx";
 import { db } from "./lib/firebase.ts";
 import { doc, getDoc, onSnapshot, setDoc } from "firebase/firestore";
@@ -297,17 +294,10 @@ export default function App() {
     loadStateFromCloud, 
     signInWithGoogle, 
     signOutUser,
-    registerUser,
-    registerCustomUser,
-    resendVerificationCode,
-    verifyRegistrationCode,
-    registerThreeRoles,
-    loginWithEmailPassword,
-    resetUserPassword,
+    updateOwnProfileDetails,
     refreshUserProfile,
     authError,
     setAuthError,
-    simulateAdminLogin,
     isDemo,
     demoSecondsLeft,
     demoNotice,
@@ -322,13 +312,15 @@ export default function App() {
     user?.uid === "demo_user_5min"
   );
 
+  // Strict non-admin guarantee: new tenants (peran: "USER") and demo accounts NEVER get Panel Admin access
   const isAdminUser =
-    !isDemoUser && user
-      ? isMainAdminEmail(user.email) ||
-        userProfile?.peran === "ADMIN" ||
-        user.uid === "admin_syukriyusuf82" ||
-        user.uid === "admin_sukriyusuf82"
-      : false;
+    !isDemoUser &&
+    Boolean(user) &&
+    (userProfile?.statusPersetujuan === "aktif" || isMainAdminEmail(user?.email)) &&
+    (isMainAdminEmail(user?.email) ||
+      userProfile?.peran === "ADMIN" ||
+      user?.uid === "admin_syukriyusuf82" ||
+      user?.uid === "admin_sukriyusuf82");
 
   const getDefaultTabForProfesi = (profesi?: string, peran?: string) => {
     if (peran === "ADMIN") return "dashboard";
@@ -342,176 +334,44 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (userProfile?.profesi) {
+    if (userProfile?.profesi && userProfile?.statusPersetujuan === "aktif") {
       const hasChosen = sessionStorage.getItem("sisper_user_tab_chosen");
       if (!hasChosen) {
         const roleTab = getDefaultTabForProfesi(userProfile.profesi, userProfile.peran);
         setActiveTab(roleTab);
       }
     }
-  }, [userProfile]);
+  }, [userProfile?.profesi, userProfile?.peran, userProfile?.statusPersetujuan]);
 
-  // Real-time listener in App component to monitor statusPersetujuan in current user's Firestore profile document
-  useEffect(() => {
-    const activeUid = userProfile?.uid || user?.uid || localStorage.getItem("custom_logged_in_uid");
-    if (!activeUid) return;
+  // Google Email Sign-In & Waiting-for-ACC UI states
+  const [isGoogleSigningIn, setIsGoogleSigningIn] = useState(false);
+  const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+  const [statusCheckFeedback, setStatusCheckFeedback] = useState<{ type: "info" | "success" | "error"; text: string } | null>(null);
+  const [isSavingWaitingProfile, setIsSavingWaitingProfile] = useState(false);
+  const [waitingProfileSavedMsg, setWaitingProfileSavedMsg] = useState<string | null>(null);
 
-    const email = (userProfile?.email || user?.email || "").toLowerCase().trim();
-    if (
-      isDemoUser ||
-      activeUid === "demo_user_5min" ||
-      activeUid === "admin_sukriyusuf82" ||
-      activeUid === "admin_syukriyusuf82" ||
-      isMainAdminEmail(email)
-    ) {
-      return;
-    }
-
-    try {
-      const userRef = doc(db, "users", activeUid);
-      const unsubscribe = onSnapshot(userRef, (snap) => {
-        if (snap.exists()) {
-          const freshData = snap.data();
-          const newStatus = freshData.statusPersetujuan;
-
-          if (newStatus === "aktif") {
-            const currentStatus = userProfile?.statusPersetujuan;
-            if (currentStatus !== "aktif") {
-              const updated = { ...userProfile, ...freshData, statusPersetujuan: "aktif", uid: activeUid };
-              localStorage.setItem("sisper_user_profile", JSON.stringify(updated));
-              localStorage.setItem(`offline_user_${activeUid}`, JSON.stringify(updated));
-              
-              if (typeof refreshUserProfile === "function") {
-                refreshUserProfile();
-              }
-            }
-          }
-        }
-      }, (err) => {
-        console.warn("App statusPersetujuan real-time listener notice:", err);
-      });
-
-      return () => unsubscribe();
-    } catch (e) {
-      console.warn("Could not set up App statusPersetujuan listener:", e);
-    }
-  }, [userProfile?.uid, user?.uid, userProfile?.statusPersetujuan, refreshUserProfile]);
-
-  // Authentication Tab & Form States
-  const [authTab, setAuthTab] = useState<"masuk" | "daftar">(() => {
-    try {
-      const raw = sessionStorage.getItem(PENDING_OTP_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed?.expiresAt && parsed.expiresAt > Date.now()) {
-          return "daftar";
-        }
-      }
-    } catch {}
-    return "masuk";
-  });
-  const [loginEmail, setLoginEmail] = useState("");
-  const [loginSandi, setLoginSandi] = useState("");
-  const [showLoginSandi, setShowLoginSandi] = useState(false);
-  const [showRegSandi, setShowRegSandi] = useState(false);
-  const [showRegConfirmSandi, setShowRegConfirmSandi] = useState(false);
-
-  // Reset Password Modal States
-  const [showResetModal, setShowResetModal] = useState(false);
-  const [resetEmailInput, setResetEmailInput] = useState("");
-  const [resetNewSandi, setResetNewSandi] = useState("");
-  const [isResettingSandi, setIsResettingSandi] = useState(false);
-
-  // Registration Single User Form States
-  const [regNamaSingle, setRegNamaSingle] = useState("");
-  const [regEmailSingle, setRegEmailSingle] = useState("");
-  const [regPekerjaanSingle, setRegPekerjaanSingle] = useState("");
-  const [regInstansiSingle, setRegInstansiSingle] = useState("");
-  const [regSandiSingle, setRegSandiSingle] = useState("");
-  const [regConfirmSandiSingle, setRegConfirmSandiSingle] = useState("");
-
-  // Registration Multi-Role Form States
-  const [regInstansi, setRegInstansi] = useState("");
-  const [regSandiShared, setRegSandiShared] = useState("");
-
-  // Role 1: Pengawas Gizi
-  const [regGiziNama, setRegGiziNama] = useState("");
-  const [regGiziEmail, setRegGiziEmail] = useState("");
-  const [regGiziNoHp, setRegGiziNoHp] = useState("");
-
-  // Role 2: Akuntan
-  const [regAkuntanNama, setRegAkuntanNama] = useState("");
-  const [regAkuntanEmail, setRegAkuntanEmail] = useState("");
-  const [regAkuntanNoHp, setRegAkuntanNoHp] = useState("");
-
-  // Role 3: Chef / Juru Masak
-  const [regChefNama, setRegChefNama] = useState("");
-  const [regChefEmail, setRegChefEmail] = useState("");
-  const [regChefNoHp, setRegChefNoHp] = useState("");
-
-  const [isRegistering, setIsRegistering] = useState(false);
-  const [isLoggingIn, setIsLoggingIn] = useState(false);
-
-  // Email OTP Verification States (Registration -> Auto Email OTP -> Instant Activation)
-  const [pendingOtpSession, setPendingOtpSession] = useState<OtpDispatchResult | null>(() => {
-    try {
-      const raw = sessionStorage.getItem(PENDING_OTP_STORAGE_KEY);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw) as OtpDispatchResult;
-      if (parsed && parsed.expiresAt && parsed.expiresAt > Date.now()) {
-        return parsed;
-      }
-      sessionStorage.removeItem(PENDING_OTP_STORAGE_KEY);
-    } catch {}
-    return null;
-  });
-  const [otpInput, setOtpInput] = useState("");
-  const [otpError, setOtpError] = useState<string | null>(null);
-  const [otpInfo, setOtpInfo] = useState<string | null>(null);
-  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
-  const [isResendingOtp, setIsResendingOtp] = useState(false);
-  const [otpResendCooldown, setOtpResendCooldown] = useState(0);
-  const [otpSecondsLeft, setOtpSecondsLeft] = useState(0);
-  const [copiedOtpPreview, setCopiedOtpPreview] = useState(false);
-  const [authFeedback, setAuthFeedback] = useState<{ type: "error" | "success" | "info"; text: string } | null>(null);
-
-  // Countdown timers for OTP expiry & resend cooldown
-  useEffect(() => {
-    if (!pendingOtpSession) {
-      setOtpSecondsLeft(0);
-      return;
-    }
-    const updateRemaining = () => {
-      const rem = Math.max(0, Math.ceil((pendingOtpSession.expiresAt - Date.now()) / 1000));
-      setOtpSecondsLeft(rem);
-    };
-    updateRemaining();
-    const timer = window.setInterval(updateRemaining, 1000);
-    return () => window.clearInterval(timer);
-  }, [pendingOtpSession]);
-
-  useEffect(() => {
-    if (otpResendCooldown <= 0) return;
-    const timer = window.setTimeout(() => {
-      setOtpResendCooldown((prev) => Math.max(0, prev - 1));
-    }, 1000);
-    return () => window.clearTimeout(timer);
-  }, [otpResendCooldown]);
-
-  // Fallback / legacy profile registration form states
+  // Tenant identity fields (optional quick-fill on Waiting ACC screen so Admin immediately sees SPPG details)
   const [regNama, setRegNama] = useState("");
   const [regProfesi, setRegProfesi] = useState("Ahli Gizi");
   const [regNamaSPPG, setRegNamaSPPG] = useState("");
   const [regNoHp, setRegNoHp] = useState("");
 
-  // Admin Panel states (never permitted for demo accounts)
+  useEffect(() => {
+    if (!userProfile) return;
+    setRegNama((prev) => prev || userProfile.namaLengkap || user?.displayName || "");
+    setRegProfesi((prev) => (prev && prev !== "Ahli Gizi" ? prev : userProfile.profesi || "Ahli Gizi"));
+    setRegNamaSPPG((prev) => prev || userProfile.namaSPPG || "");
+    setRegNoHp((prev) => prev || userProfile.noHp || "");
+  }, [userProfile?.uid, userProfile?.namaLengkap, userProfile?.profesi, userProfile?.namaSPPG, userProfile?.noHp, user?.displayName]);
+
+  // Admin Panel states (never permitted for demo accounts or non-admin tenants)
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
 
   useEffect(() => {
-    if (isDemoUser && isAdminPanelOpen) {
+    if ((!isAdminUser || isDemoUser) && isAdminPanelOpen) {
       setIsAdminPanelOpen(false);
     }
-  }, [isDemoUser, isAdminPanelOpen]);
+  }, [isAdminUser, isDemoUser, isAdminPanelOpen]);
 
   const [isCloudLoading, setIsCloudLoading] = useState(false);
   const [loadedCloudUid, setLoadedCloudUid] = useState<string | null>(null);
@@ -1468,21 +1328,24 @@ export default function App() {
     }
   };
 
-  const handleWhatsAppContact = () => {
-    let currentName = regNama || regGiziNama || regAkuntanNama || regChefNama;
-    if (!currentName && loginEmail) {
-      currentName = loginEmail.split("@")[0];
-    }
-    if (!currentName) {
-      const inputName = window.prompt("Masukkan Nama Pengguna Anda untuk izin akses via WhatsApp:", "");
-      if (inputName && inputName.trim()) {
-        currentName = inputName.trim();
-      }
-    }
-    const displayName = currentName ? currentName.trim() : "Nama Pengguna";
-    const message = `Halo min, aku ( ${displayName} ) Izin Minta Akses Yah\nTerimakasih..`;
-    const waUrl = `https://wa.me/6282271095251?text=${encodeURIComponent(message)}`;
-    window.open(waUrl, "_blank", "noopener,noreferrer");
+  const buildOdheGiziWhatsAppUrl = (opts?: {
+    nama?: string;
+    email?: string;
+    namaSPPG?: string;
+    keperluan?: string;
+  }) => {
+    const nama = (opts?.nama || userProfile?.namaLengkap || user?.displayName || "").trim();
+    const email = (opts?.email || user?.email || userProfile?.email || "").trim();
+    const sppg = (opts?.namaSPPG || regNamaSPPG || userProfile?.namaSPPG || "").trim();
+    const keperluan = opts?.keperluan || "mohon ACC Akses dashboard SISPERMBG saya";
+    const lines = [
+      "Halo Odhe Gizi,",
+      nama ? `Saya ${nama}` : "Saya pengguna SISPERMBG",
+      email ? `Email Akun: ${email}` : "",
+      sppg ? `Instansi / SPPG: ${sppg}` : "",
+      `Izin ${keperluan}. Terima kasih.`
+    ].filter(Boolean);
+    return `https://wa.me/6282271095251?text=${encodeURIComponent(lines.join("\n"))}`;
   };
 
   const handleTkpiUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1678,257 +1541,74 @@ export default function App() {
     );
   }
 
-  // Form submission handlers
-  const handleCustomLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthFeedback(null);
-    if (!loginEmail || !loginSandi) {
-      setAuthFeedback({ type: "error", text: "Mohon isi email dan kata sandi Anda terlebih dahulu." });
-      return;
-    }
-    setIsLoggingIn(true);
+  const handleGoogleSignInClick = async () => {
+    setAuthError(null);
+    setStatusCheckFeedback(null);
+    setIsGoogleSigningIn(true);
     try {
-      await loginWithEmailPassword(loginEmail, loginSandi);
-    } catch (err: any) {
-      if (err?.code === "PENDING_EMAIL_OTP" && err?.pendingUser) {
-        try {
-          const otpResult = await resendVerificationCode({
-            email: err.pendingUser.email,
-            namaLengkap: err.pendingUser.namaLengkap,
-            namaSPPG: err.pendingUser.namaSPPG,
-            uid: err.pendingUser.uid,
-          });
-          setPendingOtpSession(otpResult);
-          setOtpInput("");
-          setOtpError(null);
-          setOtpInfo(otpResult.message);
-          setOtpResendCooldown(20);
-          setAuthTab("daftar");
-          setAuthFeedback({
-            type: "info",
-            text: "Email Anda belum terverifikasi. Kode verifikasi baru telah dikirim otomatis—silakan masukkan kode di bawah untuk langsung mengaktifkan akun.",
-          });
-        } catch (resendErr: any) {
-          setAuthFeedback({ type: "error", text: resendErr?.message || err.message });
-        }
+      await signInWithGoogle();
+    } finally {
+      setIsGoogleSigningIn(false);
+    }
+  };
+
+  const handleManualStatusCheck = async () => {
+    setIsCheckingStatus(true);
+    setStatusCheckFeedback(null);
+    try {
+      const updated = await refreshUserProfile();
+      if (updated?.statusPersetujuan === "aktif") {
+        setStatusCheckFeedback({
+          type: "success",
+          text: "Akses Anda telah disetujui (ACC)! Membuka dashboard SISPERMBG..."
+        });
+      } else if (updated?.statusPersetujuan === "diblokir") {
+        setStatusCheckFeedback({
+          type: "error",
+          text: "Status akun Anda saat ini sedang dinonaktifkan oleh Admin. Silakan hubungi Odhe Gizi."
+        });
       } else {
-        setAuthFeedback({ type: "error", text: err?.message || "Gagal masuk. Periksa kembali email dan kata sandi Anda." });
+        setStatusCheckFeedback({
+          type: "info",
+          text: "Status akun masih Menunggu ACC. Silakan hubungi Odhe Gizi via WhatsApp untuk persetujuan cepat."
+        });
       }
     } finally {
-      setIsLoggingIn(false);
+      setIsCheckingStatus(false);
     }
   };
 
-  const handleCustomResetPassword = async (e: React.FormEvent) => {
+  const handleSaveWaitingIdentity = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!resetEmailInput || !resetNewSandi) {
-      setAuthFeedback({ type: "error", text: "Mohon isi Email dan Kata Sandi baru!" });
-      return;
-    }
-    if (resetNewSandi.trim().length < 6) {
-      setAuthFeedback({ type: "error", text: "Kata sandi baru minimal 6 karakter demi keamanan akun Anda." });
-      return;
-    }
-    setIsResettingSandi(true);
+    setWaitingProfileSavedMsg(null);
+    setIsSavingWaitingProfile(true);
     try {
-      await resetUserPassword(resetEmailInput, resetNewSandi);
-      setAuthFeedback({
-        type: "success",
-        text: `Kata sandi untuk "${resetEmailInput}" berhasil diperbarui. Silakan masuk menggunakan kata sandi baru Anda.`,
+      await updateOwnProfileDetails({
+        namaLengkap: regNama.trim() || user?.displayName || user?.email?.split("@")[0] || "Pengguna SISPERMBG",
+        profesi: regProfesi.trim() || "Ahli Gizi",
+        namaSPPG: regNamaSPPG.trim(),
+        noHp: regNoHp.trim(),
       });
-      setLoginEmail(resetEmailInput);
-      setLoginSandi(resetNewSandi);
-      setShowResetModal(false);
-      setResetNewSandi("");
+      setWaitingProfileSavedMsg("Data identitas SPPG berhasil dikirim ke Panel Admin Odhe Gizi.");
     } catch (err: any) {
-      setAuthFeedback({ type: "error", text: "Gagal memperbarui kata sandi: " + (err?.message || String(err)) });
+      setWaitingProfileSavedMsg(err?.message || "Gagal menyimpan identitas.");
     } finally {
-      setIsResettingSandi(false);
+      setIsSavingWaitingProfile(false);
     }
   };
 
-  const handleCustomRegister = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setAuthFeedback(null);
-    if (!regNamaSingle || !regEmailSingle || !regPekerjaanSingle || !regInstansiSingle || !regSandiSingle || !regConfirmSandiSingle) {
-      setAuthFeedback({ type: "error", text: "Mohon lengkapi seluruh kolom pendaftaran terlebih dahulu." });
-      return;
-    }
-    if (regSandiSingle.length < 6) {
-      setAuthFeedback({ type: "error", text: "Kata sandi minimal 6 karakter demi keamanan akun Anda." });
-      return;
-    }
-    if (regSandiSingle !== regConfirmSandiSingle) {
-      setAuthFeedback({ type: "error", text: "Konfirmasi kata sandi tidak cocok!" });
-      return;
-    }
-    setIsRegistering(true);
-    try {
-      const otpResult = await registerCustomUser({
-        namaLengkap: regNamaSingle,
-        email: regEmailSingle,
-        profesi: regPekerjaanSingle,
-        namaSPPG: regInstansiSingle,
-        sandi: regSandiSingle
-      });
-
-      setPendingOtpSession(otpResult);
-      setOtpInput("");
-      setOtpError(null);
-      setOtpInfo(otpResult.message);
-      setOtpResendCooldown(20);
-      setCopiedOtpPreview(false);
-
-      // Prefill login email for convenience
-      setLoginEmail(regEmailSingle);
-      setLoginSandi(regSandiSingle);
-    } catch (err: any) {
-      setAuthFeedback({ type: "error", text: err?.message || "Gagal melakukan registrasi." });
-    } finally {
-      setIsRegistering(false);
-    }
-  };
-
-  const handleVerifyOtpSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!pendingOtpSession) return;
-    setOtpError(null);
-    const cleanCode = otpInput.replace(/\D/g, "").trim();
-    if (cleanCode.length !== 6) {
-      setOtpError("Masukkan tepat 6 digit angka kode verifikasi.");
-      return;
-    }
-    setIsVerifyingOtp(true);
-    try {
-      await verifyRegistrationCode({
-        email: pendingOtpSession.recipientEmail,
-        code: cleanCode,
-        verificationToken: pendingOtpSession.verificationToken,
-        autoLogin: true,
-      });
-
-      setPendingOtpSession(null);
-      setOtpInput("");
-      setOtpError(null);
-      setOtpInfo(null);
-      setAuthFeedback(null);
-
-      // Reset registration inputs after successful activation
-      setRegNamaSingle("");
-      setRegEmailSingle("");
-      setRegPekerjaanSingle("");
-      setRegInstansiSingle("");
-      setRegSandiSingle("");
-      setRegConfirmSandiSingle("");
-    } catch (err: any) {
-      setOtpError(err?.message || "Kode verifikasi salah. Silakan periksa kembali kode Anda.");
-    } finally {
-      setIsVerifyingOtp(false);
-    }
-  };
-
-  const handleResendOtp = async () => {
-    if (!pendingOtpSession || otpResendCooldown > 0 || isResendingOtp) return;
-    setOtpError(null);
-    setIsResendingOtp(true);
-    try {
-      const freshResult = await resendVerificationCode({
-        email: pendingOtpSession.recipientEmail,
-        namaLengkap: pendingOtpSession.namaLengkap,
-        namaSPPG: pendingOtpSession.namaSPPG,
-        uid: pendingOtpSession.uid,
-      });
-      setPendingOtpSession(freshResult);
-      setOtpInput("");
-      setOtpInfo(freshResult.message);
-      setOtpResendCooldown(20);
-      setCopiedOtpPreview(false);
-    } catch (err: any) {
-      setOtpError(err?.message || "Gagal mengirim ulang kode verifikasi.");
-    } finally {
-      setIsResendingOtp(false);
-    }
-  };
-
-  const handleCancelPendingOtp = () => {
-    setPendingOtpSession(null);
-    setOtpInput("");
-    setOtpError(null);
-    setOtpInfo(null);
-    try {
-      sessionStorage.removeItem(PENDING_OTP_STORAGE_KEY);
-    } catch {}
-  };
-
-  const handleMultiRoleRegister = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!regInstansi || !regSandiShared) {
-      alert("Mohon lengkapi Nama Instansi dan Kata Sandi!");
-      return;
-    }
-    if (regSandiShared.length < 6) {
-      alert("Kata sandi minimal 6 karakter demi keamanan akun Anda.");
-      return;
-    }
-    if (!regGiziNama || !regGiziEmail || !regGiziNoHp) {
-      alert("Mohon lengkapi data diri Pengawas Gizi!");
-      return;
-    }
-    if (!regAkuntanNama || !regAkuntanEmail || !regAkuntanNoHp) {
-      alert("Mohon lengkapi data diri Akuntan!");
-      return;
-    }
-    if (!regChefNama || !regChefEmail || !regChefNoHp) {
-      alert("Mohon lengkapi data diri Chef/Juru Masak!");
-      return;
-    }
-
-    setIsRegistering(true);
-    try {
-      await registerThreeRoles({
-        namaSPPG: regInstansi,
-        sandi: regSandiShared,
-        roles: [
-          { namaLengkap: regGiziNama, email: regGiziEmail, noHp: regGiziNoHp, profesi: "Pengawas gizi" },
-          { namaLengkap: regAkuntanNama, email: regAkuntanEmail, noHp: regAkuntanNoHp, profesi: "Akuntan" },
-          { namaLengkap: regChefNama, email: regChefEmail, noHp: regChefNoHp, profesi: "Chef/Juru Masak" }
-        ]
-      });
-
-      alert(
-        `Registrasi Berhasil!\n\nData untuk ketiga peran (Pengawas Gizi, Akuntan, dan Chef/Juru Masak) pada instansi "${regInstansi}" berhasil didaftarkan.\n\nAkun Anda saat ini menunggu verifikasi & persetujuan (ACC) dari Administrator. Setelah di-ACC oleh admin, Anda dapat masuk menggunakan email terdaftar dan langsung mengakses dasbor aplikasi.`
-      );
-      
-      // Auto-prefill the login tab with the Pengawas Gizi email
-      setLoginEmail(regGiziEmail);
-      setAuthTab("masuk");
-    } catch (err: any) {
-      alert(err.message || "Gagal mendaftarkan tenant. Silakan coba lagi.");
-    } finally {
-      setIsRegistering(false);
-    }
-  };
-
-  // If user is not logged in, show beautiful GiziSync / SISPERMBG Login screen
+  // If user is not logged in, show clean Email Google Login screen (no password / registration tabs)
   if (!user) {
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const isRegNamaValid = regNamaSingle.trim().length >= 2;
-    const isRegEmailValid = emailRegex.test(regEmailSingle.trim());
-    const isRegPekerjaanValid = regPekerjaanSingle.trim().length >= 2;
-    const isRegInstansiValid = regInstansiSingle.trim().length >= 2;
-    const isRegSandiValid = regSandiSingle.length >= 6;
-    const isRegConfirmSandiValid = regConfirmSandiSingle.length >= 6 && regConfirmSandiSingle === regSandiSingle;
+    const isIframeBlocked = authError === "IFRAME_BLOCKED";
 
     return (
       <div className="min-h-screen bg-[#F1F3F9] text-slate-700 flex items-center justify-center p-4 md:p-8 font-sans">
-        {/* Main responsive container card matching picture structure */}
-        <div className="w-full max-w-5xl bg-white rounded-3xl shadow-2xl flex flex-col md:flex-row overflow-hidden border border-slate-200/80">
+        <div className="w-full max-w-5xl bg-white rounded-3xl shadow-xl flex flex-col md:flex-row overflow-hidden border border-slate-200/90">
           
-          {/* LEFT COLUMN: Dark Blue Gradient Banner */}
-          <div className="w-full md:w-[420px] shrink-0 bg-[#112461] bg-gradient-to-b from-[#112461] via-[#0E1E52] to-[#0A153A] text-white p-8 md:p-10 flex flex-col justify-between min-h-[480px] md:min-h-[640px] relative items-center text-center">
-            {/* Top Logo and branding - Centered and Uploadable */}
+          {/* LEFT COLUMN: Branded Navy Banner with Synced Global Admin Logo */}
+          <div className="w-full md:w-[410px] shrink-0 bg-[#112461] bg-gradient-to-b from-[#112461] via-[#0E1E52] to-[#0A153A] text-white p-8 md:p-10 flex flex-col justify-between min-h-[420px] md:min-h-[600px] relative items-center text-center">
             <div className="flex flex-col items-center gap-3 w-full">
-              <div className="relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-xl bg-white flex items-center justify-center">
+              <div className="relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-lg bg-white flex items-center justify-center">
                 <img
                   src={globalAppLogo || customLogo || kopLeftLogo || DEFAULT_FALLBACK_LOGO}
                   alt="Logo GiziSync"
@@ -1939,669 +1619,204 @@ export default function App() {
                   }}
                 />
               </div>
-              
+
               <div>
                 <div className="font-extrabold text-lg tracking-wider text-white">GIZISYNC</div>
-                <div className="text-[10px] text-emerald-400 font-bold uppercase tracking-widest -mt-1">SISPERMBG</div>
+                <div className="text-[10px] text-emerald-400 font-bold uppercase tracking-widest -mt-0.5">SISPERMBG</div>
               </div>
             </div>
 
-            {/* Mid Banner Text - Centered */}
-            <div className="my-6 md:my-8 space-y-4">
+            <div className="my-6 md:my-8 space-y-3.5">
               <h1 className="text-xl md:text-2xl font-extrabold text-white leading-tight tracking-tight">
-                Sistem Perencanaan & Pemantauan Gizi Nasional
+                Sistem Perencanaan &amp; Pemantauan Gizi Nasional
               </h1>
               <p className="text-slate-300 text-xs leading-relaxed font-normal">
-                Platform komersial dan terpadu untuk penginputan, perencanaan, perhitungan kecukupan gizi, akuntansi anggaran, dan manajemen dapur secara gratis berdasarkan standar menu gizi nasional.
+                Platform terpadu untuk perencanaan menu siklus, perhitungan kecukupan gizi TKPI 2020, food cost, nota pesanan logistik, dan arsip bulanan SPPG.
               </p>
             </div>
 
-            {/* Bottom Multi-Platform and Copyright */}
-            <div className="space-y-6 w-full">
+            <div className="space-y-5 w-full">
               <div className="bg-white/5 border border-white/10 rounded-2xl p-4 text-left">
-                <p className="text-[9px] font-bold text-blue-400 tracking-wider uppercase mb-2">MULTI-PLATFORM READY</p>
-                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-300">
-                  <span className="flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                    iPhone/Android
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                    iPad/Tablet
-                  </span>
-                  <span className="flex items-center gap-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                    Laptop / PC
-                  </span>
+                <p className="text-[10px] font-bold text-blue-300 tracking-wider uppercase mb-2">MULTI-PLATFORM READY</p>
+                <div className="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-200">
+                  <span>iPhone / Android</span>
+                  <span>·</span>
+                  <span>iPad / Tablet</span>
+                  <span>·</span>
+                  <span>Laptop / PC</span>
                 </div>
               </div>
-              
+
               <p className="text-[10px] text-slate-400 font-medium">
                 © 2026 GIZISYNC | SISPERMBG Berdasarkan TKPI 2020.
               </p>
             </div>
           </div>
 
-          {/* RIGHT COLUMN: White Interactive Panel */}
-          <div className="bg-white p-8 md:p-10 flex-grow flex flex-col justify-between">
-            <div>
-              {/* Header section matching screenshot */}
-              <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">Selamat Datang</h2>
-              <p className="text-slate-500 text-xs mt-1">
-                Silakan login menggunakan email aktif Anda untuk masuk ke sistem perencanaan menu gizi.
-              </p>
+          {/* RIGHT COLUMN: Clean Per-User Email Google Sign-In */}
+          <div className="bg-white p-7 md:p-10 flex-grow flex flex-col justify-between gap-6">
+            <div className="space-y-5">
+              <div className="space-y-1.5">
+                <h2 className="text-2xl font-extrabold text-slate-900 tracking-tight">
+                  Masuk Dashboard SISPERMBG
+                </h2>
+                <p className="text-slate-500 text-xs leading-relaxed">
+                  Masuk langsung menggunakan akun email Google masing-masing untuk mengakses ruang kerja dashboard pribadi Anda.
+                </p>
+              </div>
 
               {demoNotice && (
-                <div className="mt-4 bg-rose-50 border border-rose-200 rounded-2xl p-3.5 text-xs text-rose-900 flex items-start justify-between gap-3">
+                <div className="bg-rose-50 border border-rose-200 rounded-2xl p-3.5 text-xs text-rose-900 flex items-start justify-between gap-3">
                   <div className="flex items-start gap-2">
                     <Clock className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                    <span className="font-bold">{demoNotice}</span>
+                    <span className="font-semibold">{demoNotice}</span>
                   </div>
                   <button
                     type="button"
                     onClick={clearDemoNotice}
-                    className="text-rose-700 font-extrabold hover:underline shrink-0 cursor-pointer"
+                    className="text-rose-700 font-bold hover:underline shrink-0 cursor-pointer"
                   >
                     Tutup
                   </button>
                 </div>
               )}
 
-              {/* Alert Box matching screenshot info banner - Clickable WhatsApp integration */}
-              <div 
-                onClick={handleWhatsAppContact}
-                className="bg-[#FFF8E1] border border-amber-300 hover:border-emerald-500 rounded-2xl p-4 my-5 text-left cursor-pointer transition-all hover:shadow-md group relative overflow-hidden"
-                title="Klik untuk mengirim pesan WhatsApp otomatis ke Admin"
-              >
-                <div className="flex items-center justify-between mb-1">
-                  <h4 className="text-xs font-black text-amber-900 flex items-center gap-1.5 uppercase tracking-wide">
-                    <Info className="w-4 h-4 text-amber-600 shrink-0" />
-                    Informasi :
-                  </h4>
-                  <span className="text-[10px] font-extrabold text-emerald-800 bg-emerald-100 border border-emerald-300 px-2.5 py-0.5 rounded-full flex items-center gap-1 group-hover:bg-emerald-600 group-hover:text-white transition-all shadow-2xs">
-                    <MessageCircle className="w-3.5 h-3.5 text-emerald-600 group-hover:text-white shrink-0" />
-                    Minta Akses WA
-                  </span>
-                </div>
-                <div className="text-[11px] text-amber-900 leading-relaxed font-bold space-y-0.5">
-                  <p>Kendala Login SISPERMBG</p>
-                  <p>Hubungi Admin GiziSync SISPERMBG</p>
-                  <p className="text-indigo-900 font-extrabold mt-1">Syukri_Odhe | Ahli Gizi</p>
-                  <p className="text-emerald-700 font-black flex items-center gap-1.5 mt-0.5">
-                    WA : 082271095251
-                    <span className="text-[10px] font-bold underline text-emerald-800 group-hover:text-emerald-950 transition-colors">(Klik untuk Kirim Pesan)</span>
-                  </p>
-                </div>
-              </div>
-
-              {authFeedback && (
-                <div
-                  className={`mb-4 rounded-2xl p-3.5 text-xs flex items-start justify-between gap-3 border ${
-                    authFeedback.type === "error"
-                      ? "bg-rose-50 border-rose-200 text-rose-900"
-                      : authFeedback.type === "success"
-                      ? "bg-emerald-50 border-emerald-200 text-emerald-900"
-                      : "bg-indigo-50 border-indigo-200 text-indigo-900"
-                  }`}
-                >
-                  <div className="flex items-start gap-2">
-                    {authFeedback.type === "success" ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                    ) : (
-                      <AlertCircle
-                        className={`w-4 h-4 shrink-0 mt-0.5 ${
-                          authFeedback.type === "error" ? "text-rose-600" : "text-indigo-600"
-                        }`}
-                      />
-                    )}
-                    <span className="font-bold leading-relaxed">{authFeedback.text}</span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setAuthFeedback(null)}
-                    className="font-extrabold hover:underline shrink-0 cursor-pointer text-[11px]"
-                  >
-                    Tutup
-                  </button>
-                </div>
-              )}
-
-              {/* Modern tab selectors inside right column */}
-              <div className="flex bg-slate-100 p-1 rounded-2xl border border-slate-200 mb-5">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthTab("masuk");
-                    setAuthFeedback(null);
-                  }}
-                  className={`flex-1 py-2 text-xs font-extrabold rounded-xl transition-all duration-155 ${
-                    authTab === "masuk"
-                      ? "bg-[#112461] text-white shadow-sm"
-                      : "text-slate-500 hover:text-slate-800"
-                  }`}
-                >
-                  Masuk Akun
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setAuthTab("daftar");
-                    setAuthFeedback(null);
-                  }}
-                  className={`flex-1 py-2 text-xs font-extrabold rounded-xl transition-all duration-155 ${
-                    authTab === "daftar"
-                      ? "bg-[#112461] text-white shadow-sm"
-                      : "text-slate-500 hover:text-slate-800"
-                  }`}
-                >
-                  {pendingOtpSession ? "Verifikasi Email (OTP)" : "Pendaftaran Baru"}
-                </button>
-              </div>
-
-              {authTab === "masuk" ? (
-                /* LOGIN FORM */
-                <form onSubmit={handleCustomLogin} className="space-y-4 text-xs">
-                  <div className="space-y-1.5 text-left">
-                    <label className="font-bold text-slate-700">Email Akun:</label>
-                    <input
-                      type="email"
-                      required
-                      value={loginEmail}
-                      onChange={(e) => setLoginEmail(e.target.value)}
-                      placeholder="Masukkan email Anda"
-                      className="w-full px-3.5 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-950 font-medium focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 focus:outline-none transition-all text-xs"
-                    />
-                  </div>
-
-                  <div className="space-y-1.5 text-left">
-                    <label className="font-bold text-slate-700">Kata Sandi:</label>
-                    <div className="relative">
-                      <input
-                        type={showLoginSandi ? "text" : "password"}
-                        required
-                        value={loginSandi}
-                        onChange={(e) => setLoginSandi(e.target.value)}
-                        placeholder="Masukkan kata sandi Anda"
-                        className="w-full pl-3.5 pr-11 py-3 bg-slate-50 border border-slate-200 rounded-xl text-slate-950 font-medium focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 focus:outline-none transition-all text-xs"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setShowLoginSandi(!showLoginSandi)}
-                        className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors p-1"
-                        title={showLoginSandi ? "Sembunyikan Kata Sandi" : "Tampilkan Kata Sandi"}
-                      >
-                        {showLoginSandi ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                      </button>
+              {authError && (
+                <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 text-xs text-rose-900 space-y-2.5">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                      <span className="font-semibold leading-relaxed">
+                        {isIframeBlocked
+                          ? "Browser memblokir jendela login Google di tampilan tertanam. Silakan buka aplikasi di tab baru agar Anda dapat memilih email Google Anda."
+                          : authError}
+                      </span>
                     </div>
-                    <div className="flex justify-end pt-1">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setResetEmailInput(loginEmail);
-                          setShowResetModal(true);
-                        }}
-                        className="text-blue-600 hover:text-blue-800 font-bold text-[11px] underline transition-colors cursor-pointer"
-                      >
-                        Lupa / Reset Kata Sandi?
-                      </button>
-                    </div>
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={isLoggingIn}
-                    className="w-full py-3.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-extrabold rounded-2xl transition cursor-pointer shadow-lg shadow-blue-500/20 disabled:opacity-50 text-xs flex items-center justify-center gap-2"
-                  >
-                    {isLoggingIn ? (
-                      <>
-                        <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                        <span>Memproses Masuk...</span>
-                      </>
-                    ) : (
-                      "Masuk Sekarang"
-                    )}
-                  </button>
-                </form>
-              ) : pendingOtpSession ? (
-                /* EMAIL VERIFICATION CODE (OTP) FORM */
-                <form onSubmit={handleVerifyOtpSubmit} className="space-y-4 text-left text-xs text-slate-700">
-                  <div className="bg-[#F4F7FC] p-5 md:p-6 rounded-2xl border border-indigo-200/80 space-y-4 shadow-2xs">
-                    <div className="flex items-start gap-3">
-                      <div className="w-10 h-10 rounded-xl bg-indigo-600 text-white flex items-center justify-center shrink-0 shadow-sm">
-                        <Mail className="w-5 h-5" />
-                      </div>
-                      <div className="space-y-1 flex-1">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <h3 className="text-sm font-black text-slate-900">Verifikasi Kode Email</h3>
-                          <span
-                            className={`text-[10px] font-extrabold px-2.5 py-0.5 rounded-md ${
-                              otpSecondsLeft > 0
-                                ? "bg-emerald-100 text-emerald-800"
-                                : "bg-rose-100 text-rose-700"
-                            }`}
-                          >
-                            {otpSecondsLeft > 0
-                              ? `Berlaku ${String(Math.floor(otpSecondsLeft / 60)).padStart(2, "0")}:${String(
-                                  otpSecondsLeft % 60
-                                ).padStart(2, "0")}`
-                              : "Kode Kedaluwarsa"}
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-slate-600 leading-relaxed">
-                          Sistem otomatis telah mengirim kode verifikasi 6 digit ke{" "}
-                          <strong className="text-indigo-700">{pendingOtpSession.recipientEmail}</strong>. Masukkan kode tersebut untuk langsung mengaktifkan akun Anda.
-                        </p>
-                      </div>
-                    </div>
-
-                    {otpInfo && (
-                      <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 text-[11px] text-emerald-900 font-semibold flex items-start gap-2">
-                        <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                        <span>{otpInfo}</span>
-                      </div>
-                    )}
-
-                    {/* When server SMTP/Resend secrets are not yet configured, display formatted email delivery preview so user can validate immediately */}
-                    {pendingOtpSession.deliveryMode === "preview" && pendingOtpSession.previewCode && (
-                      <div className="bg-white border border-indigo-200 rounded-xl p-4 space-y-2.5 shadow-2xs">
-                        <div className="flex items-center justify-between gap-2 border-b border-slate-100 pb-2">
-                          <span className="text-[10px] font-black uppercase tracking-wider text-indigo-700 flex items-center gap-1.5">
-                            <Send className="w-3.5 h-3.5" />
-                            Email Verifikasi Otomatis Terkirim
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              if (pendingOtpSession.previewCode) {
-                                navigator.clipboard?.writeText(pendingOtpSession.previewCode).catch(() => {});
-                                setOtpInput(pendingOtpSession.previewCode);
-                                setCopiedOtpPreview(true);
-                                setTimeout(() => setCopiedOtpPreview(false), 2000);
-                              }
-                            }}
-                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold text-[10px] rounded-lg transition cursor-pointer"
-                          >
-                            {copiedOtpPreview ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                            <span>{copiedOtpPreview ? "Diisi Otomatis" : "Salin & Isi Kode"}</span>
-                          </button>
-                        </div>
-                        <div className="text-[10.5px] text-slate-500 space-y-0.5">
-                          <div>
-                            <strong className="text-slate-700">Kepada:</strong> {pendingOtpSession.recipientEmail}
-                          </div>
-                          <div>
-                            <strong className="text-slate-700">Subjek:</strong>{" "}
-                            {pendingOtpSession.emailSubject || "[SISPERMBG] Kode Verifikasi Pendaftaran"}
-                          </div>
-                        </div>
-                        <div className="bg-slate-50 border border-dashed border-indigo-300 rounded-xl py-3 px-4 text-center">
-                          <div className="text-[9.5px] uppercase font-bold tracking-widest text-slate-400">
-                            Kode Verifikasi 6 Digit
-                          </div>
-                          <div className="text-2xl font-black tracking-[0.35em] text-[#112461] font-mono mt-1">
-                            {pendingOtpSession.previewCode}
-                          </div>
-                        </div>
-                        <p className="text-[10px] text-slate-400 leading-snug">
-                          Pengiriman ke kotak masuk eksternal otomatis aktif saat kredensial SMTP/Resend diatur di server.
-                        </p>
-                      </div>
-                    )}
-
-                    {/* 6-Digit OTP Input */}
-                    <div className="space-y-2">
-                      <label className="font-bold text-slate-700 text-xs block">
-                        Masukkan 6 Digit Kode Verifikasi:
-                      </label>
-                      <input
-                        type="text"
-                        inputMode="numeric"
-                        autoComplete="one-time-code"
-                        maxLength={6}
-                        value={otpInput}
-                        onChange={(e) => {
-                          const digits = e.target.value.replace(/\D/g, "").slice(0, 6);
-                          setOtpInput(digits);
-                          setOtpError(null);
-                        }}
-                        placeholder="000000"
-                        className="w-full px-4 py-3.5 bg-white border-2 border-indigo-300 focus:border-indigo-600 focus:ring-2 focus:ring-indigo-500/20 rounded-2xl text-center text-2xl font-black tracking-[0.45em] font-mono text-[#112461] focus:outline-none transition-all shadow-2xs"
-                      />
-                      {otpError && (
-                        <div className="bg-rose-50 border border-rose-200 text-rose-700 font-bold text-[11px] rounded-xl p-2.5 flex items-center gap-2">
-                          <AlertCircle className="w-4 h-4 shrink-0 text-rose-600" />
-                          <span>{otpError}</span>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px]">
-                      <button
-                        type="button"
-                        onClick={handleResendOtp}
-                        disabled={otpResendCooldown > 0 || isResendingOtp}
-                        className="font-bold text-indigo-600 hover:text-indigo-800 disabled:text-slate-400 disabled:cursor-not-allowed cursor-pointer inline-flex items-center gap-1"
-                      >
-                        <RefreshCw className={`w-3.5 h-3.5 ${isResendingOtp ? "animate-spin" : ""}`} />
-                        <span>
-                          {isResendingOtp
-                            ? "Mengirim Ulang..."
-                            : otpResendCooldown > 0
-                            ? `Kirim Ulang Kode (${otpResendCooldown}d)`
-                            : "Kirim Ulang Kode Verifikasi"}
-                        </span>
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={handleCancelPendingOtp}
-                        className="font-bold text-slate-500 hover:text-slate-800 cursor-pointer inline-flex items-center gap-1"
-                      >
-                        <ArrowLeft className="w-3.5 h-3.5" />
-                        <span>Ubah Email</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={isVerifyingOtp || otpInput.replace(/\D/g, "").length !== 6 || otpSecondsLeft === 0}
-                    className="w-full py-3.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold rounded-2xl transition cursor-pointer shadow-lg shadow-emerald-500/20 disabled:opacity-50 disabled:cursor-not-allowed text-xs flex items-center justify-center gap-2"
-                  >
-                    {isVerifyingOtp ? (
-                      <>
-                        <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                        <span>Memvalidasi & Mengaktifkan Akun...</span>
-                      </>
-                    ) : (
-                      <>
-                        <ShieldCheck className="w-4 h-4" />
-                        <span>Verifikasi Kode & Aktifkan Akun Sekarang</span>
-                      </>
-                    )}
-                  </button>
-                </form>
-              ) : (
-                /* SINGLE USER REGISTRATION FORM MATCHING REFERENCE IMAGE FORMAT */
-                <form onSubmit={handleCustomRegister} className="space-y-4 text-left text-xs text-slate-700">
-                  <div className="bg-[#F4F7FC] p-5 md:p-6 rounded-2xl border border-slate-200/80 space-y-4 shadow-2xs">
-                    {/* Nama Lengkap */}
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <label className="font-bold text-slate-700 text-xs block">Nama Lengkap:</label>
-                        {regNamaSingle.length > 0 && (
-                          <span className="text-[10px] font-bold">
-                            {isRegNamaValid ? (
-                              <span className="text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3"/> Sesuai</span>
-                            ) : (
-                              <span className="text-rose-500 flex items-center gap-1"><AlertCircle className="w-3 h-3"/> Min. 2 Karakter</span>
-                            )}
-                          </span>
-                        )}
-                      </div>
-                      <input
-                        type="text"
-                        required
-                        value={regNamaSingle}
-                        onChange={(e) => setRegNamaSingle(e.target.value)}
-                        placeholder="ESSE MAISHORAH"
-                        className={`w-full px-4 py-3 bg-white border rounded-2xl text-slate-900 font-bold focus:outline-none transition-all text-xs tracking-wide uppercase placeholder:text-slate-400 placeholder:normal-case placeholder:font-normal shadow-2xs ${
-                          regNamaSingle.length === 0
-                            ? "border-slate-200/90 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30"
-                            : isRegNamaValid
-                            ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/10"
-                            : "border-rose-500 ring-2 ring-rose-500/20 bg-rose-50/10"
-                        }`}
-                      />
-                    </div>
-
-                    {/* Email */}
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <label className="font-bold text-slate-700 text-xs block">Email Aktif (Untuk Kode Verifikasi):</label>
-                        {regEmailSingle.length > 0 && (
-                          <span className="text-[10px] font-bold">
-                            {isRegEmailValid ? (
-                              <span className="text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3"/> Format Valid</span>
-                            ) : (
-                              <span className="text-rose-500 flex items-center gap-1"><AlertCircle className="w-3 h-3"/> Format Tidak Valid</span>
-                            )}
-                          </span>
-                        )}
-                      </div>
-                      <input
-                        type="email"
-                        required
-                        value={regEmailSingle}
-                        onChange={(e) => setRegEmailSingle(e.target.value)}
-                        placeholder="essemaisyorara@gmail.com"
-                        className={`w-full px-4 py-3 bg-white border rounded-2xl text-slate-900 font-bold focus:outline-none transition-all text-xs tracking-wide placeholder:text-slate-400 placeholder:font-normal shadow-2xs ${
-                          regEmailSingle.length === 0
-                            ? "border-slate-200/90 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30"
-                            : isRegEmailValid
-                            ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/10"
-                            : "border-rose-500 ring-2 ring-rose-500/20 bg-rose-50/10"
-                        }`}
-                      />
-                      {regEmailSingle.length > 0 && !isRegEmailValid && (
-                        <p className="text-[10px] text-rose-600 font-semibold flex items-center gap-1 pt-0.5">
-                          <AlertCircle className="w-3 h-3 shrink-0" />
-                          Masukkan format email yang benar (contoh: user@gmail.com)
-                        </p>
-                      )}
-                    </div>
-
-                    {/* Pekerjaan / Profesi */}
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <label className="font-bold text-slate-700 text-xs block">Pekerjaan / Profesi:</label>
-                        {regPekerjaanSingle.length > 0 && (
-                          <span className="text-[10px] font-bold">
-                            {isRegPekerjaanValid ? (
-                              <span className="text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3"/> Sesuai</span>
-                            ) : (
-                              <span className="text-rose-500 flex items-center gap-1"><AlertCircle className="w-3 h-3"/> Min. 2 Karakter</span>
-                            )}
-                          </span>
-                        )}
-                      </div>
-                      <input
-                        type="text"
-                        required
-                        value={regPekerjaanSingle}
-                        onChange={(e) => setRegPekerjaanSingle(e.target.value)}
-                        placeholder="AHLI GIZI"
-                        className={`w-full px-4 py-3 bg-white border rounded-2xl text-slate-900 font-bold focus:outline-none transition-all text-xs tracking-wide uppercase placeholder:text-slate-400 placeholder:normal-case placeholder:font-normal shadow-2xs ${
-                          regPekerjaanSingle.length === 0
-                            ? "border-slate-200/90 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30"
-                            : isRegPekerjaanValid
-                            ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/10"
-                            : "border-rose-500 ring-2 ring-rose-500/20 bg-rose-50/10"
-                        }`}
-                      />
-                    </div>
-
-                    {/* Instansi / SPPG */}
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <label className="font-bold text-slate-700 text-xs block">Instansi / SPPG:</label>
-                        {regInstansiSingle.length > 0 && (
-                          <span className="text-[10px] font-bold">
-                            {isRegInstansiValid ? (
-                              <span className="text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3"/> Sesuai</span>
-                            ) : (
-                              <span className="text-rose-500 flex items-center gap-1"><AlertCircle className="w-3 h-3"/> Min. 2 Karakter</span>
-                            )}
-                          </span>
-                        )}
-                      </div>
-                      <input
-                        type="text"
-                        required
-                        value={regInstansiSingle}
-                        onChange={(e) => setRegInstansiSingle(e.target.value)}
-                        placeholder="SPPG KAYUAPAK"
-                        className={`w-full px-4 py-3 bg-white border rounded-2xl text-slate-900 font-bold focus:outline-none transition-all text-xs tracking-wide uppercase placeholder:text-slate-400 placeholder:normal-case placeholder:font-normal shadow-2xs ${
-                          regInstansiSingle.length === 0
-                            ? "border-slate-200/90 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30"
-                            : isRegInstansiValid
-                            ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/10"
-                            : "border-rose-500 ring-2 ring-rose-500/20 bg-rose-50/10"
-                        }`}
-                      />
-                    </div>
-
-                    {/* Kata Sandi & Konfirmasi Kata Sandi */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="space-y-1">
-                        <div className="flex items-center justify-between">
-                          <label className="font-bold text-slate-700 text-xs block">
-                            Kata Sandi <span className="text-[10px] text-slate-400 font-normal">(Min. 6)</span>:
-                          </label>
-                          {regSandiSingle.length > 0 && (
-                            <span className="text-[10px] font-bold">
-                              {isRegSandiValid ? (
-                                <span className="text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3"/> Valid ({regSandiSingle.length})</span>
-                              ) : (
-                                <span className="text-rose-500 flex items-center gap-1"><AlertCircle className="w-3 h-3"/> {regSandiSingle.length}/6 Karakter</span>
-                              )}
-                            </span>
-                          )}
-                        </div>
-                        <div className="relative">
-                          <input
-                            type={showRegSandi ? "text" : "password"}
-                            required
-                            minLength={6}
-                            value={regSandiSingle}
-                            onChange={(e) => setRegSandiSingle(e.target.value)}
-                            placeholder="Esse@123"
-                            className={`w-full pl-4 pr-11 py-3 bg-white border rounded-2xl text-slate-900 font-bold focus:outline-none transition-all text-xs tracking-wide placeholder:text-slate-400 placeholder:font-normal shadow-2xs ${
-                              regSandiSingle.length === 0
-                                ? "border-slate-200/90 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30"
-                                : isRegSandiValid
-                                ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/10"
-                                : "border-rose-500 ring-2 ring-rose-500/20 bg-rose-50/10"
-                            }`}
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setShowRegSandi(!showRegSandi)}
-                            className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors p-1"
-                            title={showRegSandi ? "Sembunyikan Kata Sandi" : "Tampilkan Kata Sandi"}
-                          >
-                            {showRegSandi ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                          </button>
-                        </div>
-                        {regSandiSingle.length > 0 && !isRegSandiValid && (
-                          <p className="text-[10px] text-rose-600 font-semibold flex items-center gap-1 pt-0.5">
-                            <AlertCircle className="w-3 h-3 shrink-0" />
-                            Kata sandi minimal 6 karakter
-                          </p>
-                        )}
-                      </div>
-
-                      <div className="space-y-1">
-                        <div className="flex items-center justify-between">
-                          <label className="font-bold text-slate-700 text-xs block">Konfirmasi Kata Sandi:</label>
-                          {regConfirmSandiSingle.length > 0 && (
-                            <span className="text-[10px] font-bold">
-                              {isRegConfirmSandiValid ? (
-                                <span className="text-emerald-600 flex items-center gap-1"><CheckCircle2 className="w-3 h-3"/> Cocok</span>
-                              ) : (
-                                <span className="text-rose-500 flex items-center gap-1"><AlertCircle className="w-3 h-3"/> Tidak Cocok</span>
-                              )}
-                            </span>
-                          )}
-                        </div>
-                        <div className="relative">
-                          <input
-                            type={showRegConfirmSandi ? "text" : "password"}
-                            required
-                            minLength={6}
-                            value={regConfirmSandiSingle}
-                            onChange={(e) => setRegConfirmSandiSingle(e.target.value)}
-                            placeholder="Esse@123"
-                            className={`w-full pl-4 pr-11 py-3 bg-white border rounded-2xl text-slate-900 font-bold focus:outline-none transition-all text-xs tracking-wide placeholder:text-slate-400 placeholder:font-normal shadow-2xs ${
-                              regConfirmSandiSingle.length === 0
-                                ? "border-slate-200/90 focus:border-blue-500 focus:ring-2 focus:ring-blue-400/30"
-                                : isRegConfirmSandiValid
-                                ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/10"
-                                : "border-rose-500 ring-2 ring-rose-500/20 bg-rose-50/10"
-                            }`}
-                          />
-                          <button
-                            type="button"
-                            onClick={() => setShowRegConfirmSandi(!showRegConfirmSandi)}
-                            className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 transition-colors p-1"
-                            title={showRegConfirmSandi ? "Sembunyikan Kata Sandi" : "Tampilkan Kata Sandi"}
-                          >
-                            {showRegConfirmSandi ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                          </button>
-                        </div>
-                        {regConfirmSandiSingle.length > 0 && !isRegConfirmSandiValid && (
-                          <p className="text-[10px] text-rose-600 font-semibold flex items-center gap-1 pt-0.5">
-                            <AlertCircle className="w-3 h-3 shrink-0" />
-                            {regConfirmSandiSingle !== regSandiSingle
-                              ? "Konfirmasi kata sandi tidak cocok"
-                              : "Kata sandi minimal 6 karakter"}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex justify-end items-center gap-3 pt-3">
                     <button
                       type="button"
-                      onClick={() => setAuthTab("masuk")}
-                      className="px-6 py-2.5 bg-[#EEF2F7] hover:bg-slate-200 text-slate-700 font-bold rounded-xl transition cursor-pointer text-xs"
+                      onClick={() => setAuthError(null)}
+                      className="text-rose-700 font-bold hover:underline shrink-0 cursor-pointer"
                     >
-                      Batal
-                    </button>
-                    <button
-                      type="submit"
-                      disabled={isRegistering}
-                      className="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 active:scale-98 text-white font-extrabold rounded-xl shadow-xs transition-all cursor-pointer text-xs flex items-center justify-center gap-2 disabled:opacity-80 disabled:cursor-not-allowed"
-                    >
-                      {isRegistering ? (
-                        <>
-                          <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                          <span>Mengirim Kode Verifikasi...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Send className="w-3.5 h-3.5" />
-                          <span>Daftar & Kirim Kode Verifikasi</span>
-                        </>
-                      )}
+                      Tutup
                     </button>
                   </div>
-                </form>
+                  {isIframeBlocked && (
+                    <a
+                      href={typeof window !== "undefined" ? window.location.href : "#"}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#112461] hover:bg-[#193382] text-white font-bold rounded-xl text-xs transition"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Buka Aplikasi di Tab Baru</span>
+                    </a>
+                  )}
+                </div>
               )}
 
+              {/* PRIMARY ACTION: Sign In With Own Google Email */}
+              <div className="space-y-3 pt-1">
+                <button
+                  type="button"
+                  id="btn-google-email-login"
+                  onClick={handleGoogleSignInClick}
+                  disabled={isGoogleSigningIn}
+                  className="w-full py-3.5 px-5 bg-[#112461] hover:bg-[#193382] active:scale-[0.99] text-white font-extrabold rounded-2xl transition cursor-pointer shadow-md shadow-indigo-950/15 disabled:opacity-60 text-sm flex items-center justify-center gap-3"
+                >
+                  {isGoogleSigningIn ? (
+                    <>
+                      <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                      <span>Membuka Pilihan Email Google...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="w-7 h-7 rounded-lg bg-white flex items-center justify-center shrink-0 shadow-xs">
+                        <svg className="w-4 h-4" viewBox="0 0 24 24" aria-hidden="true">
+                          <path fill="#4285F4" d="M23.49 12.27c0-.79-.07-1.54-.2-2.27H12v4.3h6.44a5.5 5.5 0 0 1-2.39 3.61v3h3.87c2.26-2.08 3.57-5.15 3.57-8.64z" />
+                          <path fill="#34A853" d="M12 24c3.24 0 5.95-1.07 7.93-2.91l-3.87-3c-1.07.72-2.44 1.15-4.06 1.15-3.12 0-5.77-2.11-6.72-4.95H1.28v3.1A12 12 0 0 0 12 24z" />
+                          <path fill="#FBBC05" d="M5.28 14.29A7.2 7.2 0 0 1 4.9 12c0-.79.14-1.56.38-2.29v-3.1H1.28A12 12 0 0 0 0 12c0 1.94.46 3.77 1.28 5.39l4-3.1z" />
+                          <path fill="#EA4335" d="M12 4.76c1.76 0 3.34.61 4.59 1.8l3.44-3.44C17.95 1.19 15.24 0 12 0A12 12 0 0 0 1.28 6.61l4 3.1C6.23 6.87 8.88 4.76 12 4.76z" />
+                        </svg>
+                      </span>
+                      <span>Masuk dengan Email Google Anda</span>
+                    </>
+                  )}
+                </button>
+                <p className="text-[11px] text-slate-500 text-center">
+                  Pilih akun Gmail pribadi Anda — tanpa perlu membuat atau mengingat kata sandi.
+                </p>
+              </div>
+
+              {/* Concise Access Flow Guide */}
+              <div className="bg-slate-50 border border-slate-200/80 rounded-2xl p-4 space-y-3 text-left">
+                <div className="text-[11px] font-extrabold text-slate-800 uppercase tracking-wide flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-[#112461] shrink-0" />
+                  <span>Alur Akses Pengguna SISPERMBG</span>
+                </div>
+                <ol className="space-y-2 text-xs text-slate-600">
+                  <li className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-md bg-indigo-100 text-[#112461] font-extrabold text-[11px] flex items-center justify-center shrink-0 mt-0.5 tabular-nums">1</span>
+                    <span>
+                      <strong className="text-slate-900">Masuk dengan Email Sendiri:</strong> Klik tombol di atas lalu pilih email Google aktif Anda.
+                    </span>
+                  </li>
+                  <li className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-md bg-amber-100 text-amber-800 font-extrabold text-[11px] flex items-center justify-center shrink-0 mt-0.5 tabular-nums">2</span>
+                    <span>
+                      <strong className="text-slate-900">Menunggu ACC Odhe Gizi:</strong> Pengguna baru otomatis diarahkan menghubungi <strong className="text-slate-900">Odhe Gizi</strong> agar akses disetujui melalui Panel Admin.
+                    </span>
+                  </li>
+                  <li className="flex items-start gap-2.5">
+                    <span className="w-5 h-5 rounded-md bg-emerald-100 text-emerald-800 font-extrabold text-[11px] flex items-center justify-center shrink-0 mt-0.5 tabular-nums">3</span>
+                    <span>
+                      <strong className="text-slate-900">Akses Penuh &amp; Tersimpan Otomatis:</strong> Setelah di-ACC, Anda langsung mendapatkan dashboard pribadi sendiri secara permanen (terkelola oleh Admin, tanpa Panel Admin).
+                    </span>
+                  </li>
+                </ol>
+              </div>
+
+              {/* Direct WhatsApp Contact to Odhe Gizi */}
+              <a
+                href={buildOdheGiziWhatsAppUrl({ keperluan: "konsultasi & ACC Akses Dashboard SISPERMBG" })}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block bg-amber-50/90 border border-amber-300/90 hover:border-emerald-500 rounded-2xl p-4 text-left transition-all hover:shadow-sm group"
+              >
+                <div className="flex items-center justify-between gap-2 mb-1">
+                  <span className="text-xs font-extrabold text-amber-950 flex items-center gap-1.5">
+                    <Info className="w-4 h-4 text-amber-600 shrink-0" />
+                    Hubungi Odhe Gizi Untuk ACC Akses
+                  </span>
+                  <span className="text-[11px] font-extrabold text-emerald-800 bg-emerald-100 border border-emerald-300 px-2.5 py-0.5 rounded-lg inline-flex items-center gap-1 group-hover:bg-emerald-600 group-hover:text-white transition-colors shrink-0">
+                    <MessageCircle className="w-3.5 h-3.5" />
+                    Chat WA
+                  </span>
+                </div>
+                <p className="text-xs text-slate-700 font-semibold">
+                  Syukri Odhe | Ahli Gizi — <span className="font-mono text-emerald-700 font-extrabold">WA 082271095251</span>
+                </p>
+              </a>
+
               {/* PANEL MASUK DEMO 5 MENIT */}
-              <div className="mt-5 bg-gradient-to-br from-emerald-50 via-teal-50 to-cyan-50 border border-emerald-200 rounded-2xl p-4 shadow-2xs space-y-2.5 text-left">
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2">
-                    <div className="w-8 h-8 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0">
-                      <Clock className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <h4 className="text-xs font-black text-emerald-950 uppercase tracking-wide">
-                        Panel Masuk Demo 5 Menit
-                      </h4>
-                      <p className="text-[11px] text-emerald-800 font-medium">
-                        Coba fitur aplikasi secara langsung · Keluar otomatis setelah 5 menit · Tanpa Panel Admin
-                      </p>
-                    </div>
+              <div className="bg-emerald-50/70 border border-emerald-200 rounded-2xl p-4 space-y-2.5 text-left">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-emerald-600 text-white flex items-center justify-center shrink-0">
+                    <Clock className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h4 className="text-xs font-extrabold text-emerald-950 uppercase tracking-wide">
+                      Panel Masuk Demo 5 Menit
+                    </h4>
+                    <p className="text-[11px] text-emerald-800 font-medium">
+                      Coba fitur secara langsung · Keluar otomatis setelah 5 menit · Tanpa Panel Admin
+                    </p>
                   </div>
                 </div>
                 <button
                   type="button"
                   id="btn-demo-5min-login"
                   onClick={loginDemoAccount}
-                  className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.99] text-white font-extrabold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-sm cursor-pointer"
+                  className="w-full py-2.5 px-4 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.99] text-white font-extrabold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-xs cursor-pointer"
                 >
                   <PlayCircle className="w-4 h-4" />
                   <span>Masuk Akun Demo (Batas Waktu 5 Menit)</span>
@@ -2609,11 +1824,10 @@ export default function App() {
               </div>
             </div>
 
-            {/* Bottom Footer Links matching reference image */}
-            <div className="border-t border-slate-100 pt-6 mt-6 flex flex-wrap justify-between gap-x-6 gap-y-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-              <span>SISTEM ENKRIPSI TERLINDUNGI</span>
-              <span>SYARAT & KETENTUAN</span>
-              <span>KONTAK BANTUAN</span>
+            <div className="border-t border-slate-100 pt-4 flex flex-wrap justify-between gap-x-6 gap-y-2 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+              <span>AUTENTIKASI EMAIL GOOGLE</span>
+              <span>DATA TENANT TERISOLASI</span>
+              <span>TKPI 2020 · JUKNIS BGN 2025</span>
             </div>
           </div>
 
@@ -2622,127 +1836,9 @@ export default function App() {
     );
   }
 
-  // If user profile is not registered in Firestore, show Registration Form
-  if (userProfile?.isNotRegistered) {
-    const handleRegisterSubmit = async (e: React.FormEvent) => {
-      e.preventDefault();
-      if (!regNama || !regNamaSPPG || !regNoHp) {
-        alert("Mohon lengkapi seluruh kolom pendaftaran!");
-        return;
-      }
-      setIsRegistering(true);
-      try {
-        await registerUser({
-          namaLengkap: regNama,
-          profesi: regProfesi,
-          namaSPPG: regNamaSPPG,
-          noHp: regNoHp
-        });
-      } catch (err) {
-        console.error(err);
-      } finally {
-        setIsRegistering(false);
-      }
-    };
-
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-6 relative overflow-hidden font-sans">
-        <div className="absolute top-0 left-0 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <div className="absolute bottom-0 right-0 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
-
-        <div className="w-full max-w-md bg-slate-900/80 border border-slate-800 p-8 rounded-3xl shadow-2xl relative z-10 space-y-6">
-          <div className="text-center space-y-1">
-            <h2 className="text-xl font-extrabold text-white">Formulir Pendaftaran</h2>
-            <p className="text-xs text-slate-400">Lengkapi data di bawah untuk memproses verifikasi tenant Anda</p>
-          </div>
-
-          <form onSubmit={handleRegisterSubmit} className="space-y-4 text-xs text-slate-200">
-            <div className="space-y-1 text-left">
-              <label className="font-bold text-slate-400">Email Akun (Google):</label>
-              <input
-                type="text"
-                disabled
-                value={user.email || ""}
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-slate-400 font-semibold focus:outline-none"
-              />
-            </div>
-
-            <div className="space-y-1 text-left">
-              <label className="font-bold text-slate-300">Nama Lengkap (Sesuai KTP/Profesi):</label>
-              <input
-                type="text"
-                required
-                value={regNama}
-                onChange={(e) => setRegNama(e.target.value)}
-                placeholder="Contoh: dr. Syukri Yusuf, M.Gizi"
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-white font-medium focus:ring-1 focus:ring-emerald-500 focus:outline-none"
-              />
-            </div>
-
-            <div className="space-y-1 text-left">
-              <label className="font-bold text-slate-300">Profesi / Jabatan Anda:</label>
-              <select
-                value={regProfesi}
-                onChange={(e) => setRegProfesi(e.target.value)}
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-white font-medium focus:ring-1 focus:ring-emerald-500 focus:outline-none cursor-pointer"
-              >
-                <option value="Ahli Gizi">Ahli Gizi / Nutritionist</option>
-                <option value="Pengelola SPPG">Pengelola Satuan Pelayanan (SPPG)</option>
-                <option value="Kepala SPPG">Kepala Satuan Pelayanan</option>
-                <option value="Tenaga Akuntansi">Tenaga Akuntansi / Keuangan</option>
-                <option value="Staf Operasional">Staf Operasional Lapangan</option>
-                <option value="Lainnya">Lainnya</option>
-              </select>
-            </div>
-
-            <div className="space-y-1 text-left">
-              <label className="font-bold text-slate-300">Nama SPPG / Instansi Anda:</label>
-              <input
-                type="text"
-                required
-                value={regNamaSPPG}
-                onChange={(e) => setRegNamaSPPG(e.target.value)}
-                placeholder="Contoh: SPPG Muna Barat Sawerigadi"
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-white font-medium focus:ring-1 focus:ring-emerald-500 focus:outline-none"
-              />
-            </div>
-
-            <div className="space-y-1 text-left">
-              <label className="font-bold text-slate-300">No. WhatsApp / Handphone Aktif:</label>
-              <input
-                type="text"
-                required
-                value={regNoHp}
-                onChange={(e) => setRegNoHp(e.target.value)}
-                placeholder="Contoh: 081234567890"
-                className="w-full px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-white font-medium focus:ring-1 focus:ring-emerald-500 focus:outline-none"
-              />
-            </div>
-
-            <div className="pt-2 flex gap-3">
-              <button
-                type="button"
-                onClick={signOutUser}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-xl transition cursor-pointer"
-              >
-                Batal
-              </button>
-              <button
-                type="submit"
-                disabled={isRegistering}
-                className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-extrabold rounded-xl transition cursor-pointer shadow-md shadow-emerald-500/10 disabled:opacity-50"
-              >
-                {isRegistering ? "Memproses..." : "Daftar & Ajukan Verifikasi"}
-              </button>
-            </div>
-          </form>
-        </div>
-      </div>
-    );
-  }
-
-  // Check if active period has expired
+  // Check if active period has expired (Main Admin never expires)
   const isExpired = (() => {
+    if (isAdminUser || isDemoUser) return false;
     if (!userProfile?.berakhirPada) return false;
     try {
       const now = new Date();
@@ -2757,129 +1853,330 @@ export default function App() {
     }
   })();
 
-  // If user profile access has expired
+  // If non-admin tenant is waiting for Admin ACC -> Direct immediately to Hubungi Odhe Gizi Untuk ACC Akses Anda
+  if (
+    !isDemoUser &&
+    !isMainAdminAccount &&
+    (userProfile?.statusPersetujuan === "menunggu" ||
+      userProfile?.statusPersetujuan === "pending" ||
+      !userProfile?.statusPersetujuan)
+  ) {
+    const waAccUrl = buildOdheGiziWhatsAppUrl({
+      nama: regNama || userProfile?.namaLengkap || user.displayName || "",
+      email: user.email || userProfile?.email || "",
+      namaSPPG: regNamaSPPG || userProfile?.namaSPPG || "",
+      keperluan: "mohon ACC Akses dashboard SISPERMBG saya agar akun langsung aktif",
+    });
+
+    return (
+      <div className="min-h-screen bg-[#F1F3F9] text-slate-800 flex items-center justify-center p-4 md:p-8 font-sans">
+        <div className="w-full max-w-2xl bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden">
+          {/* Top Branded Header Band */}
+          <div className="bg-[#112461] bg-gradient-to-r from-[#112461] to-[#193382] text-white px-6 py-6 md:px-8 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+            <div className="flex items-center gap-4">
+              <div className="w-16 h-16 rounded-full overflow-hidden border-2 border-emerald-400 bg-white shrink-0 shadow-md">
+                <img
+                  src={globalAppLogo || customLogo || kopLeftLogo || DEFAULT_FALLBACK_LOGO}
+                  alt="Logo SISPERMBG"
+                  className="w-full h-full object-cover"
+                  referrerPolicy="no-referrer"
+                  onError={(e) => {
+                    (e.target as HTMLImageElement).src = DEFAULT_FALLBACK_LOGO;
+                  }}
+                />
+              </div>
+              <div>
+                <div className="text-[10px] font-bold uppercase tracking-widest text-emerald-300">
+                  GIZISYNC · SISPERMBG
+                </div>
+                <h1 className="text-lg md:text-xl font-extrabold tracking-tight text-white">
+                  Menunggu ACC Akses Dashboard
+                </h1>
+                <p className="text-xs text-slate-300 mt-0.5">
+                  Email masuk: <strong className="text-white font-mono">{user.email}</strong>
+                </p>
+              </div>
+            </div>
+            <div className="self-start sm:self-center px-3 py-1.5 rounded-lg bg-amber-400/20 border border-amber-300/40 text-amber-200 text-xs font-extrabold flex items-center gap-1.5 shrink-0">
+              <Clock className="w-3.5 h-3.5" />
+              <span>Menunggu ACC Admin</span>
+            </div>
+          </div>
+
+          <div className="p-6 md:p-8 space-y-6">
+            {/* Primary Callout: Direct to Odhe Gizi for ACC */}
+            <div className="bg-amber-50 border border-amber-200 rounded-2xl p-5 space-y-4">
+              <div className="space-y-1.5">
+                <h2 className="text-base font-extrabold text-slate-900">
+                  Hubungi Odhe Gizi Untuk ACC Akses Anda
+                </h2>
+                <p className="text-xs text-slate-700 leading-relaxed">
+                  Akun email <strong className="text-slate-900">{user.email}</strong> telah tercatat otomatis di Panel Admin SISPERMBG. Silakan hubungi <strong className="text-slate-900">Odhe Gizi</strong> melalui WhatsApp di bawah ini agar akses penuh dashboard pribadi Anda segera disetujui (ACC).
+                </p>
+              </div>
+
+              <a
+                href={waAccUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                id="btn-hubungi-odhe-gizi-acc"
+                className="w-full py-3.5 px-5 bg-emerald-600 hover:bg-emerald-700 active:scale-[0.99] text-white font-extrabold rounded-xl text-sm transition shadow-md shadow-emerald-600/20 flex items-center justify-center gap-2.5"
+              >
+                <MessageCircle className="w-5 h-5 shrink-0" />
+                <span>Hubungi Odhe Gizi Untuk ACC Akses Anda (WA: 082271095251)</span>
+              </a>
+
+              <div className="flex items-start gap-2 text-[11px] text-emerald-900 bg-emerald-50 border border-emerald-200/80 rounded-xl p-3">
+                <UserCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <span>
+                  <strong>Terbuka Otomatis Setelah ACC:</strong> Setelah Odhe Gizi menekan tombol <strong>ACC / Setujui</strong> di Panel Admin, halaman ini akan langsung membuka dashboard penuh milik Anda secara otomatis dan tersimpan permanen.
+                </span>
+              </div>
+            </div>
+
+            {statusCheckFeedback && (
+              <div
+                className={`rounded-xl p-3.5 text-xs font-semibold flex items-start gap-2 border ${
+                  statusCheckFeedback.type === "success"
+                    ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                    : statusCheckFeedback.type === "error"
+                    ? "bg-rose-50 border-rose-200 text-rose-900"
+                    : "bg-indigo-50 border-indigo-200 text-indigo-900"
+                }`}
+              >
+                {statusCheckFeedback.type === "success" ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                ) : (
+                  <Info className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                )}
+                <span>{statusCheckFeedback.text}</span>
+              </div>
+            )}
+
+            {/* Optional Quick Profile Form so Admin sees Tenant SPPG details immediately */}
+            <form onSubmit={handleSaveWaitingIdentity} className="bg-slate-50 border border-slate-200 rounded-2xl p-5 space-y-4">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-xs font-extrabold text-slate-900 uppercase tracking-wide flex items-center gap-1.5">
+                    <Building2 className="w-4 h-4 text-[#112461]" />
+                    <span>Identitas SPPG Anda (Tampil di Panel Admin)</span>
+                  </h3>
+                  <p className="text-[11px] text-slate-500 mt-0.5">
+                    Lengkapi nama &amp; SPPG Anda agar Odhe Gizi mudah mengenali akun Anda saat ACC.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+                <div className="space-y-1">
+                  <label className="font-bold text-slate-700 block">Nama Lengkap</label>
+                  <input
+                    type="text"
+                    required
+                    value={regNama}
+                    onChange={(e) => setRegNama(e.target.value)}
+                    placeholder="Nama Lengkap Anda"
+                    className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="font-bold text-slate-700 block">Profesi / Jabatan</label>
+                  <select
+                    value={regProfesi}
+                    onChange={(e) => setRegProfesi(e.target.value)}
+                    className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 cursor-pointer"
+                  >
+                    <option value="Ahli Gizi">Ahli Gizi / Nutritionist</option>
+                    <option value="Pengelola SPPG">Pengelola SPPG</option>
+                    <option value="Kepala SPPG">Kepala Satuan Pelayanan</option>
+                    <option value="Tenaga Akuntansi">Akuntan / Keuangan</option>
+                    <option value="Chef / Juru Masak">Chef / Juru Masak</option>
+                    <option value="Staf Operasional">Staf Operasional</option>
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <label className="font-bold text-slate-700 block">Nama SPPG / Instansi</label>
+                  <input
+                    type="text"
+                    value={regNamaSPPG}
+                    onChange={(e) => setRegNamaSPPG(e.target.value)}
+                    placeholder="Contoh: SPPG Muna Barat"
+                    className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="font-bold text-slate-700 block">No. WhatsApp Aktif</label>
+                  <input
+                    type="text"
+                    value={regNoHp}
+                    onChange={(e) => setRegNoHp(e.target.value)}
+                    placeholder="Contoh: 081234567890"
+                    className="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-slate-900 font-semibold focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                <div className="text-[11px] font-semibold text-emerald-700">
+                  {waitingProfileSavedMsg && (
+                    <span className="inline-flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      {waitingProfileSavedMsg}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="submit"
+                  disabled={isSavingWaitingProfile}
+                  className="px-4 py-2 bg-[#112461] hover:bg-[#193382] text-white font-bold text-xs rounded-xl transition cursor-pointer disabled:opacity-60"
+                >
+                  {isSavingWaitingProfile ? "Menyimpan..." : "Simpan Identitas ke Admin"}
+                </button>
+              </div>
+            </form>
+
+            {/* Footer Actions */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={signOutUser}
+                className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl transition cursor-pointer text-xs flex items-center justify-center gap-1.5"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+                <span>Keluar &amp; Ganti Email</span>
+              </button>
+              <button
+                type="button"
+                onClick={handleManualStatusCheck}
+                disabled={isCheckingStatus}
+                className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-extrabold rounded-xl transition cursor-pointer text-xs flex items-center justify-center gap-1.5 disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingStatus ? "animate-spin" : ""}`} />
+                <span>{isCheckingStatus ? "Memeriksa Status ACC..." : "Periksa Status ACC Sekarang"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // If user is blocked / diblokir by Admin
+  if (!isDemoUser && !isMainAdminAccount && userProfile?.statusPersetujuan === "diblokir") {
+    const waBlockedUrl = buildOdheGiziWhatsAppUrl({
+      nama: userProfile?.namaLengkap || user.displayName || "",
+      email: user.email || userProfile?.email || "",
+      namaSPPG: userProfile?.namaSPPG || "",
+      keperluan: "memohon pengaktifan kembali akses dashboard SISPERMBG saya",
+    });
+
+    return (
+      <div className="min-h-screen bg-[#F1F3F9] text-slate-800 flex items-center justify-center p-4 md:p-8 font-sans">
+        <div className="w-full max-w-md bg-white border border-slate-200 rounded-3xl shadow-xl overflow-hidden text-center">
+          <div className="bg-rose-600 text-white px-6 py-6 flex flex-col items-center gap-3">
+            <div className="w-14 h-14 rounded-2xl bg-white/15 flex items-center justify-center">
+              <Lock className="w-7 h-7 text-white" />
+            </div>
+            <div>
+              <h2 className="text-lg font-extrabold">Akses Akun Dinonaktifkan</h2>
+              <p className="text-xs text-rose-100 font-mono mt-0.5">{user.email}</p>
+            </div>
+          </div>
+
+          <div className="p-6 space-y-5">
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Akses dashboard Anda saat ini sedang dinonaktifkan atau ditangguhkan oleh Administrator melalui Panel Admin. Silakan hubungi <strong className="text-slate-900">Odhe Gizi</strong> untuk membuka kembali akses akun Anda.
+            </p>
+
+            <a
+              href={waBlockedUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-sm"
+            >
+              <MessageCircle className="w-4 h-4" />
+              <span>Hubungi Odhe Gizi (WA: 082271095251)</span>
+            </a>
+
+            <div className="flex gap-2.5 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={signOutUser}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl transition cursor-pointer text-xs"
+              >
+                Keluar &amp; Ganti Email
+              </button>
+              <button
+                type="button"
+                onClick={handleManualStatusCheck}
+                disabled={isCheckingStatus}
+                className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl transition cursor-pointer text-xs flex items-center justify-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingStatus ? "animate-spin" : ""}`} />
+                <span>Cek Status</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // If user profile access period has expired
   if (isExpired) {
+    const waExpiredUrl = buildOdheGiziWhatsAppUrl({
+      nama: userProfile?.namaLengkap || user.displayName || "",
+      email: user.email || userProfile?.email || "",
+      namaSPPG: userProfile?.namaSPPG || "",
+      keperluan: `memperpanjang masa aktif akun SISPERMBG (berakhir ${userProfile?.berakhirPada || ""})`,
+    });
+
     return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-6 relative overflow-hidden font-sans select-none">
-        <div className="absolute top-0 left-0 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <div className="absolute bottom-0 right-0 w-96 h-96 bg-rose-500/10 rounded-full blur-3xl pointer-events-none"></div>
-
-        <div className="w-full max-w-md bg-slate-900/80 border border-slate-800 p-8 rounded-3xl shadow-2xl relative z-10 text-center space-y-6 animate-in fade-in zoom-in-95 duration-200">
-          <div className="p-4 bg-rose-500/10 text-rose-500 rounded-full inline-block mx-auto animate-pulse">
-            <Clock className="w-10 h-10 text-rose-500" />
+      <div className="min-h-screen bg-[#F1F3F9] text-slate-800 flex items-center justify-center p-4 md:p-8 font-sans">
+        <div className="w-full max-w-md bg-white border border-slate-200 rounded-3xl shadow-xl overflow-hidden text-center">
+          <div className="bg-amber-600 text-white px-6 py-6 flex flex-col items-center gap-3">
+            <div className="w-14 h-14 rounded-2xl bg-white/15 flex items-center justify-center">
+              <Clock className="w-7 h-7 text-white" />
+            </div>
+            <div>
+              <h2 className="text-lg font-extrabold">Masa Aktif Akun Berakhir</h2>
+              <p className="text-xs text-amber-100 font-mono mt-0.5">{user.email}</p>
+            </div>
           </div>
 
-          <div className="space-y-2">
-            <h2 className="text-xl font-extrabold text-white">Masa Login Berakhir</h2>
-            <p className="text-xs text-slate-400 leading-relaxed">
-              Mohon maaf, masa login/aktif akun Anda dengan email <strong className="text-rose-400">{user.email}</strong> telah berakhir pada <strong className="text-rose-400">{userProfile.berakhirPada}</strong>.
+          <div className="p-6 space-y-5">
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Masa aktif akun Anda berakhir pada <strong className="text-rose-600 font-mono">{userProfile?.berakhirPada}</strong>. Hubungi <strong className="text-slate-900">Odhe Gizi</strong> agar masa aktif dashboard Anda diperpanjang di Panel Admin.
             </p>
-          </div>
 
-          <div className="bg-rose-950/30 p-3.5 border border-rose-900 rounded-xl text-[10px] text-rose-300 leading-relaxed">
-            Akses Anda telah dinonaktifkan secara otomatis. Silakan hubungi Administrator Utama di email <strong className="text-white">Syukriyusuf82@gmail.com</strong> untuk melakukan perpanjangan masa aktif atau aktivasi ulang tenant Anda.
-          </div>
-
-          <div className="pt-2 flex gap-3">
-            <button
-              onClick={signOutUser}
-              className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-xl transition cursor-pointer text-xs flex-1"
+            <a
+              href={waExpiredUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-sm"
             >
-              Keluar & Ganti Akun
-            </button>
-            <button
-              onClick={refreshUserProfile}
-              className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl transition cursor-pointer text-xs flex-1 flex items-center justify-center gap-1.5"
-            >
-              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-              Segarkan Status
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+              <MessageCircle className="w-4 h-4" />
+              <span>Hubungi Odhe Gizi Untuk Perpanjangan</span>
+            </a>
 
-  // If user is pending approval
-  if (userProfile?.statusPersetujuan === "menunggu" || userProfile?.statusPersetujuan === "pending") {
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-6 relative overflow-hidden font-sans">
-        <div className="absolute top-0 left-0 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <div className="absolute bottom-0 right-0 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
-
-        <div className="w-full max-w-md bg-slate-900/80 border border-slate-800 p-8 rounded-3xl shadow-2xl relative z-10 text-center space-y-6 animate-in fade-in zoom-in-95 duration-200">
-          <div className="p-4 bg-amber-500/10 text-amber-400 rounded-full inline-block mx-auto animate-pulse">
-            <Clock className="w-10 h-10" />
-          </div>
-
-          <div className="space-y-2">
-            <h2 className="text-xl font-extrabold text-white">Menunggu Verifikasi Admin</h2>
-            <p className="text-xs text-slate-400 leading-relaxed">
-              Pendaftaran Anda dengan email <strong className="text-amber-400">{user.email}</strong> berhasil disimpan. Akun Anda sedang menunggu persetujuan dan pengaktifan oleh Admin Utama agar data Anda dapat terisolasi dengan aman.
-            </p>
-          </div>
-
-          <div className="bg-slate-950/60 p-4 rounded-xl border border-slate-800 text-left text-[11px] space-y-1.5 text-slate-300">
-            <div><span className="font-bold text-slate-500">Nama Lengkap:</span> {userProfile.namaLengkap}</div>
-            <div><span className="font-bold text-slate-500">Profesi:</span> {userProfile.profesi}</div>
-            <div><span className="font-bold text-slate-500">SPPG/Instansi:</span> {userProfile.namaSPPG}</div>
-            <div><span className="font-bold text-slate-500">No. HP:</span> {userProfile.noHp}</div>
-          </div>
-
-          <div className="bg-indigo-950/50 p-3.5 border border-indigo-900 rounded-xl text-[10px] text-indigo-300 leading-relaxed">
-            Silakan hubungi Admin Utama di email <strong className="text-white">Syukriyusuf82@gmail.com</strong> untuk mempercepat aktivasi Satuan Pelayanan Anda.
-          </div>
-
-          <div className="pt-2 flex gap-3">
-            <button
-              onClick={signOutUser}
-              className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-xl transition cursor-pointer text-xs"
-            >
-              Keluar Akun
-            </button>
-            <button
-              onClick={refreshUserProfile}
-              className="flex-1 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-extrabold rounded-xl transition cursor-pointer text-xs flex items-center justify-center gap-1.5 shadow-md shadow-amber-500/10"
-            >
-              <RefreshCw className="w-3.5 h-3.5" />
-              Segarkan Status
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // If user is blocked / diblokir
-  if (userProfile?.statusPersetujuan === "diblokir") {
-    return (
-      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-6 relative overflow-hidden font-sans">
-        <div className="absolute top-0 left-0 w-96 h-96 bg-indigo-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <div className="absolute bottom-0 right-0 w-96 h-96 bg-rose-500/10 rounded-full blur-3xl pointer-events-none"></div>
-
-        <div className="w-full max-w-md bg-slate-900/80 border border-slate-800 p-8 rounded-3xl shadow-2xl relative z-10 text-center space-y-6">
-          <div className="p-4 bg-rose-500/10 text-rose-500 rounded-full inline-block mx-auto">
-            <Lock className="w-10 h-10" />
-          </div>
-
-          <div className="space-y-2">
-            <h2 className="text-xl font-extrabold text-white">Akses Akun Dinonaktifkan</h2>
-            <p className="text-xs text-slate-400 leading-relaxed">
-              Mohon maaf, akun Anda dengan email <strong className="text-rose-400">{user.email}</strong> saat ini ditangguhkan atau dinonaktifkan oleh Administrator Utama.
-            </p>
-          </div>
-
-          <div className="bg-rose-950/30 p-3.5 border border-rose-900 rounded-xl text-[10px] text-rose-300 leading-relaxed">
-            Silakan hubungi Admin Utama di email <strong className="text-white">Syukriyusuf82@gmail.com</strong> untuk informasi pengaktifan kembali tenant Anda.
-          </div>
-
-          <div className="pt-2">
-            <button
-              onClick={signOutUser}
-              className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-xl transition cursor-pointer text-xs"
-            >
-              Keluar & Ganti Akun
-            </button>
+            <div className="flex gap-2.5 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={signOutUser}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl transition cursor-pointer text-xs"
+              >
+                Keluar &amp; Ganti Email
+              </button>
+              <button
+                type="button"
+                onClick={handleManualStatusCheck}
+                disabled={isCheckingStatus}
+                className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl transition cursor-pointer text-xs flex items-center justify-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingStatus ? "animate-spin" : ""}`} />
+                <span>Cek Status</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>
@@ -4160,41 +3457,41 @@ export default function App() {
 
             <div className="space-y-4 text-slate-600 text-xs leading-relaxed">
               <p>
-                Browser Anda memblokir Google Sign-In pop-up karena aplikasi berjalan di dalam <strong>Iframe Google AI Studio</strong> (proteksi keamanan pihak ketiga).
+                {authError === "IFRAME_BLOCKED"
+                  ? "Browser Anda memblokir Google Sign-In pop-up karena aplikasi berjalan di dalam jendela pratinjau (iframe). Buka di tab baru agar masuk dengan email Google berjalan lancar."
+                  : authError}
               </p>
 
-              <div className="bg-[#FFF4F7]/80 border border-rose-100/50 p-3.5 rounded-2xl text-slate-700">
-                <p className="font-bold text-[#E6004C] mb-1 flex items-center gap-1.5">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-[#E6004C]"></span>
-                  Solusi Utama (Sangat Direkomendasikan):
+              <div className="bg-blue-50/80 border border-blue-100 p-3.5 rounded-2xl text-slate-700 space-y-2.5">
+                <p className="font-bold text-blue-800 flex items-center gap-1.5">
+                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-600"></span>
+                  Solusi Utama (Direkomendasikan):
                 </p>
                 <p className="text-[11px] text-slate-600 pl-3 leading-snug">
-                  Klik tombol <strong>"Buka di Tab Baru" (Open in New Tab)</strong> di sudut kanan atas layar pratinjau AI Studio Anda untuk menjalankan sistem secara mandiri dengan lancar.
+                  Buka aplikasi SISPERMBG di tab browser terpisah lalu masuk menggunakan akun email Google masing-masing.
                 </p>
-              </div>
-
-              <div className="bg-slate-50 border border-slate-200/60 p-3.5 rounded-2xl">
-                <p className="font-bold text-slate-800 mb-1 flex items-center gap-1.5">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-600"></span>
-                  Masuk Instan Admin Utama:
-                </p>
-                <p className="text-[11px] mb-3 text-slate-500 pl-3 leading-snug">
-                  Gunakan kredensial Administrator Utama resmi untuk melewati rintangan cookie iframe dan masuk dengan hak akses penuh.
-                </p>
-                <button
-                  type="button"
-                  onClick={() => {
-                    simulateAdminLogin();
-                  }}
-                  className="w-full py-2.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-black rounded-xl transition shadow-md flex items-center justify-center gap-2 cursor-pointer"
+                <a
+                  href={typeof window !== "undefined" ? window.location.href : "#"}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full py-2.5 px-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition shadow-sm flex items-center justify-center gap-2"
                 >
-                  <Lock className="w-3.5 h-3.5" />
-                  <span>Masuk sebagai sukriyusuf82@gmail.com</span>
-                </button>
+                  <span>Buka Aplikasi di Tab Baru</span>
+                </a>
               </div>
             </div>
 
             <div className="mt-5 pt-3 border-t border-slate-100 flex justify-end gap-2.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthError(null);
+                  signInWithGoogle();
+                }}
+                className="py-2 px-4 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition cursor-pointer"
+              >
+                Coba Masuk Google Lagi
+              </button>
               <button
                 type="button"
                 onClick={() => setAuthError(null)}
@@ -4396,85 +3693,6 @@ export default function App() {
                 <span>Simpan & Terapkan</span>
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* RESET PASSWORD MODAL */}
-      {showResetModal && (
-        <div className="fixed inset-0 z-[99999] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white w-full max-w-md rounded-2xl shadow-2xl border border-slate-200 overflow-hidden animate-in fade-in zoom-in-95 duration-150">
-            <div className="p-5 bg-gradient-to-r from-blue-600 to-indigo-600 text-white flex justify-between items-center">
-              <div className="flex items-center gap-2">
-                <Key className="w-5 h-5 text-amber-300" />
-                <h3 className="font-extrabold text-sm">Reset Kata Sandi Akun</h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowResetModal(false)}
-                className="text-white/80 hover:text-white text-lg font-bold p-1 cursor-pointer"
-              >
-                ✕
-              </button>
-            </div>
-            
-            <form onSubmit={handleCustomResetPassword} className="p-5 space-y-4 text-xs">
-              <p className="text-slate-600 text-[11px]">
-                Masukkan email terdaftar dan kata sandi baru Anda. Kata sandi akan diperbarui secara langsung di sistem.
-              </p>
-
-              <div className="space-y-1 text-left">
-                <label className="font-bold text-slate-700">Email Akun:</label>
-                <input
-                  type="email"
-                  required
-                  value={resetEmailInput}
-                  onChange={(e) => setResetEmailInput(e.target.value)}
-                  placeholder="Masukkan email terdaftar Anda"
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 focus:outline-none"
-                />
-              </div>
-
-              <div className="space-y-1 text-left">
-                <label className="font-bold text-slate-700">Kata Sandi Baru (Min. 6 Karakter):</label>
-                <input
-                  type="password"
-                  required
-                  minLength={6}
-                  value={resetNewSandi}
-                  onChange={(e) => setResetNewSandi(e.target.value)}
-                  placeholder="Masukkan kata sandi baru (min. 6 karakter)"
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-900 font-medium focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 focus:outline-none"
-                />
-              </div>
-
-              <div className="pt-2 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setShowResetModal(false)}
-                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl transition cursor-pointer"
-                >
-                  Batal
-                </button>
-                <button
-                  type="submit"
-                  disabled={isResettingSandi}
-                  className="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-black rounded-xl shadow-md transition cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
-                >
-                  {isResettingSandi ? (
-                    <>
-                      <span className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
-                      <span>Memperbarui...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Key className="w-3.5 h-3.5" />
-                      <span>Perbarui Kata Sandi</span>
-                    </>
-                  )}
-                </button>
-              </div>
-            </form>
           </div>
         </div>
       )}

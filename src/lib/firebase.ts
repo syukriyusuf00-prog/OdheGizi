@@ -155,6 +155,7 @@ export const db = initializeFirestore(
 // Initialize Firebase Authentication
 export const auth = getAuth(app);
 export const googleAuthProvider = new GoogleAuthProvider();
+googleAuthProvider.setCustomParameters({ prompt: "select_account" });
 
 // Validate Firestore connectivity on startup via getDocFromServer
 export async function testFirestoreConnection(): Promise<FirestoreHealthState> {

@@ -331,7 +331,15 @@ const sanitizeRealtimeUser = (raw: Record<string, any>): Record<string, any> | n
   const uid = clampField(raw.uid || raw.id || (email ? `custom_user_${email.replace(/[@.]/g, "_")}` : ""), 128);
   if (!uid || !email) return null;
   const nowIso = new Date().toISOString();
-  const prev = realtimeUsers.get(uid) || {};
+  let prev = realtimeUsers.get(uid) || {};
+  if (!realtimeUsers.has(uid)) {
+    for (const existingUser of realtimeUsers.values()) {
+      if (normalizeEmail(existingUser.email) === email) {
+        prev = existingUser;
+        break;
+      }
+    }
+  }
   const merged: Record<string, any> = {
     ...prev,
     uid,
@@ -344,6 +352,7 @@ const sanitizeRealtimeUser = (raw: Record<string, any>): Record<string, any> | n
     peran: clampField(raw.peran ?? prev.peran ?? "USER", 32) || "USER",
     statusPersetujuan: clampField(raw.statusPersetujuan ?? prev.statusPersetujuan ?? "menunggu", 32) || "menunggu",
     berakhirPada: clampField(raw.berakhirPada ?? prev.berakhirPada ?? "", 32),
+    authProvider: clampField(raw.authProvider ?? prev.authProvider ?? "", 32) || undefined,
     emailVerified: typeof raw.emailVerified === "boolean" ? raw.emailVerified : Boolean(prev.emailVerified),
     verificationStatus: clampField(raw.verificationStatus ?? prev.verificationStatus ?? "", 32) || undefined,
     emailVerifiedAt: clampField(raw.emailVerifiedAt ?? prev.emailVerifiedAt ?? "", 64) || undefined,
@@ -513,6 +522,16 @@ async function startServer() {
     if (!sanitized) {
       res.status(400).json({ ok: false, error: "Data pengguna tidak valid." });
       return;
+    }
+    // Remove duplicate keys with same email so a Google Firebase UID replaces legacy custom_user_* cleanly
+    const targetEmail = normalizeEmail(sanitized.email);
+    const isRealFirebaseUid = !sanitized.uid.startsWith("custom_user_");
+    for (const [existingKey, existingVal] of realtimeUsers.entries()) {
+      if (existingKey !== sanitized.uid && normalizeEmail(existingVal.email) === targetEmail) {
+        if (isRealFirebaseUid || existingKey.startsWith("custom_user_")) {
+          realtimeUsers.delete(existingKey);
+        }
+      }
     }
     realtimeUsers.set(sanitized.uid, sanitized);
     schedulePersistRealtimeCache();

@@ -183,6 +183,7 @@ interface AuthContextType {
   saveStateToCloud: (key: string, data: any) => Promise<void>;
   loadStateFromCloud: (key: string) => Promise<any | null>;
   registerUser: (formData: { namaLengkap: string; profesi: string; namaSPPG: string; noHp: string }) => Promise<void>;
+  updateOwnProfileDetails: (formData: { namaLengkap: string; profesi: string; namaSPPG: string; noHp: string }) => Promise<void>;
   registerCustomUser: (formData: {
     namaLengkap: string;
     email: string;
@@ -209,7 +210,7 @@ interface AuthContextType {
   }) => Promise<void>;
   loginWithEmailPassword: (email: string, sandi?: string) => Promise<void>;
   resetUserPassword: (email: string, newSandi: string) => Promise<void>;
-  refreshUserProfile: () => Promise<void>;
+  refreshUserProfile: () => Promise<any | null>;
   authError: string | null;
   setAuthError: (error: string | null) => void;
   simulateAdminLogin: () => void;
@@ -235,35 +236,47 @@ const fetchWithTimeout = <T,>(promise: Promise<T>, timeoutMs: number, defaultVal
   ]);
 };
 
+const getRecordTimeMs = (val: any): number => {
+  if (!val) return 0;
+  if (typeof val === "string") {
+    const t = new Date(val).getTime();
+    return Number.isNaN(t) ? 0 : t;
+  }
+  if (typeof val?.seconds === "number") return val.seconds * 1000;
+  if (typeof val?.toMillis === "function") return val.toMillis();
+  return 0;
+};
+
+const getDefaultExpirationDate = () => {
+  const nextYear = new Date();
+  nextYear.setFullYear(nextYear.getFullYear() + 1);
+  return `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, "0")}-${String(nextYear.getDate()).padStart(2, "0")}`;
+};
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(() => {
     const customUid = localStorage.getItem("custom_logged_in_uid");
-    if (customUid) {
-      const savedProfile = localStorage.getItem("sisper_user_profile");
-      if (savedProfile) {
-        try {
-          const profile = JSON.parse(savedProfile);
-          return {
-            uid: customUid,
-            email: profile.email,
-            displayName: profile.namaLengkap,
-            emailVerified: true
-          } as any;
-        } catch (e) {
-          return null;
-        }
+    if (customUid === DEMO_UID) {
+      const rawExp = localStorage.getItem(DEMO_EXPIRES_KEY);
+      if (rawExp && Date.now() < Number(rawExp)) {
+        const demoProf = buildDemoProfile();
+        return {
+          uid: DEMO_UID,
+          email: DEMO_EMAIL,
+          displayName: demoProf.namaLengkap,
+          emailVerified: true,
+        } as any;
       }
     }
     return null;
   });
 
   const [userProfile, setUserProfile] = useState<any | null>(() => {
-    const savedProfile = localStorage.getItem("sisper_user_profile");
-    if (savedProfile) {
-      try {
-        return JSON.parse(savedProfile);
-      } catch (e) {
-        return null;
+    const customUid = localStorage.getItem("custom_logged_in_uid");
+    if (customUid === DEMO_UID) {
+      const rawExp = localStorage.getItem(DEMO_EXPIRES_KEY);
+      if (rawExp && Date.now() < Number(rawExp)) {
+        return buildDemoProfile();
       }
     }
     return null;
@@ -291,8 +304,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUser(currentUser);
     setUserProfile(profile);
     if (currentUser && profile) {
-      localStorage.setItem("custom_logged_in_uid", currentUser.uid);
+      const isLocalCustomSession =
+        currentUser.uid === DEMO_UID ||
+        currentUser.uid.startsWith("custom_user_") ||
+        currentUser.uid.startsWith("admin_");
+      if (isLocalCustomSession) {
+        localStorage.setItem("custom_logged_in_uid", currentUser.uid);
+      } else {
+        // Real Firebase Auth session persists natively via onAuthStateChanged
+        localStorage.removeItem("custom_logged_in_uid");
+      }
       localStorage.setItem("sisper_user_profile", JSON.stringify(profile));
+      if (currentUser.uid !== DEMO_UID) {
+        localStorage.setItem(`offline_user_${currentUser.uid}`, JSON.stringify(profile));
+      }
     } else {
       localStorage.removeItem("custom_logged_in_uid");
       localStorage.removeItem("sisper_user_profile");
@@ -300,162 +325,268 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const fetchUserProfile = async (currentUser: User) => {
-    const lowerEmail = currentUser.email?.toLowerCase();
+    const lowerEmail = (currentUser.email || "").toLowerCase().trim();
     const isMainAdmin = isMainAdminEmail(lowerEmail);
     const userRef = doc(db, "users", currentUser.uid);
-    const path = `users/${currentUser.uid}`;
-    const mainAdminPhone = "0822271059251";
+    const mainAdminPhone = "082271095251";
+    const nowIso = new Date().toISOString();
 
     if (isMainAdmin) {
+      const fallbackAdminProfile = {
+        uid: currentUser.uid,
+        email: lowerEmail || "syukriyusuf82@gmail.com",
+        namaLengkap: currentUser.displayName || "LA ODE MUHAMMAD SUKRI YUSUF",
+        profesi: "Administrator Utama",
+        namaSPPG: "SPPG MUNA BARAT SAWERIGADI ONDOKE",
+        noHp: mainAdminPhone,
+        peran: "ADMIN" as const,
+        statusPersetujuan: "aktif" as const,
+        authProvider: "google",
+        emailVerified: true,
+        berakhirPada: "2035-12-31",
+        updatedAt: nowIso,
+        loginTerakhir: nowIso,
+      };
       try {
-        const userSnap = await getDoc(userRef);
-        if (userSnap.exists()) {
-          const data = userSnap.data();
-          if (data.peran !== "ADMIN" || data.statusPersetujuan !== "aktif") {
-            // Document exists but does not have active ADMIN role, update it!
-            await setDoc(userRef, {
-              peran: "ADMIN",
-              statusPersetujuan: "aktif",
-              namaLengkap: data.namaLengkap || "LA ODE MUHAMMAD SUKRI YUSUF",
-              profesi: data.profesi || "Administrator Utama",
-              namaSPPG: data.namaSPPG || "SPPG MUNA BARAT SAWERIGADI ONDOKE",
-              noHp: data.noHp || mainAdminPhone,
-              berakhirPada: "2035-12-31",
-              updatedAt: serverTimestamp(),
-              loginTerakhir: serverTimestamp()
-            }, { merge: true });
-            const snap = await getDoc(userRef);
-            updateSession(currentUser, snap.data());
-          } else {
-            // Already active ADMIN, just update login timestamp
-            await setDoc(userRef, {
-              loginTerakhir: serverTimestamp(),
-              updatedAt: serverTimestamp()
-            }, { merge: true });
-            const snap = await getDoc(userRef);
-            updateSession(currentUser, snap.data());
-          }
-        } else {
-          // Document does not exist yet, create it!
-          const adminProfile = {
-            uid: currentUser.uid,
-            email: currentUser.email || "syukriyusuf82@gmail.com",
-            namaLengkap: "LA ODE MUHAMMAD SUKRI YUSUF",
-            profesi: "Administrator Utama",
-            namaSPPG: "SPPG MUNA BARAT SAWERIGADI ONDOKE",
-            noHp: mainAdminPhone,
-            peran: "ADMIN" as const,
-            statusPersetujuan: "aktif" as const,
-            berakhirPada: "2035-12-31",
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-            loginTerakhir: serverTimestamp()
-          };
-          await setDoc(userRef, adminProfile);
-          const snap = await getDoc(userRef);
-          updateSession(currentUser, snap.data());
-        }
-      } catch (err) {
-        console.error("Error setting up main admin profile:", err);
-        updateSession(currentUser, {
+        const userSnap: any = await fetchWithTimeout(getDoc(userRef), 3500, null);
+        const existingData = userSnap && userSnap.exists() ? userSnap.data() : {};
+        const mergedAdmin = {
+          ...fallbackAdminProfile,
+          ...existingData,
           uid: currentUser.uid,
-          email: currentUser.email || "syukriyusuf82@gmail.com",
-          namaLengkap: "LA ODE MUHAMMAD SUKRI YUSUF",
-          profesi: "Administrator Utama",
-          namaSPPG: "SPPG MUNA BARAT SAWERIGADI ONDOKE",
-          noHp: mainAdminPhone,
+          email: lowerEmail || existingData.email || "syukriyusuf82@gmail.com",
+          peran: "ADMIN" as const,
+          statusPersetujuan: "aktif" as const,
+          authProvider: "google",
+          emailVerified: true,
+          berakhirPada: "2035-12-31",
+          updatedAt: nowIso,
+          loginTerakhir: nowIso,
+        };
+        updateSession(currentUser, mergedAdmin);
+
+        const devRecord = await buildDeviceRecord({
+          sessionState: "active",
+          userUid: currentUser.uid,
+          userEmail: mergedAdmin.email,
+          userName: mergedAdmin.namaLengkap,
+          namaSPPG: mergedAdmin.namaSPPG,
           peran: "ADMIN",
           statusPersetujuan: "aktif",
-          berakhirPada: "2035-12-31"
+          isOnline: true,
         });
+        const compactDev = toCompactDeviceSummary(devRecord);
+        const enrichedAdmin = {
+          ...mergedAdmin,
+          lastDevice: compactDev,
+          lastDeviceLabel: formatDeviceShortLabel(compactDev),
+          lastDeviceId: devRecord.deviceId,
+          lastDeviceSeenAt: nowIso,
+        };
+        updateSession(currentUser, enrichedAdmin);
+
+        await Promise.all([
+          syncUserToRealtimeHub(enrichedAdmin),
+          syncDeviceToFirestore({
+            sessionState: "active",
+            userUid: currentUser.uid,
+            userEmail: enrichedAdmin.email,
+            userName: enrichedAdmin.namaLengkap,
+            namaSPPG: enrichedAdmin.namaSPPG,
+            peran: "ADMIN",
+            statusPersetujuan: "aktif",
+            isOnline: true,
+            forceFirestore: true,
+          }),
+          fetchWithTimeout(
+            setDoc(
+              userRef,
+              {
+                ...enrichedAdmin,
+                createdAt: existingData.createdAt || serverTimestamp(),
+                updatedAt: serverTimestamp(),
+                loginTerakhir: serverTimestamp(),
+              },
+              { merge: true }
+            ).then(() => reportFirestoreWriteResult(true)),
+            3000,
+            null
+          ).catch((err) => reportFirestoreWriteResult(false, err)),
+        ]);
+      } catch (err) {
+        console.warn("Notice setting up main admin profile:", err);
+        updateSession(currentUser, fallbackAdminProfile);
       }
       return;
     }
 
     try {
-      const userSnap = await getDoc(userRef);
-      if (userSnap.exists()) {
-        const data = userSnap.data();
-        const nowIso = new Date().toISOString();
-        const devRecord = await buildDeviceRecord({
-          sessionState: "active",
-          userUid: currentUser.uid,
-          userEmail: data.email || currentUser.email || "",
-          userName: data.namaLengkap || currentUser.displayName || "",
-          namaSPPG: data.namaSPPG || "",
-          peran: data.peran || "USER",
-          statusPersetujuan: data.statusPersetujuan || "aktif",
-          isOnline: true,
-        });
-        const compactDev = toCompactDeviceSummary(devRecord);
-        const enriched: Record<string, any> = {
-          ...data,
-          lastDevice: compactDev,
-          lastDeviceLabel: formatDeviceShortLabel(compactDev),
-          lastDeviceId: devRecord.deviceId,
-          lastDeviceSeenAt: nowIso,
-          loginTerakhir: nowIso,
-        };
-        updateSession(currentUser, enriched);
+      // Check Firestore (by UID), Real-Time Hub (by UID/email), and legacy custom_user doc (by email)
+      const emailSlug = lowerEmail.replace(/[@.]/g, "_");
+      const legacyUid = emailSlug ? `custom_user_${emailSlug}` : "";
 
-        // Push immediately to real-time hub so laptop Admin Panel reflects mobile Google login in <1s
-        await syncUserToRealtimeHub(enriched);
-        await syncDeviceToFirestore({
-          sessionState: "active",
+      const [uidSnap, hubUser] = await Promise.all([
+        fetchWithTimeout(getDoc(userRef), 3500, null).catch(() => null),
+        fetchUserFromRealtimeHub(lowerEmail, currentUser.uid).catch(() => null),
+      ]);
+
+      let firestoreData: any = uidSnap && uidSnap.exists() ? uidSnap.data() : null;
+
+      // Migrate seamlessly if the user had an existing pre-Google record under custom_user_<slug>
+      if (!firestoreData && !hubUser && legacyUid) {
+        try {
+          const legacySnap: any = await fetchWithTimeout(getDoc(doc(db, "users", legacyUid)), 2500, null);
+          if (legacySnap && legacySnap.exists()) {
+            firestoreData = legacySnap.data();
+          }
+        } catch {}
+      }
+
+      // Pick the freshest authoritative profile between Firestore and Real-Time Hub
+      let resolvedProfile: any = null;
+      if (firestoreData && hubUser) {
+        const fsMs = Math.max(getRecordTimeMs(firestoreData.updatedAt), getRecordTimeMs(firestoreData.loginTerakhir));
+        const hubMs = Math.max(getRecordTimeMs(hubUser.updatedAt), getRecordTimeMs(hubUser.loginTerakhir));
+        resolvedProfile = hubMs >= fsMs
+          ? { ...firestoreData, ...hubUser }
+          : { ...hubUser, ...firestoreData };
+      } else {
+        resolvedProfile = hubUser || firestoreData;
+      }
+
+      // Fallback to local offline cache only if both network sources returned nothing
+      if (!resolvedProfile) {
+        try {
+          const cached = localStorage.getItem(`offline_user_${currentUser.uid}`);
+          if (cached) {
+            const parsed = JSON.parse(cached);
+            if ((parsed?.email || "").toLowerCase().trim() === lowerEmail && !parsed.isNotRegistered) {
+              resolvedProfile = parsed;
+            }
+          }
+        } catch {}
+      }
+
+      const isNewTenant = !resolvedProfile;
+      // Strict security: new tenants ALWAYS start as peran: "USER" and statusPersetujuan: "menunggu" (awaiting Odhe Gizi ACC)
+      const resolvedRole = !isNewTenant && resolvedProfile.peran === "ADMIN" ? "ADMIN" : "USER";
+      const resolvedStatus = isNewTenant
+        ? "menunggu"
+        : (resolvedProfile.statusPersetujuan || "menunggu");
+      const resolvedSessionState = resolvedStatus === "aktif" ? "active" : "registering";
+
+      const devRecord = await buildDeviceRecord({
+        sessionState: resolvedSessionState,
+        userUid: currentUser.uid,
+        userEmail: lowerEmail,
+        userName: resolvedProfile?.namaLengkap || currentUser.displayName || lowerEmail.split("@")[0] || "Pengguna Baru",
+        namaSPPG: resolvedProfile?.namaSPPG || "",
+        peran: resolvedRole,
+        statusPersetujuan: resolvedStatus,
+        isOnline: true,
+      });
+      const compactDev = toCompactDeviceSummary(devRecord);
+
+      const finalProfile: Record<string, any> = {
+        ...(resolvedProfile || {}),
+        uid: currentUser.uid,
+        id: currentUser.uid,
+        email: lowerEmail,
+        namaLengkap:
+          (resolvedProfile?.namaLengkap && String(resolvedProfile.namaLengkap).trim()) ||
+          currentUser.displayName ||
+          lowerEmail.split("@")[0] ||
+          "Pengguna Baru",
+        profesi:
+          (resolvedProfile?.profesi && String(resolvedProfile.profesi).trim()) ||
+          "Ahli Gizi / Pengelola SPPG",
+        namaSPPG: resolvedProfile?.namaSPPG || "",
+        noHp: resolvedProfile?.noHp || "",
+        peran: resolvedRole,
+        statusPersetujuan: resolvedStatus,
+        authProvider: "google",
+        emailVerified: true,
+        berakhirPada: resolvedProfile?.berakhirPada || getDefaultExpirationDate(),
+        lastDevice: compactDev,
+        lastDeviceLabel: formatDeviceShortLabel(compactDev),
+        lastDeviceId: devRecord.deviceId,
+        lastDeviceSeenAt: nowIso,
+        createdAt: resolvedProfile?.createdAt ? normalizeTimestampForRelay(resolvedProfile.createdAt) : nowIso,
+        updatedAt: nowIso,
+        loginTerakhir: nowIso,
+      };
+      delete finalProfile.isNotRegistered;
+
+      // Clear deleted-email blocklist marker if user is signing in cleanly
+      removeDeletedTenantEmail(lowerEmail);
+
+      // Update session immediately so UI transitions without waiting for Firestore write timeout
+      updateSession(currentUser, finalProfile);
+
+      // Broadcast immediately to Real-Time Hub & Device Tracker so Admin Panel sees new tenant + device in <1s
+      await Promise.all([
+        syncUserToRealtimeHub(finalProfile),
+        syncDeviceToFirestore({
+          sessionState: resolvedSessionState,
           userUid: currentUser.uid,
-          userEmail: enriched.email || currentUser.email || "",
-          userName: enriched.namaLengkap || currentUser.displayName || "",
-          namaSPPG: enriched.namaSPPG || "",
-          peran: enriched.peran || "USER",
-          statusPersetujuan: enriched.statusPersetujuan || "aktif",
+          userEmail: lowerEmail,
+          userName: finalProfile.namaLengkap,
+          namaSPPG: finalProfile.namaSPPG,
+          peran: finalProfile.peran,
+          statusPersetujuan: finalProfile.statusPersetujuan,
           isOnline: true,
           forceFirestore: true,
-        });
+        }),
+      ]);
 
-        // Update last login + device on Firestore
+      if (isNewTenant) {
         try {
-          await fetchWithTimeout(
-            setDoc(
-              userRef,
-              {
-                lastDevice: compactDev,
-                lastDeviceLabel: formatDeviceShortLabel(compactDev),
-                lastDeviceId: devRecord.deviceId,
-                lastDeviceSeenAt: nowIso,
-                loginTerakhir: serverTimestamp(),
-                updatedAt: serverTimestamp(),
-              },
-              { merge: true }
-            ).then(() => reportFirestoreWriteResult(true)),
-            3500,
-            null
-          );
-        } catch (timestampErr) {
-          reportFirestoreWriteResult(false, timestampErr);
-          console.warn("Gagal memperbarui login terakhir di awan:", timestampErr);
-        }
-      } else {
-        // Also check realtime hub in case user registered recently while Firestore write quota was capped
-        const hubUser = await fetchUserFromRealtimeHub(currentUser.email || "", currentUser.uid);
-        if (hubUser) {
-          updateSession(currentUser, hubUser);
-        } else {
-          // Normal user: Needs registration
-          updateSession(currentUser, {
-            uid: currentUser.uid,
-            email: currentUser.email || "",
-            isNotRegistered: true
-          });
-        }
+          window.dispatchEvent(new CustomEvent("sisper_user_registered", { detail: finalProfile }));
+        } catch {}
+      }
+
+      // Persist profile to Firestore (non-blocking timeout so mobile login never stalls if quota is capped)
+      try {
+        await fetchWithTimeout(
+          setDoc(
+            userRef,
+            {
+              ...finalProfile,
+              createdAt: resolvedProfile?.createdAt || serverTimestamp(),
+              updatedAt: serverTimestamp(),
+              loginTerakhir: serverTimestamp(),
+            },
+            { merge: true }
+          ).then(() => reportFirestoreWriteResult(true)),
+          3500,
+          null
+        );
+      } catch (writeErr) {
+        reportFirestoreWriteResult(false, writeErr);
+        console.warn("Notice syncing Google user profile to Firestore:", writeErr);
       }
     } catch (err) {
       console.error("Error fetching user profile:", err);
-      // Fallback local setting to prevent lock out in case of rules delay
-      updateSession(currentUser, {
+      // Safe fallback: never grant active/admin access on unexpected error — keep user in waiting-for-ACC state
+      const fallbackPending = {
         uid: currentUser.uid,
-        email: currentUser.email || "",
-        isNotRegistered: true
-      });
+        id: currentUser.uid,
+        email: lowerEmail,
+        namaLengkap: currentUser.displayName || lowerEmail.split("@")[0] || "Pengguna Baru",
+        profesi: "Ahli Gizi / Pengelola SPPG",
+        namaSPPG: "",
+        noHp: "",
+        peran: "USER",
+        statusPersetujuan: "menunggu",
+        authProvider: "google",
+        emailVerified: true,
+        berakhirPada: getDefaultExpirationDate(),
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        loginTerakhir: nowIso,
+      };
+      updateSession(currentUser, fallbackPending);
+      syncUserToRealtimeHub(fallbackPending).catch(() => {});
     }
   };
 
@@ -474,17 +605,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           namaLengkap: "Syukri Yusuf (Admin)",
           profesi: "Administrator Utama",
           namaSPPG: "Pusat Gizi SPPG",
-          noHp: "0822271059251",
-          sandi: "Odhe@1998",
+          noHp: "082271095251",
           peran: "ADMIN",
           statusPersetujuan: "aktif",
-          berakhirPada: "2030-12-31"
+          berakhirPada: "2035-12-31"
         });
         setLoading(false);
         return;
       }
 
-      let customUid = localStorage.getItem("custom_logged_in_uid");
+      const customUid = localStorage.getItem("custom_logged_in_uid");
 
       // Check 5-minute Demo session expiration on startup
       if (customUid === DEMO_UID) {
@@ -512,102 +642,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return;
       }
 
-      if (customUid) {
-        if (customUid === "admin_sukriyusuf82" || customUid === "admin_syukriyusuf82" || customUid === "syukriyusuf82_simulated_uid") {
-          const isSukri = customUid === "admin_sukriyusuf82";
-          const finalEmail = isSukri ? "sukriyusuf82@gmail.com" : "syukriyusuf82@gmail.com";
-          updateSession({
-            uid: customUid,
-            email: finalEmail,
-            displayName: "Syukri Yusuf (Admin)",
-            emailVerified: true
-          } as any, {
-            uid: customUid,
-            email: finalEmail,
-            namaLengkap: "Syukri Yusuf (Admin)",
-            profesi: "Administrator Utama",
-            namaSPPG: "Pusat Gizi SPPG",
-            noHp: "0822271059251",
-            sandi: "Odhe@1998",
-            peran: "ADMIN",
-            statusPersetujuan: "aktif",
-            berakhirPada: "2030-12-31"
-          });
-          setLoading(false);
-          return;
-        }
-
-        // Fast load from saved local profile
-        const savedProfile = localStorage.getItem("sisper_user_profile");
-        let localData: any = null;
-        if (savedProfile) {
-          try {
-            localData = JSON.parse(savedProfile);
-            updateSession({
-              uid: customUid,
-              email: localData.email,
-              displayName: localData.namaLengkap,
-              emailVerified: true
-            } as any, localData);
-          } catch (e) {
-            console.warn("Gagal parsing profil lokal:", e);
-          }
-        }
-
-        // Instantly unblock loading screen so app opens without delay
-        setLoading(false);
-
-        // Background profile verification with Firestore validation
-        fetchWithTimeout(getDoc(doc(db, "users", customUid)), 3500, null)
-          .then((snap: any) => {
-            if (snap && snap.exists()) {
-              const remoteData = snap.data();
-              
-              // Validate approval status across Firestore and local cache
-              const isApproved = remoteData.statusPersetujuan === "aktif" || localData?.statusPersetujuan === "aktif";
-              const isBlocked = remoteData.statusPersetujuan === "diblokir" || localData?.statusPersetujuan === "diblokir";
-              const finalStatus = isBlocked ? "diblokir" : isApproved ? "aktif" : "menunggu";
-
-              const mergedData = {
-                ...localData,
-                ...remoteData,
-                statusPersetujuan: finalStatus,
-                uid: customUid
-              };
-
-              localStorage.setItem("sisper_user_profile", JSON.stringify(mergedData));
-              localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(mergedData));
-
-              if (remoteData.statusPersetujuan !== finalStatus) {
-                setDoc(doc(db, "users", customUid), { statusPersetujuan: finalStatus }, { merge: true }).catch(() => {});
-              }
-
-              updateSession({
-                uid: customUid,
-                email: mergedData.email,
-                displayName: mergedData.namaLengkap,
-                emailVerified: true
-              } as any, mergedData);
-            }
-          })
-          .catch((e) => {
-            console.warn("Gagal memuat profil awan secara asinkron:", e);
-          });
-
-        return;
+      // Clean up any stale non-demo custom_logged_in_uid so Google Firebase Auth handles session cleanly
+      if (customUid && customUid !== DEMO_UID) {
+        localStorage.removeItem("custom_logged_in_uid");
       }
 
       const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
         if (getIsDriveConnecting()) {
           return;
         }
+        if (localStorage.getItem("custom_logged_in_uid") === DEMO_UID) {
+          setLoading(false);
+          return;
+        }
         if (currentUser) {
           setUser(currentUser);
           await fetchUserProfile(currentUser);
         } else {
-          if (!localStorage.getItem("custom_logged_in_uid")) {
-            updateSession(null, null);
-          }
+          updateSession(null, null);
         }
         setLoading(false);
       });
@@ -724,78 +776,141 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     isDemo,
   ]);
 
-  // Real-time synchronization of user profile status and expiration date from Firestore
+  // Dual-channel real-time synchronization of user profile status, role, and expiration date
+  // Listens to BOTH Firestore onSnapshot AND Server SSE Real-Time Hub so Admin ACC unlocks dashboard automatically in <1s
   useEffect(() => {
-    const activeUid = userProfile?.uid || user?.uid || localStorage.getItem("custom_logged_in_uid");
+    const activeUid = userProfile?.uid || user?.uid;
+    const activeEmail = (userProfile?.email || user?.email || "").toLowerCase().trim();
     if (!activeUid) return;
 
-    // Skip snapshot listener for demo accounts, local simulated admin override, or main admin
     if (
       activeUid === DEMO_UID ||
       userProfile?.isDemo ||
       activeUid === "admin_sukriyusuf82" ||
       activeUid === "admin_syukriyusuf82" ||
-      isMainAdminEmail(userProfile?.email)
+      isMainAdminEmail(activeEmail)
     ) {
       return;
     }
 
+    let firestoreDocPreviouslyExisted = false;
+
+    const applyAuthoritativeUpdate = (freshData: Record<string, any>) => {
+      if (!freshData) return;
+      setUserProfile((prev: any) => {
+        const nextStatus = freshData.statusPersetujuan || prev?.statusPersetujuan || "menunggu";
+        const nextRole = freshData.peran === "ADMIN" ? "ADMIN" : (freshData.peran || prev?.peran || "USER");
+        const updated = {
+          ...(prev || {}),
+          ...freshData,
+          uid: activeUid,
+          id: activeUid,
+          email: activeEmail || freshData.email || prev?.email || "",
+          peran: nextRole,
+          statusPersetujuan: nextStatus,
+        };
+        delete updated.isNotRegistered;
+        try {
+          localStorage.setItem("sisper_user_profile", JSON.stringify(updated));
+          localStorage.setItem(`offline_user_${activeUid}`, JSON.stringify(updated));
+        } catch {}
+        return updated;
+      });
+    };
+
+    // Channel A: Firestore real-time document listener
+    let unsubFirestore: (() => void) | null = null;
     try {
       const userRef = doc(db, "users", activeUid);
-      const unsubscribe = onSnapshot(userRef, (snap) => {
-        if (snap.exists()) {
-          const freshData = snap.data();
-          
-          // Check expiration
-          const now = new Date();
-          const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-          const isExpired = freshData.berakhirPada ? todayStr > freshData.berakhirPada : false;
-
-          const currentLocalStatus = userProfile?.statusPersetujuan;
-          const isApproved = freshData.statusPersetujuan === "aktif" || currentLocalStatus === "aktif";
-          const isBlocked = freshData.statusPersetujuan === "diblokir";
-
-          if (isBlocked || (!isApproved && freshData.statusPersetujuan === "menunggu") || isExpired) {
-            signOutUser();
-            setAuthError(
-              isExpired
-                ? `Masa aktif akun Anda telah berakhir pada ${freshData.berakhirPada}. Silakan hubungi admin untuk memperpanjang.`
-                : freshData.statusPersetujuan === "menunggu"
-                ? `Status akun Anda berada dalam DAFTAR TUNGGU (menunggu persetujuan Admin).`
-                : "Akses akun Anda telah diputuskan/diblokir oleh Administrator."
-            );
-          } else {
-            const finalStatus = "aktif";
-            if (freshData.statusPersetujuan !== finalStatus) {
-              setDoc(userRef, { statusPersetujuan: finalStatus }, { merge: true }).catch(() => {});
+      unsubFirestore = onSnapshot(
+        userRef,
+        async (snap) => {
+          if (snap.exists()) {
+            firestoreDocPreviouslyExisted = true;
+            applyAuthoritativeUpdate(snap.data());
+          } else if (firestoreDocPreviouslyExisted) {
+            // Confirm deletion via Real-Time Hub before signing out so quota lag never causes false logout
+            const stillInHub = await fetchUserFromRealtimeHub(activeEmail, activeUid).catch(() => null);
+            if (!stillInHub) {
+              signOutUser();
+              setAuthError("Data akun Anda telah dihapus oleh Administrator. Silakan masuk kembali menggunakan akun email Anda.");
             }
-
-            setUserProfile((prev: any) => {
-              if (!prev) return { ...freshData, statusPersetujuan: finalStatus };
-              const updated = { ...prev, ...freshData, statusPersetujuan: finalStatus };
-              localStorage.setItem("sisper_user_profile", JSON.stringify(updated));
-              if (activeUid) {
-                localStorage.setItem(`offline_user_${activeUid}`, JSON.stringify(updated));
-              }
-              return updated;
-            });
           }
-        } else {
-          // User document removed or reset by Admin in Firestore -> Immediate real-time force logout
-          if (!isMainAdminEmail(userProfile?.email)) {
-            signOutUser();
-            setAuthError("Data akun Anda telah direset/dihapus oleh Administrator. Silakan melakukan pendaftaran ulang dengan email Anda.");
-          }
+        },
+        (err) => {
+          console.warn("User profile onSnapshot listener notice:", err);
         }
-      }, (err) => {
-        console.warn("User profile onSnapshot listener notice:", err);
-      });
-
-      return () => unsubscribe();
+      );
     } catch (err) {
       console.warn("Could not attach user profile onSnapshot:", err);
     }
-  }, [userProfile?.uid, user?.uid]);
+
+    // Channel B: Server SSE Real-Time Hub listener (instant unlock on Admin ACC even when Firestore write quota is capped)
+    let eventSource: EventSource | null = null;
+    try {
+      eventSource = new EventSource("/api/realtime/stream");
+
+      eventSource.addEventListener("snapshot", (ev: MessageEvent) => {
+        try {
+          const parsed = JSON.parse(ev.data);
+          if (Array.isArray(parsed?.users)) {
+            const match = parsed.users.find(
+              (u: any) =>
+                u?.uid === activeUid ||
+                (activeEmail && (u?.email || "").toLowerCase().trim() === activeEmail)
+            );
+            if (match) {
+              applyAuthoritativeUpdate(match);
+            }
+          }
+        } catch {}
+      });
+
+      eventSource.addEventListener("user_upsert", (ev: MessageEvent) => {
+        try {
+          const incoming = JSON.parse(ev.data);
+          const incomingEmail = (incoming?.email || "").toLowerCase().trim();
+          if (incoming?.uid === activeUid || (activeEmail && incomingEmail === activeEmail)) {
+            applyAuthoritativeUpdate(incoming);
+          }
+        } catch {}
+      });
+
+      eventSource.addEventListener("user_delete", (ev: MessageEvent) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          const delEmail = (payload?.email || "").toLowerCase().trim();
+          const delUid = payload?.uid || "";
+          const removedList: string[] = Array.isArray(payload?.removedUids) ? payload.removedUids : [];
+          if (
+            delUid === activeUid ||
+            removedList.includes(activeUid) ||
+            (activeEmail && delEmail === activeEmail)
+          ) {
+            signOutUser();
+            setAuthError("Data akun Anda telah dihapus oleh Administrator. Silakan masuk kembali menggunakan akun email Anda.");
+          }
+        } catch {}
+      });
+    } catch {}
+
+    // Channel C: Lightweight 8-second safety poll while waiting/blocked so mobile networks with buffered SSE still unlock automatically
+    const pollTimer = window.setInterval(async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const hubUser = await fetchUserFromRealtimeHub(activeEmail, activeUid);
+        if (hubUser) {
+          applyAuthoritativeUpdate(hubUser);
+        }
+      } catch {}
+    }, 8_000);
+
+    return () => {
+      if (unsubFirestore) unsubFirestore();
+      if (eventSource) eventSource.close();
+      window.clearInterval(pollTimer);
+    };
+  }, [userProfile?.uid, user?.uid, user?.email]);
 
   const simulateAdminLogin = () => {
     setLoading(true);
@@ -813,11 +928,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       namaLengkap: "Syukri Yusuf (Admin)",
       profesi: "Administrator Utama",
       namaSPPG: "Pusat Gizi SPPG",
-      noHp: "0822271059251",
-      sandi: "Odhe@1998",
+      noHp: "082271095251",
       peran: "ADMIN",
       statusPersetujuan: "aktif",
-      berakhirPada: "2030-12-31"
+      berakhirPada: "2035-12-31"
     });
     setAuthError(null);
     setLoading(false);
@@ -850,18 +964,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       clearDriveSession();
       clearPerUserWorksheetStorage();
       localStorage.removeItem(DEMO_EXPIRES_KEY);
+      localStorage.removeItem("custom_logged_in_uid");
       setDemoNotice(null);
       setAuthError(null);
-      await signInWithPopup(auth, googleAuthProvider);
+      const cred = await signInWithPopup(auth, googleAuthProvider);
+      if (cred?.user) {
+        setUser(cred.user);
+        await fetchUserProfile(cred.user);
+      }
+      setLoading(false);
     } catch (error: any) {
       console.error("Google Sign-In failed:", error);
       setLoading(false);
-      let friendlyError = error?.code || error?.message || String(error);
-      if (error?.code === "auth/network-request-failed" || String(error).includes("network-request-failed")) {
+      const code = error?.code || "";
+      let friendlyError = error?.message || String(error);
+      if (code === "auth/popup-closed-by-user") {
+        friendlyError = "Jendela pemilihan akun Google ditutup sebelum selesai. Silakan klik kembali tombol Masuk dengan Email Google Anda.";
+      } else if (
+        code === "auth/popup-blocked" ||
+        code === "auth/cancelled-popup-request" ||
+        code === "auth/network-request-failed" ||
+        String(error).includes("network-request-failed")
+      ) {
         friendlyError = "IFRAME_BLOCKED";
       }
       setAuthError(friendlyError);
-      throw error;
     }
   };
 
@@ -900,80 +1027,102 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const registerUser = async (formData: { namaLengkap: string; profesi: string; namaSPPG: string; noHp: string }) => {
-    if (!user) throw new Error("No authenticated user found");
+  const updateOwnProfileDetails = async (formData: {
+    namaLengkap: string;
+    profesi: string;
+    namaSPPG: string;
+    noHp: string;
+  }) => {
+    if (!user) throw new Error("Akun belum masuk.");
     const userRef = doc(db, "users", user.uid);
     const path = `users/${user.uid}`;
     const nowIso = new Date().toISOString();
-    
-    const lowerEmail = user.email?.toLowerCase();
-    const isMainAdmin = lowerEmail === "syukriyusuf82@gmail.com" || lowerEmail === "sukriyusuf82@gmail.com";
+    const lowerEmail = (user.email || "").toLowerCase().trim();
+    const isMainAdmin = isMainAdminEmail(lowerEmail);
+
+    // Strictly preserve existing Admin-controlled role and approval status (never self-approve or self-promote!)
+    const currentRole = isMainAdmin
+      ? ("ADMIN" as const)
+      : userProfile?.peran === "ADMIN"
+      ? ("ADMIN" as const)
+      : ("USER" as const);
+    const currentStatus = isMainAdmin
+      ? ("aktif" as const)
+      : ((userProfile?.statusPersetujuan || "menunggu") as "aktif" | "menunggu" | "diblokir");
 
     const devRecord = await buildDeviceRecord({
-      sessionState: "active",
+      sessionState: currentStatus === "aktif" ? "active" : "registering",
       userUid: user.uid,
-      userEmail: user.email || "",
-      userName: formData.namaLengkap,
-      namaSPPG: formData.namaSPPG,
-      peran: isMainAdmin ? "ADMIN" : "USER",
-      statusPersetujuan: "aktif",
+      userEmail: lowerEmail,
+      userName: formData.namaLengkap.trim(),
+      namaSPPG: formData.namaSPPG.trim(),
+      peran: currentRole,
+      statusPersetujuan: currentStatus,
       isOnline: true,
     });
     const compactDev = toCompactDeviceSummary(devRecord);
-    
+
     const profileData = {
+      ...(userProfile || {}),
       uid: user.uid,
-      email: user.email || "",
-      namaLengkap: formData.namaLengkap,
-      profesi: formData.profesi,
-      namaSPPG: formData.namaSPPG,
-      noHp: formData.noHp,
-      peran: isMainAdmin ? ("ADMIN" as const) : ("USER" as const),
-      statusPersetujuan: "aktif" as const,
+      id: user.uid,
+      email: lowerEmail,
+      namaLengkap: formData.namaLengkap.trim(),
+      profesi: formData.profesi.trim(),
+      namaSPPG: formData.namaSPPG.trim(),
+      noHp: formData.noHp.trim(),
+      peran: currentRole,
+      statusPersetujuan: currentStatus,
+      authProvider: "google",
       emailVerified: true,
-      verificationStatus: "verified" as const,
-      berakhirPada: "2030-12-31",
+      berakhirPada: userProfile?.berakhirPada || getDefaultExpirationDate(),
       lastDevice: compactDev,
       lastDeviceLabel: formatDeviceShortLabel(compactDev),
       lastDeviceId: devRecord.deviceId,
       lastDeviceSeenAt: nowIso,
-      createdAt: nowIso,
+      createdAt: userProfile?.createdAt ? normalizeTimestampForRelay(userProfile.createdAt) : nowIso,
       updatedAt: nowIso,
-      loginTerakhir: nowIso
+      loginTerakhir: nowIso,
     };
+    delete profileData.isNotRegistered;
 
-    // Push immediately to real-time server hub so mobile Google registration shows on laptop Admin Panel in <1s
-    await syncUserToRealtimeHub(profileData);
-    await syncDeviceToFirestore({
-      sessionState: "active",
-      userUid: user.uid,
-      userEmail: user.email || "",
-      userName: formData.namaLengkap,
-      namaSPPG: formData.namaSPPG,
-      peran: profileData.peran,
-      statusPersetujuan: "aktif",
-      isOnline: true,
-      forceFirestore: true,
-    });
+    updateSession(user, profileData);
+
+    await Promise.all([
+      syncUserToRealtimeHub(profileData),
+      syncDeviceToFirestore({
+        sessionState: currentStatus === "aktif" ? "active" : "registering",
+        userUid: user.uid,
+        userEmail: lowerEmail,
+        userName: profileData.namaLengkap,
+        namaSPPG: profileData.namaSPPG,
+        peran: profileData.peran,
+        statusPersetujuan: profileData.statusPersetujuan,
+        isOnline: true,
+        forceFirestore: true,
+      }),
+    ]);
 
     try {
       await fetchWithTimeout(
-        setDoc(userRef, {
-          ...profileData,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-          loginTerakhir: serverTimestamp()
-        }).then(() => reportFirestoreWriteResult(true)),
-        4000,
+        setDoc(
+          userRef,
+          {
+            ...profileData,
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        ).then(() => reportFirestoreWriteResult(true)),
+        3500,
         null
       );
-      updateSession(user, profileData);
     } catch (error) {
       reportFirestoreWriteResult(false, error);
       handleFirestoreError(error, OperationType.WRITE, path);
-      updateSession(user, profileData);
     }
   };
+
+  const registerUser = updateOwnProfileDetails;
 
 const removeDeletedTenantEmail = (email: string) => {
   if (!email) return;
@@ -1803,28 +1952,43 @@ const removeDeletedTenantEmail = (email: string) => {
     } catch(e) {}
   };
 
-  const refreshUserProfile = async () => {
-    const customUid = localStorage.getItem("custom_logged_in_uid");
-    if (customUid) {
-      try {
-        const userRef = doc(db, "users", customUid);
-        const snap = await getDoc(userRef);
-        if (snap.exists()) {
-          updateSession({
-            uid: customUid,
-            email: snap.data().email,
-            displayName: snap.data().namaLengkap,
-            emailVerified: true
-          } as any, snap.data());
-        }
-      } catch (e) {
-        console.error(e);
+  const refreshUserProfile = async (): Promise<any | null> => {
+    const activeUid = user?.uid || userProfile?.uid;
+    const activeEmail = (user?.email || userProfile?.email || "").toLowerCase().trim();
+    if (!activeUid || activeUid === DEMO_UID) return userProfile;
+
+    try {
+      const [snap, hubUser] = await Promise.all([
+        fetchWithTimeout(getDoc(doc(db, "users", activeUid)), 3500, null).catch(() => null),
+        fetchUserFromRealtimeHub(activeEmail, activeUid).catch(() => null),
+      ]);
+
+      const fsData = snap && snap.exists() ? snap.data() : null;
+      let latest: any = null;
+      if (fsData && hubUser) {
+        const fsMs = Math.max(getRecordTimeMs(fsData.updatedAt), getRecordTimeMs(fsData.loginTerakhir));
+        const hubMs = Math.max(getRecordTimeMs(hubUser.updatedAt), getRecordTimeMs(hubUser.loginTerakhir));
+        latest = hubMs >= fsMs ? { ...fsData, ...hubUser } : { ...hubUser, ...fsData };
+      } else {
+        latest = hubUser || fsData;
       }
-      return;
+
+      if (latest) {
+        const merged = {
+          ...(userProfile || {}),
+          ...latest,
+          uid: activeUid,
+          id: activeUid,
+          email: activeEmail || latest.email || "",
+        };
+        delete merged.isNotRegistered;
+        updateSession(user || ({ uid: activeUid, email: merged.email, displayName: merged.namaLengkap, emailVerified: true } as any), merged);
+        return merged;
+      }
+    } catch (e) {
+      console.warn("Notice refreshing user profile:", e);
     }
-    if (user) {
-      await fetchUserProfile(user);
-    }
+    return userProfile;
   };
 
   const saveStateToCloud = async (key: string, data: any) => {
@@ -1905,6 +2069,7 @@ const removeDeletedTenantEmail = (email: string) => {
       saveStateToCloud,
       loadStateFromCloud,
       registerUser,
+      updateOwnProfileDetails,
       registerCustomUser,
       resendVerificationCode,
       verifyRegistrationCode,
