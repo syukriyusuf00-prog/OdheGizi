@@ -84,7 +84,9 @@ import {
   ShieldCheck,
   ExternalLink,
   UserCheck,
-  Building2
+  Building2,
+  Copy,
+  Check
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import {
@@ -92,7 +94,11 @@ import {
   isMainAdminEmail,
   clearPerUserWorksheetStorage
 } from "./context/AuthContext.tsx";
-import { db } from "./lib/firebase.ts";
+import {
+  db,
+  FIREBASE_AUTH_SETTINGS_URL,
+  getPreferredAuthorizedAppUrls
+} from "./lib/firebase.ts";
 import { doc, getDoc, onSnapshot, setDoc } from "firebase/firestore";
 
 const DEFAULT_FALLBACK_LOGO = "/assets/images/app_logo_sppg.png";
@@ -298,6 +304,8 @@ export default function App() {
     refreshUserProfile,
     authError,
     setAuthError,
+    domainAuthInfo,
+    recheckDomainAndSignIn,
     isDemo,
     demoSecondsLeft,
     demoNotice,
@@ -345,6 +353,8 @@ export default function App() {
 
   // Google Email Sign-In & Waiting-for-ACC UI states
   const [isGoogleSigningIn, setIsGoogleSigningIn] = useState(false);
+  const [isRecheckingDomain, setIsRecheckingDomain] = useState(false);
+  const [domainCopied, setDomainCopied] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
   const [statusCheckFeedback, setStatusCheckFeedback] = useState<{ type: "info" | "success" | "error"; text: string } | null>(null);
   const [isSavingWaitingProfile, setIsSavingWaitingProfile] = useState(false);
@@ -1552,6 +1562,37 @@ export default function App() {
     }
   };
 
+  const handleCopyCurrentDomain = async (domainText: string) => {
+    if (!domainText) return;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(domainText);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = domainText;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setDomainCopied(true);
+      setTimeout(() => setDomainCopied(false), 2500);
+    } catch {
+      setDomainCopied(false);
+    }
+  };
+
+  const handleRecheckDomainClick = async () => {
+    setIsRecheckingDomain(true);
+    try {
+      await recheckDomainAndSignIn();
+    } finally {
+      setIsRecheckingDomain(false);
+    }
+  };
+
   const handleManualStatusCheck = async () => {
     setIsCheckingStatus(true);
     setStatusCheckFeedback(null);
@@ -1600,6 +1641,15 @@ export default function App() {
   // If user is not logged in, show clean Email Google Login screen (no password / registration tabs)
   if (!user) {
     const isIframeBlocked = authError === "IFRAME_BLOCKED";
+    const isUnauthorizedDomain =
+      authError === "UNAUTHORIZED_DOMAIN" ||
+      (domainAuthInfo.checked && !domainAuthInfo.isAuthorized);
+    const currentDomainHost =
+      domainAuthInfo.currentHostname ||
+      (typeof window !== "undefined" ? window.location.hostname : "");
+    const preferredAuthorizedUrls = getPreferredAuthorizedAppUrls(
+      domainAuthInfo.authorizedDomains || []
+    );
 
     return (
       <div className="min-h-screen bg-[#F1F3F9] text-slate-700 flex items-center justify-center p-4 md:p-8 font-sans">
@@ -1681,7 +1731,113 @@ export default function App() {
                 </div>
               )}
 
-              {authError && (
+              {isUnauthorizedDomain && (
+                <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 text-xs text-amber-950 space-y-3 text-left">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="font-extrabold text-amber-950">
+                          Domain Belum Terdaftar di Firebase Authentication
+                        </p>
+                        <p className="text-[11px] text-amber-900/90 mt-0.5 leading-relaxed">
+                          Login Google ditolak (<code>auth/unauthorized-domain</code>) karena domain aplikasi yang Anda buka saat ini belum ditambahkan ke daftar <strong>Authorized domains</strong> Firebase.
+                        </p>
+                      </div>
+                    </div>
+                    {authError === "UNAUTHORIZED_DOMAIN" && (
+                      <button
+                        type="button"
+                        onClick={() => setAuthError(null)}
+                        className="text-amber-800 font-bold hover:underline shrink-0 cursor-pointer"
+                      >
+                        Tutup
+                      </button>
+                    )}
+                  </div>
+
+                  {currentDomainHost && (
+                    <div className="bg-white border border-amber-200 rounded-xl p-2.5 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                          Domain Aktif Saat Ini
+                        </div>
+                        <code className="text-xs font-bold text-slate-900 break-all">
+                          {currentDomainHost}
+                        </code>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyCurrentDomain(currentDomainHost)}
+                        className="shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold rounded-lg text-[11px] transition cursor-pointer"
+                      >
+                        {domainCopied ? (
+                          <>
+                            <Check className="w-3.5 h-3.5 text-emerald-600" />
+                            <span>Tersalin</span>
+                          </>
+                        ) : (
+                          <>
+                            <Copy className="w-3.5 h-3.5" />
+                            <span>Salin Domain</span>
+                          </>
+                        )}
+                      </button>
+                    </div>
+                  )}
+
+                  <ol className="space-y-1 text-[11px] text-amber-950/90 list-decimal pl-4">
+                    <li>Klik tombol <strong>Buka Authorized Domains Firebase</strong> di bawah.</li>
+                    <li>Pilih tab <strong>Authorized domains</strong> lalu klik <strong>Add domain</strong>.</li>
+                    <li>Tempel domain <strong>{currentDomainHost || "aplikasi Anda"}</strong>, klik <strong>Add</strong>, lalu klik <strong>Cek Ulang &amp; Masuk Google</strong>.</li>
+                  </ol>
+
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    <a
+                      href={FIREBASE_AUTH_SETTINGS_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-[#112461] hover:bg-[#193382] text-white font-bold rounded-xl text-xs transition"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Buka Authorized Domains Firebase</span>
+                    </a>
+                    <button
+                      type="button"
+                      onClick={handleRecheckDomainClick}
+                      disabled={isRecheckingDomain}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl text-xs transition cursor-pointer disabled:opacity-60"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isRecheckingDomain ? "animate-spin" : ""}`} />
+                      <span>{isRecheckingDomain ? "Memeriksa..." : "Cek Ulang & Masuk Google"}</span>
+                    </button>
+                  </div>
+
+                  {preferredAuthorizedUrls.length > 0 && (
+                    <div className="pt-2 border-t border-amber-200/80 space-y-1.5">
+                      <p className="text-[11px] font-bold text-amber-900">
+                        Atau buka langsung melalui domain SISPERMBG yang sudah terdaftar:
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {preferredAuthorizedUrls.map((host) => (
+                          <a
+                            key={host}
+                            href={`https://${host}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-white hover:bg-amber-100 border border-amber-300 text-amber-950 font-semibold rounded-lg text-[11px] transition"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                            <span>{host}</span>
+                          </a>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {authError && authError !== "UNAUTHORIZED_DOMAIN" && (
                 <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4 text-xs text-rose-900 space-y-2.5">
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex items-start gap-2">
@@ -3441,7 +3597,7 @@ export default function App() {
         </div>
       </footer>
 
-      {/* AUTH ERROR IFRAME WARNING MODAL */}
+      {/* AUTH ERROR WARNING MODAL */}
       {authError && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center z-[9999] p-4 font-sans select-none">
           <div className="bg-white rounded-3xl max-w-md w-full p-6 shadow-2xl border border-rose-100/60 animate-in fade-in zoom-in duration-200 text-left">
@@ -3450,47 +3606,98 @@ export default function App() {
                 <AlertCircle className="w-6 h-6" />
               </div>
               <div>
-                <h3 className="font-extrabold text-slate-900 text-base leading-snug">Otentikasi Google Terkendala</h3>
-                <p className="text-[10px] text-rose-500 font-extrabold tracking-wider uppercase">Kebijakan Proteksi Iframe Browser</p>
+                <h3 className="font-extrabold text-slate-900 text-base leading-snug">
+                  {authError === "UNAUTHORIZED_DOMAIN"
+                    ? "Domain Belum Terdaftar di Firebase"
+                    : "Otentikasi Google Terkendala"}
+                </h3>
+                <p className="text-[10px] text-rose-500 font-extrabold tracking-wider uppercase">
+                  {authError === "UNAUTHORIZED_DOMAIN"
+                    ? "auth/unauthorized-domain"
+                    : "Kebijakan Proteksi Iframe Browser"}
+                </p>
               </div>
             </div>
 
-            <div className="space-y-4 text-slate-600 text-xs leading-relaxed">
-              <p>
-                {authError === "IFRAME_BLOCKED"
-                  ? "Browser Anda memblokir Google Sign-In pop-up karena aplikasi berjalan di dalam jendela pratinjau (iframe). Buka di tab baru agar masuk dengan email Google berjalan lancar."
-                  : authError}
-              </p>
-
-              <div className="bg-blue-50/80 border border-blue-100 p-3.5 rounded-2xl text-slate-700 space-y-2.5">
-                <p className="font-bold text-blue-800 flex items-center gap-1.5">
-                  <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-600"></span>
-                  Solusi Utama (Direkomendasikan):
+            {authError === "UNAUTHORIZED_DOMAIN" ? (
+              <div className="space-y-4 text-slate-600 text-xs leading-relaxed">
+                <p>
+                  Domain <strong>{domainAuthInfo.currentHostname || (typeof window !== "undefined" ? window.location.hostname : "")}</strong> belum terdaftar pada <strong>Authorized domains</strong> Firebase Authentication.
                 </p>
-                <p className="text-[11px] text-slate-600 pl-3 leading-snug">
-                  Buka aplikasi SISPERMBG di tab browser terpisah lalu masuk menggunakan akun email Google masing-masing.
-                </p>
-                <a
-                  href={typeof window !== "undefined" ? window.location.href : "#"}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="w-full py-2.5 px-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition shadow-sm flex items-center justify-center gap-2"
-                >
-                  <span>Buka Aplikasi di Tab Baru</span>
-                </a>
+                <div className="bg-amber-50 border border-amber-200 p-3.5 rounded-2xl text-amber-950 space-y-2.5">
+                  <p className="text-[11px] leading-snug">
+                    Salin domain di bawah lalu tambahkan di Firebase Console → Authentication → Settings → <strong>Authorized domains</strong>.
+                  </p>
+                  <div className="flex items-center justify-between gap-2 bg-white border border-amber-200 rounded-xl px-2.5 py-2">
+                    <code className="text-[11px] font-bold text-slate-900 break-all">
+                      {domainAuthInfo.currentHostname || (typeof window !== "undefined" ? window.location.hostname : "")}
+                    </code>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        handleCopyCurrentDomain(
+                          domainAuthInfo.currentHostname ||
+                            (typeof window !== "undefined" ? window.location.hostname : "")
+                        )
+                      }
+                      className="shrink-0 px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-[11px] font-bold cursor-pointer"
+                    >
+                      {domainCopied ? "Tersalin" : "Salin"}
+                    </button>
+                  </div>
+                  <a
+                    href={FIREBASE_AUTH_SETTINGS_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full py-2.5 px-3 bg-[#112461] hover:bg-[#193382] text-white text-xs font-bold rounded-xl transition shadow-sm flex items-center justify-center gap-2"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Buka Authorized Domains Firebase</span>
+                  </a>
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="space-y-4 text-slate-600 text-xs leading-relaxed">
+                <p>
+                  {authError === "IFRAME_BLOCKED"
+                    ? "Browser Anda memblokir Google Sign-In pop-up karena aplikasi berjalan di dalam jendela pratinjau (iframe). Buka di tab baru agar masuk dengan email Google berjalan lancar."
+                    : authError}
+                </p>
+
+                <div className="bg-blue-50/80 border border-blue-100 p-3.5 rounded-2xl text-slate-700 space-y-2.5">
+                  <p className="font-bold text-blue-800 flex items-center gap-1.5">
+                    <span className="inline-block w-1.5 h-1.5 rounded-full bg-blue-600"></span>
+                    Solusi Utama (Direkomendasikan):
+                  </p>
+                  <p className="text-[11px] text-slate-600 pl-3 leading-snug">
+                    Buka aplikasi SISPERMBG di tab browser terpisah lalu masuk menggunakan akun email Google masing-masing.
+                  </p>
+                  <a
+                    href={typeof window !== "undefined" ? window.location.href : "#"}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full py-2.5 px-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold rounded-xl transition shadow-sm flex items-center justify-center gap-2"
+                  >
+                    <span>Buka Aplikasi di Tab Baru</span>
+                  </a>
+                </div>
+              </div>
+            )}
 
             <div className="mt-5 pt-3 border-t border-slate-100 flex justify-end gap-2.5">
               <button
                 type="button"
                 onClick={() => {
-                  setAuthError(null);
-                  signInWithGoogle();
+                  if (authError === "UNAUTHORIZED_DOMAIN") {
+                    handleRecheckDomainClick();
+                  } else {
+                    setAuthError(null);
+                    signInWithGoogle();
+                  }
                 }}
                 className="py-2 px-4 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition cursor-pointer"
               >
-                Coba Masuk Google Lagi
+                {authError === "UNAUTHORIZED_DOMAIN" ? "Cek Ulang & Masuk" : "Coba Masuk Google Lagi"}
               </button>
               <button
                 type="button"

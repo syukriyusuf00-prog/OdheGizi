@@ -9,12 +9,116 @@ import {
 import firebaseConfig from "../../firebase-applet-config.json";
 
 export const FIREBASE_PROJECT_ID = firebaseConfig.projectId;
+export const FIREBASE_API_KEY = firebaseConfig.apiKey;
 export const FIRESTORE_DATABASE_ID =
   (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId || "(default)";
 
 export const FIRESTORE_UPGRADE_URL = `https://console.firebase.google.com/project/${FIREBASE_PROJECT_ID}/firestore/databases/${encodeURIComponent(
   FIRESTORE_DATABASE_ID
 )}/data?openUpgradeDialog=true`;
+
+export const FIREBASE_AUTH_SETTINGS_URL = `https://console.firebase.google.com/project/${FIREBASE_PROJECT_ID}/authentication/settings`;
+
+export interface DomainAuthCheckResult {
+  currentHostname: string;
+  isAuthorized: boolean;
+  authorizedDomains: string[];
+  checked: boolean;
+  error?: string | null;
+}
+
+let cachedDomainAuthResult: DomainAuthCheckResult | null = null;
+
+export const isHostnameAuthorized = (hostname: string, authorizedDomains: string[]): boolean => {
+  const cleanHost = (hostname || "").toLowerCase().trim();
+  if (!cleanHost) return false;
+  return authorizedDomains.some((rawDomain) => {
+    const cleanDomain = (rawDomain || "").toLowerCase().trim();
+    if (!cleanDomain) return false;
+    return cleanHost === cleanDomain || cleanHost.endsWith(`.${cleanDomain}`);
+  });
+};
+
+export const getPreferredAuthorizedAppUrls = (authorizedDomains: string[]): string[] => {
+  const currentHost =
+    typeof window !== "undefined" ? window.location.hostname.toLowerCase().trim() : "";
+  const filtered = authorizedDomains.filter((d) => {
+    const lower = (d || "").toLowerCase().trim();
+    if (!lower || lower === currentHost) return false;
+    if (lower.endsWith(".firebaseapp.com") || lower.endsWith(".web.app")) return false;
+    if (lower === "localhost" || lower === "127.0.0.1") return false;
+    // Prefer shared/pre or custom production domains (e.g. vercel.app / custom domain / ais-pre)
+    if (lower.startsWith("ais-dev-") || lower.startsWith("ais-mob-") || lower.startsWith("ais-shared-")) {
+      return false;
+    }
+    return true;
+  });
+  return Array.from(new Set(filtered)).slice(0, 3);
+};
+
+export async function checkFirebaseAuthorizedDomain(
+  forceRefresh = false
+): Promise<DomainAuthCheckResult> {
+  const currentHostname =
+    typeof window !== "undefined" ? window.location.hostname.toLowerCase().trim() : "";
+
+  if (!forceRefresh && cachedDomainAuthResult && cachedDomainAuthResult.checked) {
+    return cachedDomainAuthResult;
+  }
+
+  if (!FIREBASE_API_KEY || typeof fetch === "undefined") {
+    return {
+      currentHostname,
+      isAuthorized: true,
+      authorizedDomains: [],
+      checked: false,
+      error: null,
+    };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch(
+      `https://www.googleapis.com/identitytoolkit/v3/relyingparty/getProjectConfig?key=${encodeURIComponent(
+        FIREBASE_API_KEY
+      )}&_t=${Date.now()}`,
+      {
+        method: "GET",
+        cache: "no-store",
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    const domains: string[] = Array.isArray(data?.authorizedDomains)
+      ? data.authorizedDomains.filter((d: unknown): d is string => typeof d === "string")
+      : [];
+
+    const result: DomainAuthCheckResult = {
+      currentHostname,
+      isAuthorized: domains.length === 0 ? true : isHostnameAuthorized(currentHostname, domains),
+      authorizedDomains: domains,
+      checked: true,
+      error: null,
+    };
+    cachedDomainAuthResult = result;
+    return result;
+  } catch (err: any) {
+    return {
+      currentHostname,
+      isAuthorized: true,
+      authorizedDomains: cachedDomainAuthResult?.authorizedDomains || [],
+      checked: false,
+      error: err?.message || String(err),
+    };
+  }
+}
 
 export interface FirestoreHealthState {
   status: "checking" | "connected" | "quota_exceeded" | "offline" | "error";

@@ -23,6 +23,8 @@ import {
   handleFirestoreError,
   OperationType,
   reportFirestoreWriteResult,
+  checkFirebaseAuthorizedDomain,
+  DomainAuthCheckResult,
 } from "../lib/firebase.ts";
 import { clearDriveSession, getIsDriveConnecting } from "../lib/googleDrive.ts";
 import {
@@ -213,6 +215,8 @@ interface AuthContextType {
   refreshUserProfile: () => Promise<any | null>;
   authError: string | null;
   setAuthError: (error: string | null) => void;
+  domainAuthInfo: DomainAuthCheckResult;
+  recheckDomainAndSignIn: () => Promise<boolean>;
   simulateAdminLogin: () => void;
   isDemo: boolean;
   demoSecondsLeft: number | null;
@@ -284,6 +288,14 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [domainAuthInfo, setDomainAuthInfo] = useState<DomainAuthCheckResult>(() => ({
+    currentHostname:
+      typeof window !== "undefined" ? window.location.hostname.toLowerCase().trim() : "",
+    isAuthorized: true,
+    authorizedDomains: [],
+    checked: false,
+    error: null,
+  }));
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
   const [demoSecondsLeft, setDemoSecondsLeft] = useState<number | null>(() => {
     const rawExp = localStorage.getItem(DEMO_EXPIRES_KEY);
@@ -291,6 +303,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const rem = Math.ceil((Number(rawExp) - Date.now()) / 1000);
     return rem > 0 ? rem : 0;
   });
+
+  // Proactively inspect Firebase Authorized Domains on the login screen
+  useEffect(() => {
+    let active = true;
+    checkFirebaseAuthorizedDomain(false)
+      .then((res) => {
+        if (active) setDomainAuthInfo(res);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const isDemo = Boolean(
     userProfile?.isDemo ||
@@ -977,19 +1002,52 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.error("Google Sign-In failed:", error);
       setLoading(false);
       const code = error?.code || "";
-      let friendlyError = error?.message || String(error);
-      if (code === "auth/popup-closed-by-user") {
-        friendlyError = "Jendela pemilihan akun Google ditutup sebelum selesai. Silakan klik kembali tombol Masuk dengan Email Google Anda.";
+      const rawMsg = error?.message || String(error);
+      let friendlyError = rawMsg;
+      if (code === "auth/unauthorized-domain" || rawMsg.includes("unauthorized-domain")) {
+        const freshDomainInfo = await checkFirebaseAuthorizedDomain(true).catch(() => null);
+        if (freshDomainInfo) {
+          setDomainAuthInfo({
+            ...freshDomainInfo,
+            isAuthorized: false,
+            checked: true,
+          });
+        } else {
+          setDomainAuthInfo((prev) => ({
+            ...prev,
+            isAuthorized: false,
+            checked: true,
+          }));
+        }
+        friendlyError = "UNAUTHORIZED_DOMAIN";
+      } else if (code === "auth/operation-not-allowed") {
+        friendlyError =
+          "Metode masuk Google belum diaktifkan pada proyek Firebase Authentication. Aktifkan Google di Firebase Console → Authentication → Sign-in method.";
+      } else if (code === "auth/popup-closed-by-user") {
+        friendlyError =
+          "Jendela pemilihan akun Google ditutup sebelum selesai. Silakan klik kembali tombol Masuk dengan Email Google Anda.";
       } else if (
         code === "auth/popup-blocked" ||
         code === "auth/cancelled-popup-request" ||
         code === "auth/network-request-failed" ||
-        String(error).includes("network-request-failed")
+        rawMsg.includes("network-request-failed")
       ) {
         friendlyError = "IFRAME_BLOCKED";
       }
       setAuthError(friendlyError);
     }
+  };
+
+  const recheckDomainAndSignIn = async (): Promise<boolean> => {
+    const fresh = await checkFirebaseAuthorizedDomain(true);
+    setDomainAuthInfo(fresh);
+    if (fresh.checked && !fresh.isAuthorized) {
+      setAuthError("UNAUTHORIZED_DOMAIN");
+      return false;
+    }
+    setAuthError(null);
+    await signInWithGoogle();
+    return true;
   };
 
   const signOutUser = async () => {
@@ -2079,6 +2137,8 @@ const removeDeletedTenantEmail = (email: string) => {
       refreshUserProfile,
       authError,
       setAuthError,
+      domainAuthInfo,
+      recheckDomainAndSignIn,
       simulateAdminLogin,
       isDemo,
       demoSecondsLeft,

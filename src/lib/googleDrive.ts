@@ -86,6 +86,12 @@ export async function connectGoogleDrive(hintEmail?: string): Promise<DriveSessi
     return session;
   } catch (err: any) {
     const code = err?.code || "";
+    if (code === "auth/unauthorized-domain") {
+      const host = typeof window !== "undefined" ? window.location.hostname : "domain ini";
+      throw new Error(
+        `Domain "${host}" belum terdaftar di Firebase Authentication → Settings → Authorized domains. Tambahkan domain tersebut di Firebase Console lalu coba hubungkan Google Drive kembali.`
+      );
+    }
     if (code === "auth/popup-blocked") {
       throw new Error(
         "Pop-up Google Drive diblokir browser. Izinkan pop-up atau klik 'Buka di Tab Baru' di kanan atas pratinjau."
