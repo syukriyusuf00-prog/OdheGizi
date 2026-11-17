@@ -79,6 +79,10 @@ service cloud.firestore {
     }
 
     // 4. Global configurations and settings collection (e.g. global logo, global TKPI)
+    match /test/connection {
+      allow get: if true;
+    }
+
     match /configs/{configId} {
       allow read, write: if true;
     }

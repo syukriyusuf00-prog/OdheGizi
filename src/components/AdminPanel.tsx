@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { 
   collection, 
   getDocs, 
@@ -9,13 +9,26 @@ import {
   onSnapshot,
   serverTimestamp 
 } from "firebase/firestore";
-import { db } from "../lib/firebase.ts";
-import { isMainAdminEmail } from "../context/AuthContext.tsx";
+import {
+  db,
+  FIREBASE_PROJECT_ID,
+  FIRESTORE_DATABASE_ID,
+  FIRESTORE_UPGRADE_URL,
+  FirestoreHealthState,
+  getFirestoreHealth,
+  subscribeFirestoreHealth,
+  testFirestoreConnection,
+  reportFirestoreWriteResult,
+} from "../lib/firebase.ts";
+import {
+  isMainAdminEmail,
+  syncUserToRealtimeHub,
+  deleteUserFromRealtimeHub,
+} from "../context/AuthContext.tsx";
 import { 
   Users, 
   CheckCircle, 
   Clock, 
-  Activity, 
   Search, 
   Trash2, 
   Calendar, 
@@ -40,7 +53,9 @@ import {
   Globe,
   Wifi,
   WifiOff,
-  MailCheck
+  MailCheck,
+  AlertTriangle,
+  ExternalLink
 } from "lucide-react";
 import { DeviceRecord, getCachedLocalDevice, formatDeviceShortLabel } from "../lib/deviceTracker.ts";
 
@@ -135,6 +150,22 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
   const [refreshTrigger, setRefreshTrigger] = useState(0);
   const [selectedUserUids, setSelectedUserUids] = useState<string[]>([]);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  const [firestoreHealth, setFirestoreHealth] = useState<FirestoreHealthState>(() => getFirestoreHealth());
+  const [sseStatus, setSseStatus] = useState<"connecting" | "connected" | "reconnecting">("connecting");
+  const [lastLiveEventAt, setLastLiveEventAt] = useState<string | null>(null);
+  const [testingDb, setTestingDb] = useState(false);
+
+  // Keep dual-channel real-time stores (Firestore + Express SSE Hub) merged cleanly without clobbering
+  const firestoreUsersRef = useRef<any[]>([]);
+  const hubUsersRef = useRef<Map<string, any>>(new Map());
+  const firestoreDevicesRef = useRef<DeviceRecord[]>([]);
+  const hubDevicesRef = useRef<Map<string, DeviceRecord>>(new Map());
+
+  useEffect(() => {
+    const unsub = subscribeFirestoreHealth(setFirestoreHealth);
+    testFirestoreConnection().catch(() => {});
+    return unsub;
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowTick(Date.now()), 30_000);
@@ -145,7 +176,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
     localStorage.setItem("sisper_admin_tab", activeTab);
   }, [activeTab]);
 
-  // Load all users combining instant local cache + real-time Firestore + registration event listener
+  // Load all users & devices combining Firestore real-time onSnapshot + Server SSE Real-Time Hub + local cache
   useEffect(() => {
     setLoading(true);
 
@@ -162,7 +193,17 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       berakhirPada: "2035-12-31"
     };
 
-    const mergeAndSetUsers = (remoteDocs: any[], isFromFirestore = false) => {
+    const getRecordTimeMs = (val: any): number => {
+      if (!val) return 0;
+      if (typeof val === "string") {
+        const t = new Date(val).getTime();
+        return Number.isNaN(t) ? 0 : t;
+      }
+      if (typeof val?.seconds === "number") return val.seconds * 1000;
+      return 0;
+    };
+
+    const rebuildMergedUsers = () => {
       const map = new Map<string, any>();
       map.set("admin_syukriyusuf82", mainAdminDoc);
       const deletedEmails = getDeletedTenantEmails();
@@ -173,16 +214,18 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         if (
           u.uid === "admin_sukriyusuf82" ||
           u.uid === "admin_syukriyusuf82" ||
-          (userEmail && isMainAdminEmail(userEmail)) ||
-          (userEmail && deletedEmails.has(userEmail))
+          (userEmail && isMainAdminEmail(userEmail))
         ) {
+          return;
+        }
+        // Only apply local deleted-email filter to stale localStorage caches — NEVER drop live remote registrations from mobile/cloud!
+        if (!isRemote && userEmail && deletedEmails.has(userEmail)) {
           return;
         }
 
         const primaryKey = u.uid || u.id || (userEmail ? `custom_user_${userEmail.replace(/[@.]/g, "_")}` : null);
         if (!primaryKey && !userEmail) return;
 
-        // Try finding existing map entry by key or email
         let existingKey: string | null = null;
         if (primaryKey && map.has(primaryKey)) {
           existingKey = primaryKey;
@@ -195,41 +238,67 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
           }
         }
 
-        const existing = existingKey ? map.get(existingKey) : {};
+        const existing = existingKey ? map.get(existingKey) : null;
         const keyToUse = existingKey || primaryKey || `custom_user_${userEmail.replace(/[@.]/g, "_")}`;
 
-        // Preserve local approved status ("aktif" or "diblokir") if remote is lagging on "menunggu"
-        let finalStatus = isRemote ? (u.statusPersetujuan || existing.statusPersetujuan || "menunggu") : (existing.statusPersetujuan || u.statusPersetujuan || "menunggu");
-        if (existing.statusPersetujuan === "aktif" && u.statusPersetujuan === "menunggu") {
+        if (!existing) {
+          map.set(keyToUse, {
+            ...u,
+            uid: keyToUse,
+            id: keyToUse,
+            statusPersetujuan: u.statusPersetujuan || "menunggu",
+          });
+          return;
+        }
+
+        const existingUpdated = Math.max(
+          getRecordTimeMs(existing.updatedAt),
+          getRecordTimeMs(existing.loginTerakhir),
+          getRecordTimeMs(existing.lastDeviceSeenAt)
+        );
+        const incomingUpdated = Math.max(
+          getRecordTimeMs(u.updatedAt),
+          getRecordTimeMs(u.loginTerakhir),
+          getRecordTimeMs(u.lastDeviceSeenAt)
+        );
+
+        const newer = incomingUpdated >= existingUpdated ? u : existing;
+        const older = incomingUpdated >= existingUpdated ? existing : u;
+
+        let finalStatus = newer.statusPersetujuan || older.statusPersetujuan || "menunggu";
+        if (older.statusPersetujuan === "aktif" && newer.statusPersetujuan === "menunggu" && !newer.verificationStatus) {
           finalStatus = "aktif";
-        } else if (existing.statusPersetujuan === "diblokir" && u.statusPersetujuan === "menunggu") {
-          finalStatus = "diblokir";
         }
 
         const merged = {
-          ...existing,
-          ...u,
+          ...older,
+          ...newer,
           uid: keyToUse,
           id: keyToUse,
-          statusPersetujuan: finalStatus
+          statusPersetujuan: finalStatus,
+          loginTerakhir:
+            getRecordTimeMs(u.loginTerakhir) >= getRecordTimeMs(existing.loginTerakhir)
+              ? u.loginTerakhir || existing.loginTerakhir
+              : existing.loginTerakhir || u.loginTerakhir,
         };
 
         map.set(keyToUse, merged);
       };
 
-      // 1. First populate from offline localStorage cache
+      // 1. Local offline cache first
       const offlineList = getOfflineUsers();
       offlineList.forEach((u) => addToMap(u, false));
 
-      // 2. Overlay remote docs from Firestore
-      if (isFromFirestore && remoteDocs.length > 0) {
-        remoteDocs.forEach((u) => addToMap(u, true));
-      }
+      // 2. Remote Firestore documents
+      firestoreUsersRef.current.forEach((u) => addToMap(u, true));
+
+      // 3. Live Server Real-Time Hub users (instant Mobile -> Laptop sync)
+      hubUsersRef.current.forEach((u) => addToMap(u, true));
 
       const userList = Array.from(map.values());
       userList.sort((a, b) => {
-        const timeA = typeof a.createdAt === "string" ? new Date(a.createdAt).getTime() : (a.createdAt?.seconds ? a.createdAt.seconds * 1000 : 0);
-        const timeB = typeof b.createdAt === "string" ? new Date(b.createdAt).getTime() : (b.createdAt?.seconds ? b.createdAt.seconds * 1000 : 0);
+        const timeA = Math.max(getRecordTimeMs(a.loginTerakhir), getRecordTimeMs(a.updatedAt), getRecordTimeMs(a.createdAt));
+        const timeB = Math.max(getRecordTimeMs(b.loginTerakhir), getRecordTimeMs(b.updatedAt), getRecordTimeMs(b.createdAt));
         return timeB - timeA;
       });
 
@@ -237,132 +306,218 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       setLoading(false);
     };
 
-    // Render immediately with offline cache
-    mergeAndSetUsers([], false);
-
-    // Subscribe to Firestore for real-time cloud updates
-    const usersCol = collection(db, "users");
-    const unsubscribe = onSnapshot(usersCol, (snapshot) => {
-      const remoteList: any[] = [];
-      snapshot.docs.forEach((docSnap) => {
-        const data = docSnap.data();
-        if (docSnap.id === "admin_sukriyusuf82" || docSnap.id === "admin_syukriyusuf82" || (data.email && isMainAdminEmail(data.email))) {
-          return;
-        }
-        const userUid = data.uid || docSnap.id;
-        remoteList.push({ 
-          ...data,
-          id: docSnap.id, 
-          uid: userUid 
-        });
-      });
-      mergeAndSetUsers(remoteList, true);
-    }, (err) => {
-      console.warn("Firestore user listener notice (menggunakan mode data offline):", err);
-      setLoading(false);
-    });
-
-    // Event listener to instantly add newly registered users to admin list
-    const handleRegistered = (e: any) => {
-      if (e?.detail) {
-        const newUser = e.detail;
-        const newUserEmail = (newUser.email || "").toLowerCase().trim();
-        const emailSlug = newUserEmail.replace(/[@.]/g, "_");
-        const customUid = newUser.uid || `custom_user_${emailSlug}`;
-
-        localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(newUser));
-
-        setUsers((prev) => {
-          const exists = prev.some(
-            (u) => u.uid === customUid || (u.email || "").toLowerCase().trim() === newUserEmail
-          );
-          if (exists) {
-            return prev.map((u) =>
-              u.uid === customUid || (u.email || "").toLowerCase().trim() === newUserEmail
-                ? { ...u, ...newUser }
-                : u
-            );
-          }
-          return [newUser, ...prev];
-        });
-      } else {
-        mergeAndSetUsers([], false);
-      }
-    };
-    window.addEventListener("sisper_user_registered", handleRegistered);
-
-    return () => {
-      unsubscribe();
-      window.removeEventListener("sisper_user_registered", handleRegistered);
-    };
-  }, [refreshTrigger]);
-
-  // Real-time automatic subscription to ALL connected devices (/devices collection)
-  useEffect(() => {
-    const mergeDeviceList = (remoteList: DeviceRecord[]) => {
+    const rebuildMergedDevices = () => {
       const map = new Map<string, DeviceRecord>();
-      const localDev = getCachedLocalDevice();
-      if (localDev?.deviceId) {
-        map.set(localDev.deviceId, localDev);
-      }
-      remoteList.forEach((d) => {
+      const upsert = (d: DeviceRecord) => {
         if (!d?.deviceId) return;
         const prev = map.get(d.deviceId);
         if (!prev) {
           map.set(d.deviceId, d);
-        } else {
-          const prevTime = new Date(prev.lastSeenAt || 0).getTime();
-          const nextTime = new Date(d.lastSeenAt || 0).getTime();
-          map.set(d.deviceId, nextTime >= prevTime ? { ...prev, ...d } : { ...d, ...prev });
+          return;
         }
-      });
+        const prevTime = new Date(prev.lastSeenAt || 0).getTime();
+        const nextTime = new Date(d.lastSeenAt || 0).getTime();
+        map.set(d.deviceId, nextTime >= prevTime ? { ...prev, ...d } : { ...d, ...prev });
+      };
 
-      const sorted = Array.from(map.values()).sort((a, b) => {
-        const ta = new Date(a.lastSeenAt || 0).getTime();
-        const tb = new Date(b.lastSeenAt || 0).getTime();
-        return tb - ta;
-      });
+      const localDev = getCachedLocalDevice();
+      if (localDev?.deviceId) upsert(localDev);
+      firestoreDevicesRef.current.forEach(upsert);
+      hubDevicesRef.current.forEach(upsert);
+
+      const sorted = Array.from(map.values()).sort(
+        (a, b) => new Date(b.lastSeenAt || 0).getTime() - new Date(a.lastSeenAt || 0).getTime()
+      );
       setDevices(sorted);
     };
 
-    mergeDeviceList([]);
+    // Immediate initial render
+    rebuildMergedUsers();
+    rebuildMergedDevices();
+
+    // Channel A: Firestore real-time listeners (/users & /devices)
+    const usersCol = collection(db, "users");
+    const unsubscribeUsers = onSnapshot(
+      usersCol,
+      (snapshot) => {
+        const remoteList: any[] = [];
+        snapshot.docs.forEach((docSnap) => {
+          const data = docSnap.data();
+          if (docSnap.id === "admin_sukriyusuf82" || docSnap.id === "admin_syukriyusuf82" || (data.email && isMainAdminEmail(data.email))) {
+            return;
+          }
+          const userUid = data.uid || docSnap.id;
+          remoteList.push({
+            ...data,
+            id: docSnap.id,
+            uid: userUid,
+          });
+        });
+        firestoreUsersRef.current = remoteList;
+        setLastLiveEventAt(new Date().toISOString());
+        rebuildMergedUsers();
+      },
+      (err) => {
+        console.warn("Firestore user listener notice:", err);
+        setLoading(false);
+      }
+    );
 
     const devicesCol = collection(db, "devices");
     const unsubscribeDevices = onSnapshot(
       devicesCol,
       (snapshot) => {
-        const list: DeviceRecord[] = snapshot.docs.map((docSnap) => {
+        firestoreDevicesRef.current = snapshot.docs.map((docSnap) => {
           const data = docSnap.data() as DeviceRecord;
           return {
             ...data,
             deviceId: data.deviceId || docSnap.id,
           };
         });
-        mergeDeviceList(list);
+        setLastLiveEventAt(new Date().toISOString());
+        rebuildMergedDevices();
       },
       (err) => {
         console.warn("Firestore devices listener notice:", err);
       }
     );
 
+    // Channel B: Real-Time Server SSE Hub (/api/realtime/stream + /api/realtime/snapshot)
+    // Guarantees instant (<1s) Mobile -> Laptop synchronization across networks
+    const hydrateFromServerSnapshot = async () => {
+      try {
+        const resp = await fetch("/api/realtime/snapshot", { cache: "no-store" });
+        if (!resp.ok) return;
+        const json = await resp.json();
+        if (Array.isArray(json?.users)) {
+          hubUsersRef.current = new Map(json.users.filter((u: any) => u?.uid).map((u: any) => [u.uid, u]));
+          rebuildMergedUsers();
+        }
+        if (Array.isArray(json?.devices)) {
+          hubDevicesRef.current = new Map(json.devices.filter((d: any) => d?.deviceId).map((d: any) => [d.deviceId, d]));
+          rebuildMergedDevices();
+        }
+      } catch {}
+    };
+
+    hydrateFromServerSnapshot();
+
+    let eventSource: EventSource | null = null;
+    try {
+      setSseStatus("connecting");
+      eventSource = new EventSource("/api/realtime/stream");
+
+      eventSource.onopen = () => {
+        setSseStatus("connected");
+      };
+
+      eventSource.addEventListener("snapshot", (ev: MessageEvent) => {
+        try {
+          const parsed = JSON.parse(ev.data);
+          setSseStatus("connected");
+          setLastLiveEventAt(new Date().toISOString());
+          if (Array.isArray(parsed?.users)) {
+            hubUsersRef.current = new Map(parsed.users.filter((u: any) => u?.uid).map((u: any) => [u.uid, u]));
+            rebuildMergedUsers();
+          }
+          if (Array.isArray(parsed?.devices)) {
+            hubDevicesRef.current = new Map(parsed.devices.filter((d: any) => d?.deviceId).map((d: any) => [d.deviceId, d]));
+            rebuildMergedDevices();
+          }
+        } catch {}
+      });
+
+      eventSource.addEventListener("user_upsert", (ev: MessageEvent) => {
+        try {
+          const incoming = JSON.parse(ev.data);
+          if (incoming?.uid) {
+            hubUsersRef.current.set(incoming.uid, incoming);
+            setLastLiveEventAt(new Date().toISOString());
+            rebuildMergedUsers();
+          }
+        } catch {}
+      });
+
+      eventSource.addEventListener("user_delete", (ev: MessageEvent) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          const targetEmail = (payload?.email || "").toLowerCase().trim();
+          const targetUid = payload?.uid || "";
+          for (const [k, u] of hubUsersRef.current.entries()) {
+            if ((targetUid && (k === targetUid || u.uid === targetUid)) || (targetEmail && (u.email || "").toLowerCase().trim() === targetEmail)) {
+              hubUsersRef.current.delete(k);
+            }
+          }
+          setLastLiveEventAt(new Date().toISOString());
+          rebuildMergedUsers();
+        } catch {}
+      });
+
+      eventSource.addEventListener("device_upsert", (ev: MessageEvent) => {
+        try {
+          const incoming = JSON.parse(ev.data) as DeviceRecord;
+          if (incoming?.deviceId) {
+            hubDevicesRef.current.set(incoming.deviceId, incoming);
+            setLastLiveEventAt(new Date().toISOString());
+            rebuildMergedDevices();
+          }
+        } catch {}
+      });
+
+      eventSource.addEventListener("device_delete", (ev: MessageEvent) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          if (payload?.deviceId) {
+            hubDevicesRef.current.delete(payload.deviceId);
+            setLastLiveEventAt(new Date().toISOString());
+            rebuildMergedDevices();
+          }
+        } catch {}
+      });
+
+      eventSource.onerror = () => {
+        setSseStatus("reconnecting");
+      };
+    } catch {
+      setSseStatus("reconnecting");
+    }
+
+    // Periodic lightweight snapshot safety poll (every 12s) in case a corporate proxy buffers SSE
+    const safetyPoll = window.setInterval(() => {
+      if (document.visibilityState === "visible") {
+        hydrateFromServerSnapshot();
+      }
+    }, 12_000);
+
+    // Same-tab instant registration / device listeners
+    const handleRegistered = (e: any) => {
+      if (e?.detail) {
+        const newUser = e.detail;
+        const newUserEmail = (newUser.email || "").toLowerCase().trim();
+        const emailSlug = newUserEmail.replace(/[@.]/g, "_");
+        const customUid = newUser.uid || `custom_user_${emailSlug}`;
+        localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(newUser));
+        hubUsersRef.current.set(customUid, { ...newUser, uid: customUid, id: customUid });
+      }
+      rebuildMergedUsers();
+    };
+
     const handleLocalDeviceUpdate = (e: any) => {
       if (e?.detail?.deviceId) {
-        setDevices((prev) => {
-          const incoming = e.detail as DeviceRecord;
-          const exists = prev.some((d) => d.deviceId === incoming.deviceId);
-          const next = exists
-            ? prev.map((d) => (d.deviceId === incoming.deviceId ? { ...d, ...incoming } : d))
-            : [incoming, ...prev];
-          return next.sort(
-            (a, b) => new Date(b.lastSeenAt || 0).getTime() - new Date(a.lastSeenAt || 0).getTime()
-          );
-        });
+        hubDevicesRef.current.set(e.detail.deviceId, e.detail as DeviceRecord);
+        rebuildMergedDevices();
       }
     };
 
+    window.addEventListener("sisper_user_registered", handleRegistered);
     window.addEventListener("sisper_device_updated", handleLocalDeviceUpdate);
+
     return () => {
+      unsubscribeUsers();
       unsubscribeDevices();
+      if (eventSource) eventSource.close();
+      window.clearInterval(safetyPoll);
+      window.removeEventListener("sisper_user_registered", handleRegistered);
       window.removeEventListener("sisper_device_updated", handleLocalDeviceUpdate);
     };
   }, [refreshTrigger]);
@@ -388,8 +543,18 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
   const handleDeleteDeviceRecord = async (deviceId: string) => {
     if (!deviceId) return;
     try {
-      await deleteDoc(doc(db, "devices", deviceId));
+      hubDevicesRef.current.delete(deviceId);
       setDevices((prev) => prev.filter((d) => d.deviceId !== deviceId));
+      await Promise.all([
+        fetch("/api/realtime/delete-device", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ deviceId }),
+        }).catch(() => {}),
+        fetchWithTimeout(deleteDoc(doc(db, "devices", deviceId)), 2500, null).catch((err) => {
+          reportFirestoreWriteResult(false, err);
+        }),
+      ]);
     } catch (err) {
       console.warn("Gagal menghapus catatan perangkat:", err);
     }
@@ -519,13 +684,19 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         }
       }
 
-      // 3. Reliable background cloud sync to Firestore with complete user document
+      // 3. Real-time hub broadcast + background cloud sync to Firestore
+      syncUserToRealtimeHub(fullUserData).catch(() => {});
       const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid, userObj?.id].filter(Boolean)));
       for (const docId of docIdsToUpdate) {
         try {
           const userRef = doc(db, "users", docId);
-          await setDoc(userRef, fullUserData, { merge: true });
+          await fetchWithTimeout(
+            setDoc(userRef, fullUserData, { merge: true }).then(() => reportFirestoreWriteResult(true)),
+            2500,
+            null
+          );
         } catch (e) {
+          reportFirestoreWriteResult(false, e);
           console.warn("Notice setDoc status:", e);
         }
       }
@@ -576,13 +747,21 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       }
     }
 
+    if (userObj) {
+      syncUserToRealtimeHub({ ...userObj, peran: nextRole, uid: customUid }).catch(() => {});
+    }
     for (const docId of docIds) {
       try {
-        await setDoc(doc(db, "users", docId), {
-          peran: nextRole,
-          updatedAt: new Date().toISOString()
-        }, { merge: true });
+        await fetchWithTimeout(
+          setDoc(doc(db, "users", docId), {
+            peran: nextRole,
+            updatedAt: new Date().toISOString()
+          }, { merge: true }),
+          2500,
+          null
+        );
       } catch (e) {
+        reportFirestoreWriteResult(false, e);
         console.warn("Notice updating user role:", e);
       }
     }
@@ -613,6 +792,9 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       }
     });
 
+    if (userObj) {
+      syncUserToRealtimeHub({ ...userObj, berakhirPada: dateStr, uid: customUid }).catch(() => {});
+    }
     const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid].filter(Boolean)));
     for (const docId of docIdsToUpdate) {
       try {
@@ -622,6 +804,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
           updatedAt: new Date().toISOString()
         }, { merge: true }), 1500, null);
       } catch (err) {
+        reportFirestoreWriteResult(false, err);
         console.warn("Tanggal kedaluwarsa diperbarui lokal:", err);
       }
     }
@@ -664,16 +847,24 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       }
     });
 
+    if (userObj) {
+      syncUserToRealtimeHub({ ...userObj, berakhirPada: pastStr, statusPersetujuan: "diblokir", uid: customUid }).catch(() => {});
+    }
     const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid].filter(Boolean)));
     for (const docId of docIdsToUpdate) {
       try {
         const userRef = doc(db, "users", docId);
-        await setDoc(userRef, {
-          berakhirPada: pastStr,
-          statusPersetujuan: "diblokir",
-          updatedAt: serverTimestamp()
-        }, { merge: true });
+        await fetchWithTimeout(
+          setDoc(userRef, {
+            berakhirPada: pastStr,
+            statusPersetujuan: "diblokir",
+            updatedAt: serverTimestamp()
+          }, { merge: true }),
+          2500,
+          null
+        );
       } catch (err) {
+        reportFirestoreWriteResult(false, err);
         console.error("Gagal memutuskan akses:", err);
       }
     }
@@ -713,11 +904,14 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         localStorage.setItem(k, JSON.stringify({ ...parsed, ...updates }));
       });
 
+      if (userObj) {
+        syncUserToRealtimeHub({ ...userObj, ...updates, uid: customUid }).catch(() => {});
+      }
       const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid].filter(Boolean)));
       for (const docId of docIdsToUpdate) {
         try {
           const userRef = doc(db, "users", docId);
-          await setDoc(userRef, updates, { merge: true });
+          await fetchWithTimeout(setDoc(userRef, updates, { merge: true }), 2500, null);
         } catch (e) {}
       }
       alert(`Kata sandi untuk ${email} berhasil diperbarui menjadi: "${newSandi}"`);
@@ -739,11 +933,12 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
       const customUid = `custom_user_${emailSlug}`;
       const idsToDelete = Array.from(new Set([userId, customUid].filter(Boolean)));
 
-      // 1. Mark email as deleted & delete all doc IDs from Firestore
+      // 1. Mark email as deleted & delete from Real-Time Hub + Firestore
       addDeletedTenantEmail(lowerEmail);
+      deleteUserFromRealtimeHub(customUid, lowerEmail).catch(() => {});
       for (const id of idsToDelete) {
         try {
-          await deleteDoc(doc(db, "users", id));
+          await fetchWithTimeout(deleteDoc(doc(db, "users", id)), 2500, null);
         } catch (err) {
           console.warn(`Peringatan saat menghapus dokumen Firestore ${id}:`, err);
         }
@@ -800,6 +995,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         const emailSlug = lowerEmail.replace(/[@.]/g, "_");
         const customUid = `custom_user_${emailSlug}`;
         const idsToDelete = Array.from(new Set([u.uid, u.id, customUid].filter(Boolean)));
+        deleteUserFromRealtimeHub(customUid, lowerEmail).catch(() => {});
 
         for (const id of idsToDelete) {
           try {
@@ -847,6 +1043,7 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         const emailSlug = lowerEmail.replace(/[@.]/g, "_");
         const customUid = `custom_user_${emailSlug}`;
         const idsToDelete = Array.from(new Set([u.uid, u.id, customUid].filter(Boolean)));
+        deleteUserFromRealtimeHub(customUid, lowerEmail).catch(() => {});
 
         for (const id of idsToDelete) {
           try {
@@ -971,23 +1168,65 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
     <div className="bg-slate-50 rounded-2xl border border-slate-200 shadow-sm overflow-hidden p-6 space-y-6">
       
       {/* Title Header with Close */}
-      <div className="flex items-center justify-between border-b border-slate-200 pb-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
         <div className="flex items-center gap-3">
           <div className="p-2.5 bg-indigo-100 text-indigo-600 rounded-xl">
             <Shield className="w-6 h-6" />
           </div>
           <div>
             <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">Panel Administrasi SISPERMBG</h2>
-            <p className="text-xs text-slate-500">Multi-tenant Management Hub • Autentikasi & Verifikasi Pengguna</p>
+            <div className="flex flex-wrap items-center gap-2 mt-0.5">
+              <p className="text-xs text-slate-500">Multi-tenant Management Hub • Sinkronisasi Real-Time HP & Laptop</p>
+              <span
+                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-extrabold border ${
+                  sseStatus === "connected"
+                    ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                    : "bg-amber-50 text-amber-700 border-amber-200"
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    sseStatus === "connected" ? "bg-emerald-500 animate-pulse" : "bg-amber-500"
+                  }`}
+                ></span>
+                {sseStatus === "connected" ? "Sinkronisasi Real-Time Aktif" : "Menghubungkan Real-Time..."}
+              </span>
+            </div>
           </div>
         </div>
         <button
           onClick={onClose}
-          className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer"
+          className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer self-start sm:self-auto"
         >
           Tutup Panel
         </button>
       </div>
+
+      {/* Honest Firestore Daily Write Quota Banner if Free Tier cap reached */}
+      {firestoreHealth.writeQuotaExceeded && (
+        <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div className="text-xs text-amber-950 space-y-1">
+              <div className="font-extrabold">
+                Kuota Harian Tulis Firestore (Free Tier) Sedang Penuh — Sinkronisasi Real-Time Tetap Berjalan via Server Relay
+              </div>
+              <p className="text-[11px] text-amber-800 leading-relaxed">
+                Aktivitas pendaftaran, login, dan deteksi perangkat seluler (HP) ke laptop tetap tampil <strong>secara real-time</strong> melalui jalur sinkronisasi server langsung. Kuota tulis Firestore akan otomatis reset keesokan hari, atau Anda dapat menaikkan paket database di Firebase Console.
+              </p>
+            </div>
+          </div>
+          <a
+            href={FIRESTORE_UPGRADE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold text-[11px] rounded-xl transition shrink-0 self-start sm:self-center"
+          >
+            <span>Buka Firebase Console</span>
+            <ExternalLink className="w-3.5 h-3.5" />
+          </a>
+        </div>
+      )}
 
       {/* Global App Logo Card for Admin / Panel Admin holders */}
       {onUploadGlobalLogo && (
@@ -1780,37 +2019,104 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           {/* Firestore Connection Diagnostic */}
           <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
-            <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
-              <Database className="w-4 h-4 text-emerald-500" />
-              Koneksi Database Firestore
-            </h3>
-            <div className="p-3 bg-emerald-50/50 border border-emerald-100 rounded-lg text-xs space-y-2 text-slate-700">
-              <div className="flex items-center justify-between">
-                <span>Status Sambungan:</span>
-                <span className="font-bold text-emerald-600 flex items-center gap-1">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                  Terhubung & Sistematis Aktif
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
+                <Database className="w-4 h-4 text-emerald-500" />
+                Koneksi Database Firestore & Real-Time
+              </h3>
+              <button
+                type="button"
+                disabled={testingDb}
+                onClick={async () => {
+                  setTestingDb(true);
+                  await testFirestoreConnection();
+                  setRefreshTrigger((prev) => prev + 1);
+                  setTestingDb(false);
+                }}
+                className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[11px] rounded-lg inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${testingDb ? "animate-spin" : ""}`} />
+                Uji Koneksi
+              </button>
+            </div>
+            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2 text-slate-700">
+              <div className="flex items-center justify-between gap-2">
+                <span>Project ID:</span>
+                <span className="font-mono text-[11px] font-bold text-slate-700">{FIREBASE_PROJECT_ID}</span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span>Database ID Aktif:</span>
+                <span className="font-mono text-[10.5px] font-bold text-indigo-700 break-all text-right">
+                  {FIRESTORE_DATABASE_ID}
                 </span>
               </div>
-              <div className="flex items-center justify-between">
-                <span>Database ID:</span>
-                <span className="font-mono text-slate-500">ai-studio-sispermbg</span>
+              <div className="flex items-center justify-between gap-2">
+                <span>Status Firestore (Cloud):</span>
+                {firestoreHealth.writeQuotaExceeded ? (
+                  <span className="font-bold text-amber-700 flex items-center gap-1">
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
+                    Baca Aktif · Kuota Tulis Harian Penuh
+                  </span>
+                ) : firestoreHealth.status === "connected" ? (
+                  <span className="font-bold text-emerald-600 flex items-center gap-1">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                    Terhubung Penuh (Baca & Tulis)
+                  </span>
+                ) : firestoreHealth.status === "checking" ? (
+                  <span className="font-bold text-slate-500">Memeriksa koneksi...</span>
+                ) : (
+                  <span className="font-bold text-rose-600">
+                    {firestoreHealth.status === "offline" ? "Offline" : "Perlu Pemeriksaan"}
+                  </span>
+                )}
               </div>
-              <div className="flex items-center justify-between">
-                <span>Kebijakan Keamanan:</span>
-                <span className="font-bold text-indigo-600">Terbata / Multi-tenant Terisolasi</span>
+              <div className="flex items-center justify-between gap-2">
+                <span>Jalur Real-Time HP ↔ Laptop (SSE):</span>
+                <span
+                  className={`font-bold flex items-center gap-1 ${
+                    sseStatus === "connected" ? "text-emerald-600" : "text-amber-600"
+                  }`}
+                >
+                  <span
+                    className={`w-2 h-2 rounded-full ${
+                      sseStatus === "connected" ? "bg-emerald-500 animate-pulse" : "bg-amber-500"
+                    }`}
+                  ></span>
+                  {sseStatus === "connected" ? "Terhubung Real-Time (<1 dtk)" : "Menyambung Ulang..."}
+                </span>
               </div>
+              {lastLiveEventAt && (
+                <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80">
+                  <span>Sinkronisasi Terakhir:</span>
+                  <span className="font-mono text-[11px] text-slate-500">{formatTimestamp(lastLiveEventAt)}</span>
+                </div>
+              )}
             </div>
-            <p className="text-[11px] text-slate-500 leading-relaxed">
-              Seluruh data dienkripsi saat transit dan diisolasi per UID menggunakan Firestore Rule tingkat tinggi. Pengguna non-admin sama sekali tidak dapat mengakses atau membaca state pengguna lainnya.
-            </p>
+            {firestoreHealth.writeQuotaExceeded && (
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900 space-y-1.5">
+                <p className="font-bold">Info Kuota Harian Firestore (Free Tier):</p>
+                <p>
+                  Batas harian unit tulis gratis pada proyek Firebase sedang tercapai dan akan reset otomatis keesokan hari.
+                  Aplikasi telah dioptimalkan untuk menghemat &gt;95% kuota tulis, dan sinkronisasi langsung antar HP dan Laptop tetap berjalan melalui Server Real-Time Relay.
+                </p>
+                <a
+                  href={FIRESTORE_UPGRADE_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 font-bold text-amber-800 underline hover:text-amber-950"
+                >
+                  Lihat Database & Opsi Upgrade di Firebase Console
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+            )}
           </div>
 
-          {/* Tenant Isolation Diagnostic */}
+          {/* Tenant Isolation & Multi-Device Diagnostic */}
           <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
             <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
               <Cpu className="w-4 h-4 text-indigo-500" />
-              Sistem Multi-Tenancy
+              Sistem Multi-Tenancy & Multi-Device
             </h3>
             <div className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-lg text-xs space-y-2 text-slate-700">
               <div className="flex items-center justify-between">
@@ -1818,19 +2124,25 @@ export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo 
                 <span className="font-bold text-indigo-600">Subkoleksi States Berbasis UID</span>
               </div>
               <div className="flex items-center justify-between">
-                <span>Jumlah Tenant Saat Ini:</span>
-                <span className="font-bold">{users.length} Tenant Terdaftar</span>
+                <span>Jumlah Tenant Terdaftar:</span>
+                <span className="font-bold">{totalUsersCount} Tenant</span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span>Perangkat Terdeteksi (HP & Laptop):</span>
+                <span className="font-bold text-teal-700">
+                  {devices.length} Perangkat ({onlineDevicesCount} Online)
+                </span>
               </div>
               <div className="flex items-center justify-between">
                 <span>TKPI Rujukan Bersama:</span>
                 <span className="font-bold text-emerald-600 flex items-center gap-1">
                   <CheckCircle className="w-3.5 h-3.5" />
-                  Aktif (Global Read)
+                  Aktif (Delta Hemat Kuota)
                 </span>
               </div>
             </div>
             <p className="text-[11px] text-slate-500 leading-relaxed">
-              Database TKPI 2020 beroperasi sebagai rujukan bersama (read-only) untuk seluruh pengguna tanpa duplikasi data, menghemat ruang penyimpanan awan dan mengoptimalkan kecepatan loading.
+              Setiap aktivitas pendaftaran, verifikasi kode email, dan login dari perangkat seluler (Android/iPhone) maupun komputer langsung dikirim melalui jalur sinkronisasi ganda (Firestore Cloud + Real-Time Server Stream) agar langsung terlihat di Panel Admin.
             </p>
           </div>
         </div>

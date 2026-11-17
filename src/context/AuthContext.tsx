@@ -16,7 +16,14 @@ import {
   where,
   getDocs
 } from "firebase/firestore";
-import { auth, googleAuthProvider, db, handleFirestoreError, OperationType } from "../lib/firebase.ts";
+import {
+  auth,
+  googleAuthProvider,
+  db,
+  handleFirestoreError,
+  OperationType,
+  reportFirestoreWriteResult,
+} from "../lib/firebase.ts";
 import { clearDriveSession, getIsDriveConnecting } from "../lib/googleDrive.ts";
 import {
   buildDeviceRecord,
@@ -24,6 +31,77 @@ import {
   syncDeviceToFirestore,
   toCompactDeviceSummary,
 } from "../lib/deviceTracker.ts";
+
+// Quota protection: deduplicate identical state writes so opening/refreshing never burns Firestore write units
+const lastSyncedCloudPayload = new Map<string, string>();
+
+const normalizeTimestampForRelay = (val: any): string | null => {
+  if (!val) return null;
+  if (typeof val === "string") return val;
+  if (typeof val?.seconds === "number") return new Date(val.seconds * 1000).toISOString();
+  if (typeof val?.toDate === "function") return val.toDate().toISOString();
+  return new Date().toISOString();
+};
+
+export const syncUserToRealtimeHub = async (profileData: Record<string, any> | null) => {
+  if (!profileData || !profileData.email) return;
+  try {
+    const payload = {
+      ...profileData,
+      createdAt: normalizeTimestampForRelay(profileData.createdAt) || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      loginTerakhir:
+        profileData.loginTerakhir === null
+          ? null
+          : normalizeTimestampForRelay(profileData.loginTerakhir),
+    };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4500);
+    await fetch("/api/realtime/sync-user", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      keepalive: true,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+  } catch (err) {
+    console.warn("Notice pushing user to realtime hub:", err);
+  }
+};
+
+export const deleteUserFromRealtimeHub = async (uid?: string | null, email?: string | null) => {
+  if (!uid && !email) return;
+  try {
+    await fetch("/api/realtime/delete-user", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ uid: uid || "", email: email || "" }),
+      keepalive: true,
+    });
+  } catch {}
+};
+
+export const fetchUserFromRealtimeHub = async (email: string, uid?: string): Promise<any | null> => {
+  try {
+    const params = new URLSearchParams();
+    if (email) params.set("email", email.toLowerCase().trim());
+    if (uid) params.set("uid", uid);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3500);
+    const resp = await fetch(`/api/realtime/user?${params.toString()}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (resp.ok) {
+      const json = await resp.json().catch(() => null);
+      return json?.user || null;
+    }
+  } catch {}
+  return null;
+};
 
 const DEMO_DURATION_MS = 5 * 60 * 1000;
 const DEMO_UID = "demo_user_5min";
@@ -298,28 +376,77 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const userSnap = await getDoc(userRef);
       if (userSnap.exists()) {
         const data = userSnap.data();
-        updateSession(currentUser, data);
-        
-        // Update last login
+        const nowIso = new Date().toISOString();
+        const devRecord = await buildDeviceRecord({
+          sessionState: "active",
+          userUid: currentUser.uid,
+          userEmail: data.email || currentUser.email || "",
+          userName: data.namaLengkap || currentUser.displayName || "",
+          namaSPPG: data.namaSPPG || "",
+          peran: data.peran || "USER",
+          statusPersetujuan: data.statusPersetujuan || "aktif",
+          isOnline: true,
+        });
+        const compactDev = toCompactDeviceSummary(devRecord);
+        const enriched: Record<string, any> = {
+          ...data,
+          lastDevice: compactDev,
+          lastDeviceLabel: formatDeviceShortLabel(compactDev),
+          lastDeviceId: devRecord.deviceId,
+          lastDeviceSeenAt: nowIso,
+          loginTerakhir: nowIso,
+        };
+        updateSession(currentUser, enriched);
+
+        // Push immediately to real-time hub so laptop Admin Panel reflects mobile Google login in <1s
+        await syncUserToRealtimeHub(enriched);
+        await syncDeviceToFirestore({
+          sessionState: "active",
+          userUid: currentUser.uid,
+          userEmail: enriched.email || currentUser.email || "",
+          userName: enriched.namaLengkap || currentUser.displayName || "",
+          namaSPPG: enriched.namaSPPG || "",
+          peran: enriched.peran || "USER",
+          statusPersetujuan: enriched.statusPersetujuan || "aktif",
+          isOnline: true,
+          forceFirestore: true,
+        });
+
+        // Update last login + device on Firestore
         try {
-          await setDoc(userRef, {
-            loginTerakhir: serverTimestamp(),
-            updatedAt: serverTimestamp()
-          }, { merge: true });
-          
-          // Fetch updated data to include the server timestamp updates
-          const updatedSnap = await getDoc(userRef);
-          updateSession(currentUser, updatedSnap.data());
+          await fetchWithTimeout(
+            setDoc(
+              userRef,
+              {
+                lastDevice: compactDev,
+                lastDeviceLabel: formatDeviceShortLabel(compactDev),
+                lastDeviceId: devRecord.deviceId,
+                lastDeviceSeenAt: nowIso,
+                loginTerakhir: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              },
+              { merge: true }
+            ).then(() => reportFirestoreWriteResult(true)),
+            3500,
+            null
+          );
         } catch (timestampErr) {
+          reportFirestoreWriteResult(false, timestampErr);
           console.warn("Gagal memperbarui login terakhir di awan:", timestampErr);
         }
       } else {
-        // Normal user: Needs registration
-        updateSession(currentUser, {
-          uid: currentUser.uid,
-          email: currentUser.email || "",
-          isNotRegistered: true
-        });
+        // Also check realtime hub in case user registered recently while Firestore write quota was capped
+        const hubUser = await fetchUserFromRealtimeHub(currentUser.email || "", currentUser.uid);
+        if (hubUser) {
+          updateSession(currentUser, hubUser);
+        } else {
+          // Normal user: Needs registration
+          updateSession(currentUser, {
+            uid: currentUser.uid,
+            email: currentUser.email || "",
+            isNotRegistered: true
+          });
+        }
       }
     } catch (err) {
       console.error("Error fetching user profile:", err);
@@ -521,9 +648,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => window.clearInterval(timer);
   }, [isDemo]);
 
-  // Automatic Real-Time Device Registration & Heartbeat (visible immediately in Panel Admin)
+  // Automatic Real-Time Device Registration & Heartbeat (visible immediately in Panel Admin across Mobile & Laptop)
   useEffect(() => {
-    const pushDeviceHeartbeat = (online: boolean) => {
+    const pushDeviceHeartbeat = (online: boolean, opts?: { forceFirestore?: boolean; useBeacon?: boolean }) => {
       const currentUid = userProfile?.uid || user?.uid || null;
       const currentEmail = userProfile?.email || user?.email || null;
       const currentName = userProfile?.namaLengkap || user?.displayName || null;
@@ -548,24 +675,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         peran: currentRole,
         statusPersetujuan: currentStatus,
         isOnline: online,
+        forceFirestore: opts?.forceFirestore,
+        useBeacon: opts?.useBeacon,
       }).catch(() => {});
     };
 
     pushDeviceHeartbeat(true);
 
+    // Lightweight 30s heartbeat to Real-Time Server Relay (Firestore writes are automatically throttled to 5 min / state changes)
     const intervalId = window.setInterval(() => {
       if (document.visibilityState === "visible") {
         pushDeviceHeartbeat(true);
       }
-    }, 45_000);
+    }, 30_000);
 
     const handleVisibility = () => {
-      pushDeviceHeartbeat(document.visibilityState === "visible");
+      const isVisible = document.visibilityState === "visible";
+      pushDeviceHeartbeat(isVisible, { useBeacon: !isVisible });
     };
     const handleFocus = () => pushDeviceHeartbeat(true);
     const handleOnline = () => pushDeviceHeartbeat(true);
-    const handleOffline = () => pushDeviceHeartbeat(false);
-    const handlePageHide = () => pushDeviceHeartbeat(false);
+    const handleOffline = () => pushDeviceHeartbeat(false, { useBeacon: true });
+    const handlePageHide = () => pushDeviceHeartbeat(false, { useBeacon: true });
 
     document.addEventListener("visibilitychange", handleVisibility);
     window.addEventListener("focus", handleFocus);
@@ -773,9 +904,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!user) throw new Error("No authenticated user found");
     const userRef = doc(db, "users", user.uid);
     const path = `users/${user.uid}`;
+    const nowIso = new Date().toISOString();
     
     const lowerEmail = user.email?.toLowerCase();
     const isMainAdmin = lowerEmail === "syukriyusuf82@gmail.com" || lowerEmail === "sukriyusuf82@gmail.com";
+
+    const devRecord = await buildDeviceRecord({
+      sessionState: "active",
+      userUid: user.uid,
+      userEmail: user.email || "",
+      userName: formData.namaLengkap,
+      namaSPPG: formData.namaSPPG,
+      peran: isMainAdmin ? "ADMIN" : "USER",
+      statusPersetujuan: "aktif",
+      isOnline: true,
+    });
+    const compactDev = toCompactDeviceSummary(devRecord);
     
     const profileData = {
       uid: user.uid,
@@ -786,18 +930,48 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       noHp: formData.noHp,
       peran: isMainAdmin ? ("ADMIN" as const) : ("USER" as const),
       statusPersetujuan: "aktif" as const,
+      emailVerified: true,
+      verificationStatus: "verified" as const,
       berakhirPada: "2030-12-31",
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-      loginTerakhir: serverTimestamp()
+      lastDevice: compactDev,
+      lastDeviceLabel: formatDeviceShortLabel(compactDev),
+      lastDeviceId: devRecord.deviceId,
+      lastDeviceSeenAt: nowIso,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      loginTerakhir: nowIso
     };
 
+    // Push immediately to real-time server hub so mobile Google registration shows on laptop Admin Panel in <1s
+    await syncUserToRealtimeHub(profileData);
+    await syncDeviceToFirestore({
+      sessionState: "active",
+      userUid: user.uid,
+      userEmail: user.email || "",
+      userName: formData.namaLengkap,
+      namaSPPG: formData.namaSPPG,
+      peran: profileData.peran,
+      statusPersetujuan: "aktif",
+      isOnline: true,
+      forceFirestore: true,
+    });
+
     try {
-      await setDoc(userRef, profileData);
-      const snap = await getDoc(userRef);
-      updateSession(user, snap.data());
+      await fetchWithTimeout(
+        setDoc(userRef, {
+          ...profileData,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+          loginTerakhir: serverTimestamp()
+        }).then(() => reportFirestoreWriteResult(true)),
+        4000,
+        null
+      );
+      updateSession(user, profileData);
     } catch (error) {
+      reportFirestoreWriteResult(false, error);
       handleFirestoreError(error, OperationType.WRITE, path);
+      updateSession(user, profileData);
     }
   };
 
@@ -847,10 +1021,16 @@ const removeDeletedTenantEmail = (email: string) => {
 
         // Always save locally immediately for instant responsiveness
         localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(profileData));
+        await syncUserToRealtimeHub(profileData);
 
         try {
-          await setDoc(userRef, profileData, { merge: true });
+          await fetchWithTimeout(
+            setDoc(userRef, profileData, { merge: true }).then(() => reportFirestoreWriteResult(true)),
+            3500,
+            null
+          );
         } catch (dbErr: any) {
+          reportFirestoreWriteResult(false, dbErr);
           console.warn(`Peringatan setDoc untuk ${r.profesi}:`, dbErr);
         }
 
@@ -1014,17 +1194,23 @@ const removeDeletedTenantEmail = (email: string) => {
         loginTerakhir: null,
       };
 
-      // 4. Store locally & persist to Firestore immediately
+      // 4. Store locally, push immediately to Real-Time Hub, and persist to Firestore
       localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(profileData));
+      await syncUserToRealtimeHub(profileData);
 
       try {
-        await setDoc(userRef, profileData, { merge: true });
+        await fetchWithTimeout(
+          setDoc(userRef, profileData, { merge: true }).then(() => reportFirestoreWriteResult(true)),
+          3500,
+          null
+        );
       } catch (dbErr) {
+        reportFirestoreWriteResult(false, dbErr);
         console.warn("Operasi setDoc Firestore di latar belakang tertunda:", dbErr);
       }
 
-      // 5. Sync device presence automatically to /devices & /users/{uid}/devices
-      syncDeviceToFirestore({
+      // 5. Sync device presence automatically to Real-Time Hub & Firestore /devices
+      await syncDeviceToFirestore({
         sessionState: "registering",
         userUid: customUid,
         userEmail: profileData.email,
@@ -1033,7 +1219,8 @@ const removeDeletedTenantEmail = (email: string) => {
         peran: profileData.peran,
         statusPersetujuan: profileData.statusPersetujuan,
         isOnline: true,
-      }).catch(() => {});
+        forceFirestore: true,
+      });
 
       try {
         window.dispatchEvent(new CustomEvent("sisper_user_registered", { detail: profileData }));
@@ -1141,18 +1328,25 @@ const removeDeletedTenantEmail = (email: string) => {
       loginTerakhir: nowIso,
     };
 
-    // 1. Persist activation directly to Firestore so Admin Panel reflects "Aktif" instantaneously
+    // 1. Broadcast activation immediately to Real-Time Hub AND persist to Firestore
+    await syncUserToRealtimeHub(activatedProfile);
+
     try {
-      await setDoc(
-        userRef,
-        {
-          ...activatedProfile,
-          loginTerakhir: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
+      await fetchWithTimeout(
+        setDoc(
+          userRef,
+          {
+            ...activatedProfile,
+            loginTerakhir: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        ).then(() => reportFirestoreWriteResult(true)),
+        3500,
+        null
       );
     } catch (dbErr) {
+      reportFirestoreWriteResult(false, dbErr);
       console.warn("Notice updating verified activation to Firestore:", dbErr);
     }
 
@@ -1167,7 +1361,7 @@ const removeDeletedTenantEmail = (email: string) => {
       window.dispatchEvent(new CustomEvent("sisper_user_registered", { detail: activatedProfile }));
     } catch {}
 
-    // 4. Sync active device presence immediately to /devices & /users/{uid}/devices
+    // 4. Sync active device presence immediately to Real-Time Hub & Firestore /devices
     await syncDeviceToFirestore({
       sessionState: "active",
       userUid: customUid,
@@ -1177,6 +1371,7 @@ const removeDeletedTenantEmail = (email: string) => {
       peran: activatedProfile.peran,
       statusPersetujuan: "aktif",
       isOnline: true,
+      forceFirestore: true,
     });
 
     // 5. Auto-login into fresh empty workspace so account is immediately active & usable
@@ -1367,6 +1562,39 @@ const removeDeletedTenantEmail = (email: string) => {
         console.warn("Pemeriksaan Firestore notice, menggunakan cache lokal/auto-provisioning:", dbErr);
       }
       
+      // 2b. Check Real-Time Sync Hub so accounts registered/updated on another device (e.g. mobile) are always found
+      try {
+        const hubData = await fetchUserFromRealtimeHub(lowerEmail, customUid);
+        if (hubData) {
+          const hubSandi = hubData.sandi ? String(hubData.sandi).trim() : "";
+          if (!remoteSandi && hubSandi) {
+            remoteSandi = hubSandi;
+          }
+          const hubUpdatedMs = new Date(hubData.updatedAt || 0).getTime();
+          const curUpdatedMs = new Date(
+            typeof data?.updatedAt === "string"
+              ? data.updatedAt
+              : data?.updatedAt?.seconds
+              ? data.updatedAt.seconds * 1000
+              : 0
+          ).getTime();
+          if (!data || hubUpdatedMs >= curUpdatedMs) {
+            data = {
+              ...(data || {}),
+              ...hubData,
+              sandi: hubSandi || localSandi || remoteSandi,
+            };
+          } else {
+            data = {
+              ...hubData,
+              ...data,
+              sandi: localSandi || remoteSandi || hubSandi,
+            };
+          }
+          localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(data));
+        }
+      } catch {}
+
       // 3. Ensure user account exists
       if (!data) {
         throw new Error(`Email "${lowerEmail}" belum terdaftar di sistem. Silakan lakukan pendaftaran akun baru terlebih dahulu.`);
@@ -1426,22 +1654,8 @@ const removeDeletedTenantEmail = (email: string) => {
         throw new Error(`Masa aktif akun Anda telah berakhir pada ${data.berakhirPada}. Silakan hubungi Administrator untuk memperpanjang masa aktif.`);
       }
 
-      updateSession({
-        uid: customUid,
-        email: data.email,
-        displayName: data.namaLengkap,
-        emailVerified: true
-      } as any, data);
-      
-      // Background non-blocking timestamp + active device update
-      setDoc(userRef, {
-        loginTerakhir: serverTimestamp(),
-        updatedAt: serverTimestamp()
-      }, { merge: true }).catch((err) => {
-        console.warn("Gagal sinkron login terakhir ke Firestore:", err);
-      });
-
-      syncDeviceToFirestore({
+      const loginNowIso = new Date().toISOString();
+      const loginDeviceRecord = await buildDeviceRecord({
         sessionState: "active",
         userUid: customUid,
         userEmail: data.email,
@@ -1450,7 +1664,67 @@ const removeDeletedTenantEmail = (email: string) => {
         peran: data.peran || "USER",
         statusPersetujuan: data.statusPersetujuan || "aktif",
         isOnline: true,
-      }).catch(() => {});
+      });
+      const loginCompactDevice = toCompactDeviceSummary(loginDeviceRecord);
+
+      const enrichedLoginData = {
+        ...data,
+        uid: customUid,
+        loginTerakhir: loginNowIso,
+        updatedAt: loginNowIso,
+        lastDevice: loginCompactDevice,
+        lastDeviceLabel: formatDeviceShortLabel(loginCompactDevice),
+        lastDeviceId: loginDeviceRecord.deviceId,
+        lastDeviceSeenAt: loginNowIso,
+      };
+
+      localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(enrichedLoginData));
+
+      updateSession({
+        uid: customUid,
+        email: enrichedLoginData.email,
+        displayName: enrichedLoginData.namaLengkap,
+        emailVerified: true
+      } as any, enrichedLoginData);
+
+      // Push immediately to Real-Time Sync Hub so mobile login appears on laptop Admin Panel in <1s
+      await Promise.all([
+        syncUserToRealtimeHub(enrichedLoginData),
+        syncDeviceToFirestore({
+          sessionState: "active",
+          userUid: customUid,
+          userEmail: enrichedLoginData.email,
+          userName: enrichedLoginData.namaLengkap,
+          namaSPPG: enrichedLoginData.namaSPPG,
+          peran: enrichedLoginData.peran || "USER",
+          statusPersetujuan: enrichedLoginData.statusPersetujuan || "aktif",
+          isOnline: true,
+          forceFirestore: true,
+        }),
+      ]);
+
+      // Persist timestamp + device to Firestore (with short timeout so mobile login never stalls)
+      fetchWithTimeout(
+        setDoc(
+          userRef,
+          {
+            lastDevice: loginCompactDevice,
+            lastDeviceLabel: formatDeviceShortLabel(loginCompactDevice),
+            lastDeviceId: loginDeviceRecord.deviceId,
+            lastDeviceSeenAt: loginNowIso,
+            loginTerakhir: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+          { merge: true }
+        )
+          .then(() => reportFirestoreWriteResult(true))
+          .catch((err) => {
+            reportFirestoreWriteResult(false, err);
+            console.warn("Gagal sinkron login terakhir ke Firestore:", err);
+          }),
+        3000,
+        null
+      );
       
     } catch (error: any) {
       console.error("Gagal masuk:", error);
@@ -1491,6 +1765,10 @@ const removeDeletedTenantEmail = (email: string) => {
       }
     }
 
+    if (!data) {
+      data = await fetchUserFromRealtimeHub(lowerEmail, customUid);
+    }
+
     if (!data && !isMainAdminEmail(lowerEmail)) {
       throw new Error(`Email "${lowerEmail}" tidak ditemukan di sistem.`);
     }
@@ -1501,16 +1779,22 @@ const removeDeletedTenantEmail = (email: string) => {
     };
 
     if (data) {
-      const updatedData = { ...data, ...updates };
+      const updatedData = { ...data, ...updates, uid: customUid, email: lowerEmail };
       localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(updatedData));
       if (data.uid) {
         localStorage.setItem(`offline_user_${data.uid}`, JSON.stringify(updatedData));
       }
+      await syncUserToRealtimeHub(updatedData);
     }
 
     try {
-      await setDoc(userRef, updates, { merge: true });
+      await fetchWithTimeout(
+        setDoc(userRef, updates, { merge: true }).then(() => reportFirestoreWriteResult(true)),
+        3000,
+        null
+      );
     } catch (e) {
+      reportFirestoreWriteResult(false, e);
       console.warn("Sinkronkan Firestore reset sandi tertunda:", e);
     }
 
@@ -1547,18 +1831,32 @@ const removeDeletedTenantEmail = (email: string) => {
     if (!user || isDemo) return;
     const isApproved = userProfile?.statusPersetujuan === "aktif";
     if (!isApproved) return;
-    
+
+    const serializedData = typeof data === "string" ? data : JSON.stringify(data);
+    const cacheKey = `${user.uid}:${key}`;
+    // Skip redundant Firestore writes when data has not changed since last load/save
+    if (lastSyncedCloudPayload.get(cacheKey) === serializedData) {
+      return;
+    }
+
     const stateRef = doc(db, "users", user.uid, "states", key);
-    const path = `users/${user.uid}/states/${key}`;
     try {
-      const serializedData = typeof data === "string" ? data : JSON.stringify(data);
-      await fetchWithTimeout(setDoc(stateRef, {
-        userId: user.uid,
-        stateKey: key,
-        data: serializedData,
-        updatedAt: serverTimestamp()
-      }), 2000, null);
+      await fetchWithTimeout(
+        setDoc(stateRef, {
+          userId: user.uid,
+          stateKey: key,
+          data: serializedData,
+          updatedAt: serverTimestamp(),
+        })
+          .then(() => {
+            lastSyncedCloudPayload.set(cacheKey, serializedData);
+            reportFirestoreWriteResult(true);
+          }),
+        2500,
+        null
+      );
     } catch (error: any) {
+      reportFirestoreWriteResult(false, error);
       console.warn(`Firestore state save notice (${key}) - fallback ke penyimpanan lokal:`, error);
     }
   };
@@ -1570,16 +1868,21 @@ const removeDeletedTenantEmail = (email: string) => {
 
     const stateRef = doc(db, "users", user.uid, "states", key);
     try {
-      const snap: any = await fetchWithTimeout(getDoc(stateRef), 2000, null);
+      const snap: any = await fetchWithTimeout(getDoc(stateRef), 2500, null);
       if (snap && snap.exists()) {
         const rawData = snap.data().data;
+        const cacheKey = `${user.uid}:${key}`;
         if (typeof rawData === "string") {
+          lastSyncedCloudPayload.set(cacheKey, rawData);
           try {
             return JSON.parse(rawData);
-          } catch (e) {
+          } catch {
             return rawData;
           }
         }
+        try {
+          lastSyncedCloudPayload.set(cacheKey, JSON.stringify(rawData));
+        } catch {}
         return rawData;
       }
     } catch (error: any) {

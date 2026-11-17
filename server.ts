@@ -251,10 +251,175 @@ const sendVerificationEmail = async (params: {
   return { delivered: false, provider: "preview" };
 };
 
+const REALTIME_CACHE_FILE = path.join("/tmp", "sispermbg_realtime_hub_v1.json");
+const realtimeUsers = new Map<string, Record<string, any>>();
+const realtimeDevices = new Map<string, Record<string, any>>();
+const sseClients = new Set<express.Response>();
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+const loadRealtimeCacheFromDisk = () => {
+  try {
+    if (!fs.existsSync(REALTIME_CACHE_FILE)) return;
+    const raw = fs.readFileSync(REALTIME_CACHE_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.users)) {
+      parsed.users.forEach((u: any) => {
+        if (u && typeof u.uid === "string" && u.uid) {
+          realtimeUsers.set(u.uid, u);
+        }
+      });
+    }
+    if (Array.isArray(parsed?.devices)) {
+      parsed.devices.forEach((d: any) => {
+        if (d && typeof d.deviceId === "string" && d.deviceId) {
+          realtimeDevices.set(d.deviceId, d);
+        }
+      });
+    }
+  } catch (err) {
+    console.warn("[RealtimeHub] Notice loading cache:", err);
+  }
+};
+
+const schedulePersistRealtimeCache = () => {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    try {
+      const payload = {
+        updatedAt: new Date().toISOString(),
+        users: Array.from(realtimeUsers.values()).slice(0, 500),
+        devices: Array.from(realtimeDevices.values()).slice(0, 500),
+      };
+      fs.writeFileSync(REALTIME_CACHE_FILE, JSON.stringify(payload), "utf8");
+    } catch (err) {
+      console.warn("[RealtimeHub] Notice writing cache:", err);
+    }
+  }, 300);
+};
+
+const broadcastRealtimeEvent = (eventType: string, payload: unknown) => {
+  if (sseClients.size === 0) return;
+  const serialized = `event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const client of sseClients) {
+    try {
+      client.write(serialized);
+    } catch {
+      sseClients.delete(client);
+    }
+  }
+};
+
+const parseJsonBodySafe = (body: unknown): Record<string, any> => {
+  if (body && typeof body === "object") return body as Record<string, any>;
+  if (typeof body === "string" && body.trim()) {
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed && typeof parsed === "object") return parsed as Record<string, any>;
+    } catch {}
+  }
+  return {};
+};
+
+const clampField = (val: unknown, maxLen: number): string => {
+  if (typeof val !== "string") return "";
+  return val.trim().slice(0, maxLen);
+};
+
+const sanitizeRealtimeUser = (raw: Record<string, any>): Record<string, any> | null => {
+  const email = normalizeEmail(raw.email);
+  const uid = clampField(raw.uid || raw.id || (email ? `custom_user_${email.replace(/[@.]/g, "_")}` : ""), 128);
+  if (!uid || !email) return null;
+  const nowIso = new Date().toISOString();
+  const prev = realtimeUsers.get(uid) || {};
+  const merged: Record<string, any> = {
+    ...prev,
+    uid,
+    id: uid,
+    email,
+    namaLengkap: clampField(raw.namaLengkap ?? prev.namaLengkap ?? "", 160),
+    profesi: clampField(raw.profesi ?? prev.profesi ?? "", 120),
+    namaSPPG: clampField(raw.namaSPPG ?? prev.namaSPPG ?? "", 160),
+    noHp: clampField(raw.noHp ?? prev.noHp ?? "", 40),
+    peran: clampField(raw.peran ?? prev.peran ?? "USER", 32) || "USER",
+    statusPersetujuan: clampField(raw.statusPersetujuan ?? prev.statusPersetujuan ?? "menunggu", 32) || "menunggu",
+    berakhirPada: clampField(raw.berakhirPada ?? prev.berakhirPada ?? "", 32),
+    emailVerified: typeof raw.emailVerified === "boolean" ? raw.emailVerified : Boolean(prev.emailVerified),
+    verificationStatus: clampField(raw.verificationStatus ?? prev.verificationStatus ?? "", 32) || undefined,
+    emailVerifiedAt: clampField(raw.emailVerifiedAt ?? prev.emailVerifiedAt ?? "", 64) || undefined,
+    activatedBy: clampField(raw.activatedBy ?? prev.activatedBy ?? "", 40) || undefined,
+    lastDeviceId: clampField(raw.lastDeviceId ?? prev.lastDeviceId ?? "", 64) || undefined,
+    lastDeviceLabel: clampField(raw.lastDeviceLabel ?? prev.lastDeviceLabel ?? "", 160) || undefined,
+    lastDeviceSeenAt: clampField(raw.lastDeviceSeenAt ?? prev.lastDeviceSeenAt ?? "", 64) || undefined,
+    lastDevice: raw.lastDevice && typeof raw.lastDevice === "object" ? raw.lastDevice : prev.lastDevice,
+    createdAt: typeof raw.createdAt === "string" && raw.createdAt ? raw.createdAt : prev.createdAt || nowIso,
+    updatedAt: nowIso,
+    loginTerakhir:
+      raw.loginTerakhir === null
+        ? prev.loginTerakhir ?? null
+        : typeof raw.loginTerakhir === "string" && raw.loginTerakhir
+        ? raw.loginTerakhir
+        : prev.loginTerakhir ?? null,
+  };
+  if (typeof raw.sandi === "string" && raw.sandi.trim()) {
+    merged.sandi = raw.sandi.trim().slice(0, 128);
+  }
+  return merged;
+};
+
+const sanitizeRealtimeDevice = (raw: Record<string, any>, observedIp: string): Record<string, any> | null => {
+  const deviceId = clampField(raw.deviceId, 64);
+  if (!deviceId || !/^[a-zA-Z0-9_-]+$/.test(deviceId)) return null;
+  const prev = realtimeDevices.get(deviceId) || {};
+  const nowIso = new Date().toISOString();
+  const validTypes = new Set(["Mobile", "Tablet", "Desktop / Laptop"]);
+  const validStates = new Set(["guest", "registering", "active", "demo"]);
+  const deviceType = validTypes.has(raw.deviceType) ? raw.deviceType : (prev.deviceType || "Desktop / Laptop");
+  const sessionState = validStates.has(raw.sessionState) ? raw.sessionState : (prev.sessionState || "guest");
+
+  const resolvedIp =
+    observedIp && observedIp !== "Terdeteksi Otomatis"
+      ? observedIp
+      : clampField(raw.ipAddress ?? prev.ipAddress ?? "Terdeteksi", 64);
+
+  return {
+    ...prev,
+    deviceId,
+    deviceType,
+    deviceModel: clampField(raw.deviceModel ?? prev.deviceModel ?? deviceType, 100),
+    osName: clampField(raw.osName ?? prev.osName ?? "Tidak Diketahui", 80),
+    browserName: clampField(raw.browserName ?? prev.browserName ?? "Browser Web", 80),
+    screenResolution: clampField(raw.screenResolution ?? prev.screenResolution ?? "-", 40),
+    viewportSize: clampField(raw.viewportSize ?? prev.viewportSize ?? "-", 40),
+    language: clampField(raw.language ?? prev.language ?? "id-ID", 32),
+    timezone: clampField(raw.timezone ?? prev.timezone ?? "Asia/Jakarta", 80),
+    ipAddress: resolvedIp,
+    userAgent: clampField(raw.userAgent ?? prev.userAgent ?? "", 320),
+    sessionState,
+    userUid: raw.userUid === null ? null : clampField(raw.userUid ?? prev.userUid ?? "", 128) || null,
+    userEmail:
+      raw.userEmail === null
+        ? null
+        : normalizeEmail(raw.userEmail ?? prev.userEmail ?? "") || null,
+    userName: raw.userName === null ? null : clampField(raw.userName ?? prev.userName ?? "", 160) || null,
+    namaSPPG: raw.namaSPPG === null ? null : clampField(raw.namaSPPG ?? prev.namaSPPG ?? "", 160) || null,
+    peran: raw.peran === null ? null : clampField(raw.peran ?? prev.peran ?? "", 32) || null,
+    statusPersetujuan:
+      raw.statusPersetujuan === null
+        ? null
+        : clampField(raw.statusPersetujuan ?? prev.statusPersetujuan ?? "", 32) || null,
+    isOnline: typeof raw.isOnline === "boolean" ? raw.isOnline : true,
+    firstSeenAt: clampField(raw.firstSeenAt ?? prev.firstSeenAt ?? nowIso, 64) || nowIso,
+    lastSeenAt: nowIso,
+  };
+};
+
 async function startServer() {
+  loadRealtimeCacheFromDisk();
   const app = express();
   app.set("trust proxy", true);
   app.use(express.json({ limit: "2mb" }));
+  app.use(express.text({ type: "text/plain", limit: "1mb" }));
 
   // Periodic cleanup of expired OTP challenges
   setInterval(() => {
@@ -276,6 +441,124 @@ async function startServer() {
       userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"].slice(0, 280) : "",
       serverTime: new Date().toISOString(),
     });
+  });
+
+  // 1b. Cross-Device Real-Time Sync Hub (SSE + Snapshot + Upsert/Delete)
+  // Ensures Mobile -> Laptop Admin Panel updates arrive in <1s even if Firestore free daily quota hits limit
+  app.get("/api/realtime/stream", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
+    }
+
+    sseClients.add(res);
+    const initialSnapshot = {
+      users: Array.from(realtimeUsers.values()),
+      devices: Array.from(realtimeDevices.values()),
+      serverTime: new Date().toISOString(),
+    };
+    res.write(`event: snapshot\ndata: ${JSON.stringify(initialSnapshot)}\n\n`);
+
+    const keepAlive = setInterval(() => {
+      try {
+        res.write(`: keepalive ${Date.now()}\n\n`);
+      } catch {
+        clearInterval(keepAlive);
+        sseClients.delete(res);
+      }
+    }, 20_000);
+
+    req.on("close", () => {
+      clearInterval(keepAlive);
+      sseClients.delete(res);
+    });
+  });
+
+  app.get("/api/realtime/snapshot", (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      ok: true,
+      users: Array.from(realtimeUsers.values()),
+      devices: Array.from(realtimeDevices.values()),
+      connectedListeners: sseClients.size,
+      serverTime: new Date().toISOString(),
+    });
+  });
+
+  app.get("/api/realtime/user", (req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const email = normalizeEmail(req.query.email);
+    const uid = clampField(req.query.uid, 128);
+    let found: Record<string, any> | null = null;
+    if (uid && realtimeUsers.has(uid)) {
+      found = realtimeUsers.get(uid) || null;
+    }
+    if (!found && email) {
+      for (const u of realtimeUsers.values()) {
+        if (normalizeEmail(u.email) === email) {
+          found = u;
+          break;
+        }
+      }
+    }
+    res.json({ ok: true, user: found });
+  });
+
+  app.post("/api/realtime/sync-user", (req, res) => {
+    const body = parseJsonBodySafe(req.body);
+    const sanitized = sanitizeRealtimeUser(body);
+    if (!sanitized) {
+      res.status(400).json({ ok: false, error: "Data pengguna tidak valid." });
+      return;
+    }
+    realtimeUsers.set(sanitized.uid, sanitized);
+    schedulePersistRealtimeCache();
+    broadcastRealtimeEvent("user_upsert", sanitized);
+    res.json({ ok: true, user: sanitized, serverTime: new Date().toISOString() });
+  });
+
+  app.post("/api/realtime/delete-user", (req, res) => {
+    const body = parseJsonBodySafe(req.body);
+    const uid = clampField(body.uid, 128);
+    const email = normalizeEmail(body.email);
+    const removedUids: string[] = [];
+    for (const [k, u] of realtimeUsers.entries()) {
+      if ((uid && (k === uid || u.uid === uid)) || (email && normalizeEmail(u.email) === email)) {
+        realtimeUsers.delete(k);
+        removedUids.push(k);
+      }
+    }
+    schedulePersistRealtimeCache();
+    broadcastRealtimeEvent("user_delete", { uid, email, removedUids });
+    res.json({ ok: true, removedUids });
+  });
+
+  app.post("/api/realtime/sync-device", (req, res) => {
+    const body = parseJsonBodySafe(req.body);
+    const observedIp = extractClientIp(req);
+    const sanitized = sanitizeRealtimeDevice(body, observedIp);
+    if (!sanitized) {
+      res.status(400).json({ ok: false, error: "Data perangkat tidak valid." });
+      return;
+    }
+    realtimeDevices.set(sanitized.deviceId, sanitized);
+    schedulePersistRealtimeCache();
+    broadcastRealtimeEvent("device_upsert", sanitized);
+    res.json({ ok: true, device: sanitized, serverTime: new Date().toISOString() });
+  });
+
+  app.post("/api/realtime/delete-device", (req, res) => {
+    const body = parseJsonBodySafe(req.body);
+    const deviceId = clampField(body.deviceId, 64);
+    if (deviceId) {
+      realtimeDevices.delete(deviceId);
+      schedulePersistRealtimeCache();
+      broadcastRealtimeEvent("device_delete", { deviceId });
+    }
+    res.json({ ok: true, deviceId });
   });
 
   // 2. Send 6-Digit Email Verification Code on Registration

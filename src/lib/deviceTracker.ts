@@ -1,5 +1,5 @@
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
-import { db } from "./firebase.ts";
+import { db, reportFirestoreWriteResult } from "./firebase.ts";
 
 export type DeviceSessionState = "guest" | "registering" | "active" | "demo";
 
@@ -50,14 +50,24 @@ export interface DeviceSyncContext {
   peran?: string | null;
   statusPersetujuan?: string | null;
   isOnline?: boolean;
+  forceFirestore?: boolean;
+  useBeacon?: boolean;
 }
 
 const DEVICE_ID_STORAGE_KEY = "sisper_device_id";
 const DEVICE_FIRST_SEEN_KEY = "sisper_device_first_seen";
 const DEVICE_CACHE_KEY = "sisper_current_device_info";
 
+// In-memory fallbacks for restricted mobile Private Mode / WebViews where localStorage may throw
+let inMemoryDeviceId: string | null = null;
+let inMemoryFirstSeenAt: string | null = null;
 let cachedServerMeta: { ipAddress: string } | null = null;
 let serverMetaPromise: Promise<{ ipAddress: string }> | null = null;
+
+// Quota protection: track last Firestore write signature & time so heartbeats do NOT exhaust free daily write units
+let lastFirestoreDeviceSig = "";
+let lastFirestoreDeviceWriteMs = 0;
+const FIRESTORE_DEVICE_THROTTLE_MS = 5 * 60 * 1000; // Max once every 5 minutes unless session state / user changes
 
 const clampStr = (val: unknown, maxLen: number): string => {
   if (typeof val !== "string") return "";
@@ -65,9 +75,12 @@ const clampStr = (val: unknown, maxLen: number): string => {
 };
 
 export const getOrCreateDeviceId = (): string => {
+  if (inMemoryDeviceId) return inMemoryDeviceId;
+
   try {
     const existing = localStorage.getItem(DEVICE_ID_STORAGE_KEY);
     if (existing && /^[a-zA-Z0-9_-]{8,64}$/.test(existing)) {
+      inMemoryDeviceId = existing;
       return existing;
     }
   } catch {}
@@ -84,6 +97,7 @@ export const getOrCreateDeviceId = (): string => {
   }
 
   const newId = `dev_${randomPart}`.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48);
+  inMemoryDeviceId = newId;
   try {
     localStorage.setItem(DEVICE_ID_STORAGE_KEY, newId);
   } catch {}
@@ -91,14 +105,21 @@ export const getOrCreateDeviceId = (): string => {
 };
 
 const getOrCreateFirstSeenAt = (): string => {
+  if (inMemoryFirstSeenAt) return inMemoryFirstSeenAt;
   try {
     const existing = localStorage.getItem(DEVICE_FIRST_SEEN_KEY);
-    if (existing) return existing;
+    if (existing) {
+      inMemoryFirstSeenAt = existing;
+      return existing;
+    }
     const now = new Date().toISOString();
+    inMemoryFirstSeenAt = now;
     localStorage.setItem(DEVICE_FIRST_SEEN_KEY, now);
     return now;
   } catch {
-    return new Date().toISOString();
+    const now = new Date().toISOString();
+    inMemoryFirstSeenAt = now;
+    return now;
   }
 };
 
@@ -242,7 +263,9 @@ export const buildDeviceRecord = async (context: DeviceSyncContext): Promise<Dev
   const firstSeenAt = getOrCreateFirstSeenAt();
   const nowIso = new Date().toISOString();
   const clientInfo = detectClientDeviceInfo();
-  const serverMeta = await fetchServerDeviceMeta();
+  const serverMeta = context.useBeacon
+    ? cachedServerMeta || { ipAddress: "Terdeteksi" }
+    : await fetchServerDeviceMeta();
 
   return {
     deviceId,
@@ -282,64 +305,125 @@ export const toCompactDeviceSummary = (record: DeviceRecord): CompactDeviceSumma
   isOnline: record.isOnline,
 });
 
-export const formatDeviceShortLabel = (d?: Partial<DeviceRecord> | Partial<CompactDeviceSummary> | null): string => {
+export const formatDeviceShortLabel = (
+  d?: Partial<DeviceRecord> | Partial<CompactDeviceSummary> | null
+): string => {
   if (!d) return "-";
   const parts = [d.deviceModel || d.osName, d.browserName].filter(Boolean);
   return parts.join(" · ") || "Perangkat Web";
 };
 
-export const syncDeviceToFirestore = async (context: DeviceSyncContext): Promise<DeviceRecord | null> => {
+const syncDeviceToRealtimeServer = async (
+  record: DeviceRecord,
+  useBeacon = false
+): Promise<DeviceRecord | null> => {
+  try {
+    const serialized = JSON.stringify(record);
+    if (useBeacon && typeof navigator !== "undefined" && typeof navigator.sendBeacon === "function") {
+      navigator.sendBeacon("/api/realtime/sync-device", new Blob([serialized], { type: "text/plain" }));
+      return record;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 4500);
+    const resp = await fetch("/api/realtime/sync-device", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: serialized,
+      keepalive: true,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (resp.ok) {
+      const json = await resp.json().catch(() => null);
+      if (json?.device?.ipAddress) {
+        cachedServerMeta = { ipAddress: json.device.ipAddress };
+        return json.device as DeviceRecord;
+      }
+    }
+  } catch {
+    // Non-fatal fallback
+  }
+  return record;
+};
+
+export const syncDeviceToFirestore = async (
+  context: DeviceSyncContext
+): Promise<DeviceRecord | null> => {
   try {
     const record = await buildDeviceRecord(context);
 
+    // 1. Always push to Express Real-Time Hub first so Mobile <-> Laptop Admin Panel updates in < 1 second
+    const syncedRecord = (await syncDeviceToRealtimeServer(record, Boolean(context.useBeacon))) || record;
+
     try {
-      localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(record));
+      localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(syncedRecord));
     } catch {}
 
     try {
-      window.dispatchEvent(new CustomEvent("sisper_device_updated", { detail: record }));
+      window.dispatchEvent(new CustomEvent("sisper_device_updated", { detail: syncedRecord }));
     } catch {}
 
-    // 1. Write to top-level /devices/{deviceId} so AdminPanel reads EVERY device live
-    const deviceDocRef = doc(db, "devices", record.deviceId);
-    const firestorePayload = {
-      ...record,
-      updatedAt: serverTimestamp(),
-    };
-
-    const writeTasks: Promise<unknown>[] = [
-      setDoc(deviceDocRef, firestorePayload, { merge: true }).catch((err) => {
-        console.warn("Notice syncing device to /devices:", err);
-      }),
-    ];
-
-    // 2. Also mirror device onto the authenticated user's profile & /users/{uid}/devices/{deviceId}
-    if (record.userUid && record.userUid !== "demo_user_5min") {
-      const compact = toCompactDeviceSummary(record);
-      const userDeviceRef = doc(db, "users", record.userUid, "devices", record.deviceId);
-      const userRef = doc(db, "users", record.userUid);
-
-      writeTasks.push(
-        setDoc(userDeviceRef, firestorePayload, { merge: true }).catch((err) => {
-          console.warn("Notice syncing user device subcollection:", err);
-        }),
-        setDoc(
-          userRef,
-          {
-            lastDevice: compact,
-            lastDeviceLabel: formatDeviceShortLabel(compact),
-            lastDeviceId: record.deviceId,
-            lastDeviceSeenAt: record.lastSeenAt,
-          },
-          { merge: true }
-        ).catch((err) => {
-          console.warn("Notice updating lastDevice on user profile:", err);
-        })
-      );
+    // Skip Firestore write during synchronous pagehide beacon to avoid mobile abort noise
+    if (context.useBeacon) {
+      return syncedRecord;
     }
 
-    await Promise.all(writeTasks);
-    return record;
+    // 2. Quota-smart Firestore sync: only write to Firestore when session/user changes, forced, or > 5 mins elapsed
+    const stateSig = `${syncedRecord.sessionState}|${syncedRecord.userUid || ""}|${syncedRecord.userEmail || ""}|${syncedRecord.statusPersetujuan || ""}|${syncedRecord.isOnline}`;
+    const nowMs = Date.now();
+    const shouldWriteFirestore =
+      Boolean(context.forceFirestore) ||
+      stateSig !== lastFirestoreDeviceSig ||
+      nowMs - lastFirestoreDeviceWriteMs >= FIRESTORE_DEVICE_THROTTLE_MS;
+
+    if (shouldWriteFirestore) {
+      lastFirestoreDeviceSig = stateSig;
+      lastFirestoreDeviceWriteMs = nowMs;
+
+      const deviceDocRef = doc(db, "devices", syncedRecord.deviceId);
+      const firestorePayload = {
+        ...syncedRecord,
+        updatedAt: serverTimestamp(),
+      };
+
+      const writeTasks: Promise<unknown>[] = [
+        setDoc(deviceDocRef, firestorePayload, { merge: true })
+          .then(() => reportFirestoreWriteResult(true))
+          .catch((err) => {
+            reportFirestoreWriteResult(false, err);
+            console.warn("Notice syncing device to /devices:", err);
+          }),
+      ];
+
+      // Mirror compact lastDevice onto /users/{uid} ONLY when explicitly forced (register/verify/login)
+      if (context.forceFirestore && syncedRecord.userUid && syncedRecord.userUid !== "demo_user_5min") {
+        const compact = toCompactDeviceSummary(syncedRecord);
+        const userRef = doc(db, "users", syncedRecord.userUid);
+        writeTasks.push(
+          setDoc(
+            userRef,
+            {
+              lastDevice: compact,
+              lastDeviceLabel: formatDeviceShortLabel(compact),
+              lastDeviceId: syncedRecord.deviceId,
+              lastDeviceSeenAt: syncedRecord.lastSeenAt,
+            },
+            { merge: true }
+          ).catch((err) => {
+            reportFirestoreWriteResult(false, err);
+            console.warn("Notice updating lastDevice on user profile:", err);
+          })
+        );
+      }
+
+      await Promise.race([
+        Promise.all(writeTasks),
+        new Promise((resolve) => setTimeout(resolve, 3500)),
+      ]);
+    }
+
+    return syncedRecord;
   } catch (err) {
     console.warn("Notice during automatic device sync:", err);
     return null;

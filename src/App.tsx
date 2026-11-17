@@ -177,8 +177,13 @@ export default function App() {
     const hasTkpi2020 = incoming.some((t) => typeof t.no === "number" && t.no >= 100);
     if (hasTkpi2020) return incoming;
     const refIds = new Set(INITIAL_TKPI_DATABASE.map((i) => i.id));
-    const customOnly = incoming.filter((i) => i.isCustom === true && !refIds.has(i.id));
+    const customOnly = incoming.filter((i) => !refIds.has(i.id) || i.isCustom === true);
     return [...INITIAL_TKPI_DATABASE, ...customOnly];
+  };
+
+  const extractCustomTkpiDelta = (list: TKPIItem[]): TKPIItem[] => {
+    const refIds = new Set(INITIAL_TKPI_DATABASE.map((i) => i.id));
+    return list.filter((i) => i.isCustom === true || !refIds.has(i.id));
   };
 
   const [tkpiList, setTkpiList] = useState<TKPIItem[]>(() => {
@@ -706,13 +711,13 @@ export default function App() {
             });
           }
 
-          // New users (non-main-admin) always begin with completely empty worksheets until they fill them
+          // New users (non-main-admin) always begin with completely empty worksheets until they fill them.
+          // Do NOT blindly write 14 default documents on login — data is written to Firestore only when modified.
           if (cloudProfile) {
             setProfile(cloudProfile);
           } else {
             const initialProfile = isMainAdminAccount ? INITIAL_SPPG_PROFILE : EMPTY_SPPG_PROFILE;
             setProfile(initialProfile);
-            await saveStateToCloud("profile", initialProfile);
           }
 
           if (cloudSekolah) {
@@ -720,7 +725,6 @@ export default function App() {
           } else {
             const initialSekolah = isMainAdminAccount ? INITIAL_SEKOLAH_PM : EMPTY_SEKOLAH_PM;
             setSekolahPM(initialSekolah);
-            await saveStateToCloud("sekolah", initialSekolah);
           }
 
           if (cloudTigab) {
@@ -728,7 +732,6 @@ export default function App() {
           } else {
             const initialTigab = isMainAdminAccount ? INITIAL_TIGAB_PM : EMPTY_TIGAB_PM;
             setTigaBPM(initialTigab);
-            await saveStateToCloud("tigab", initialTigab);
           }
 
           if (cloudHarianPM) {
@@ -736,7 +739,6 @@ export default function App() {
           } else {
             const initialHarian = isMainAdminAccount ? INITIAL_HARIAN_PM : EMPTY_HARIAN_PM;
             setHarianPM(initialHarian);
-            await saveStateToCloud("harianPM", initialHarian);
           }
 
           if (cloudMenu) {
@@ -744,7 +746,6 @@ export default function App() {
           } else {
             const initialMenu = isMainAdminAccount ? INITIAL_MASTER_MENU : EMPTY_MASTER_MENU;
             setMasterMenu(initialMenu);
-            await saveStateToCloud("menu", initialMenu);
           }
 
           if (cloudFoodCost) {
@@ -752,7 +753,6 @@ export default function App() {
           } else {
             const initialFoodCost = isMainAdminAccount ? INITIAL_FOOD_COST_DAYS : EMPTY_FOOD_COST_DAYS;
             setFoodCostDays(initialFoodCost);
-            await saveStateToCloud("foodCost", initialFoodCost);
           }
 
           if (cloudTkpi) {
@@ -774,21 +774,18 @@ export default function App() {
             } catch (e) {}
 
             setTkpiList(defaultTkpi);
-            await saveStateToCloud("tkpi", defaultTkpi);
           }
 
           if (cloudKopLine1) {
             setKopLine1(cloudKopLine1);
           } else {
             setKopLine1("BADAN GIZI NASIONAL");
-            await saveStateToCloud("kopLine1", "BADAN GIZI NASIONAL");
           }
 
           if (cloudKopLine2) {
             setKopLine2(cloudKopLine2);
           } else {
             setKopLine2("SATUAN PELAYANAN PEMENUHAN GIZI");
-            await saveStateToCloud("kopLine2", "SATUAN PELAYANAN PEMENUHAN GIZI");
           }
 
           if (cloudKopLine3 !== null && cloudKopLine3 !== undefined) {
@@ -796,7 +793,6 @@ export default function App() {
           } else {
             const defaultKop3 = isMainAdminAccount ? "SPPG MUNA BARAT SAWERIGADI ONDOKE" : "";
             setKopLine3(defaultKop3);
-            await saveStateToCloud("kopLine3", defaultKop3);
           }
 
           if (cloudKopLine4 !== null && cloudKopLine4 !== undefined) {
@@ -804,7 +800,6 @@ export default function App() {
           } else {
             const defaultKop4 = isMainAdminAccount ? "Alamat : Jln. Poros Lagadi-Tondasi, Desa Ondoke, Kec. Sawerigadi, Kab. Muna Barat" : "";
             setKopLine4(defaultKop4);
-            await saveStateToCloud("kopLine4", defaultKop4);
           }
 
           if (cloudCekGiziItems) {
@@ -818,14 +813,12 @@ export default function App() {
                 ]
               : [];
             setCekGiziItems(defaultCekGizi);
-            await saveStateToCloud("cekGiziItems", defaultCekGizi);
           }
 
           if (cloudSavedPeriods) {
             setSavedPeriods(cloudSavedPeriods);
           } else {
             setSavedPeriods([]);
-            await saveStateToCloud("savedPeriods", []);
           }
 
           if (cloudPmSettings) {
@@ -838,7 +831,6 @@ export default function App() {
               porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"]
             };
             setPmSettings(defaultPmSettings);
-            await saveStateToCloud("pmSettings", defaultPmSettings);
           }
 
           if (!cancelled) {
@@ -897,7 +889,50 @@ export default function App() {
     loadedCloudUid === user.uid
   );
 
-  // Save states to local storage (only when logged in) and Cloud (only after initial load completes for current UID)
+  // Guard against firing 14 redundant Firestore writes on the exact render tick when cloud hydration completes
+  const syncedBaselineRef = React.useRef<Record<string, string>>({});
+  const lastBaselineUidRef = React.useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!canAutoSyncCloud || !user?.uid) {
+      if (!user?.uid) {
+        syncedBaselineRef.current = {};
+        lastBaselineUidRef.current = null;
+      }
+      return;
+    }
+    if (lastBaselineUidRef.current !== user.uid) {
+      lastBaselineUidRef.current = user.uid;
+      syncedBaselineRef.current = {
+        profile: JSON.stringify(profile),
+        sekolah: JSON.stringify(sekolahPM),
+        tigab: JSON.stringify(tigaBPM),
+        menu: JSON.stringify(masterMenu),
+        foodCost: JSON.stringify(foodCostDays),
+        harianPM: JSON.stringify(harianPM),
+        tkpi: JSON.stringify(extractCustomTkpiDelta(tkpiList)),
+        kopLine1: kopLine1,
+        kopLine2: kopLine2,
+        kopLine3: kopLine3,
+        kopLine4: kopLine4,
+        cekGiziItems: JSON.stringify(cekGiziItems),
+        savedPeriods: JSON.stringify(savedPeriods),
+        pmSettings: JSON.stringify(pmSettings),
+      };
+    }
+  }, [canAutoSyncCloud, user?.uid]);
+
+  const scheduleCloudSaveIfChanged = (key: string, value: any) => {
+    if (!canAutoSyncCloud || !user?.uid || lastBaselineUidRef.current !== user.uid) return null;
+    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    if (syncedBaselineRef.current[key] === serialized) return null;
+    return setTimeout(() => {
+      syncedBaselineRef.current[key] = serialized;
+      saveStateToCloud(key, value);
+    }, 1500);
+  };
+
+  // Save states to local storage (only when logged in) and Cloud (only when actually edited after hydration)
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("kop_left_logo_crop", JSON.stringify(leftLogoCrop));
@@ -908,55 +943,43 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_profile", JSON.stringify(profile));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("profile", profile), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("profile", profile);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, profile, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_sekolah", JSON.stringify(sekolahPM));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("sekolah", sekolahPM), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("sekolah", sekolahPM);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, sekolahPM, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_tigab", JSON.stringify(tigaBPM));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("tigab", tigaBPM), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("tigab", tigaBPM);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, tigaBPM, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_menu", JSON.stringify(masterMenu));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("menu", masterMenu), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("menu", masterMenu);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, masterMenu, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_food_cost", JSON.stringify(foodCostDays));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("foodCost", foodCostDays), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("foodCost", foodCostDays);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, foodCostDays, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_harian_pm", JSON.stringify(harianPM));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("harianPM", harianPM), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("harianPM", harianPM);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, harianPM, canAutoSyncCloud]);
 
   useEffect(() => {
@@ -965,15 +988,27 @@ export default function App() {
     if (isAdminUser) {
       localStorage.setItem("sisper_global_admin_tkpi", JSON.stringify(tkpiList));
     }
-    if (canAutoSyncCloud) {
+    if (canAutoSyncCloud && lastBaselineUidRef.current === user.uid) {
+      // Only persist custom/user-added TKPI rows (small delta) to Firestore — never re-upload 1,146 static TKPI 2020 rows
+      const customDelta =
+        localStorage.getItem("sisper_tkpi_cleared") === "true" && tkpiList.length === 0
+          ? []
+          : extractCustomTkpiDelta(tkpiList);
+      const serializedDelta = JSON.stringify(customDelta);
+      if (syncedBaselineRef.current.tkpi === serializedDelta) return;
       const timer = setTimeout(() => {
-        saveStateToCloud("tkpi", tkpiList);
+        syncedBaselineRef.current.tkpi = serializedDelta;
+        saveStateToCloud("tkpi", customDelta);
         if (isAdminUser) {
           try {
-            setDoc(doc(db, "global_settings", "tkpi"), {
-              data: JSON.stringify(tkpiList),
-              updatedAt: new Date().toISOString()
-            }, { merge: true });
+            setDoc(
+              doc(db, "global_settings", "tkpi"),
+              {
+                data: serializedDelta,
+                updatedAt: new Date().toISOString(),
+              },
+              { merge: true }
+            ).catch(() => {});
           } catch (e) {}
         }
       }, 1500);
@@ -984,64 +1019,50 @@ export default function App() {
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("kop_line1", kopLine1);
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("kopLine1", kopLine1), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("kopLine1", kopLine1);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, kopLine1, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("kop_line2", kopLine2);
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("kopLine2", kopLine2), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("kopLine2", kopLine2);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, kopLine2, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("kop_line3", kopLine3);
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("kopLine3", kopLine3), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("kopLine3", kopLine3);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, kopLine3, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("kop_line4", kopLine4);
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("kopLine4", kopLine4), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("kopLine4", kopLine4);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, kopLine4, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_cek_gizi_items", JSON.stringify(cekGiziItems));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("cekGiziItems", cekGiziItems), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("cekGiziItems", cekGiziItems);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, cekGiziItems, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_saved_periods", JSON.stringify(savedPeriods));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("savedPeriods", savedPeriods), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("savedPeriods", savedPeriods);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, savedPeriods, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
     localStorage.setItem("sisper_pm_settings", JSON.stringify(pmSettings));
-    if (canAutoSyncCloud) {
-      const timer = setTimeout(() => saveStateToCloud("pmSettings", pmSettings), 1500);
-      return () => clearTimeout(timer);
-    }
+    const timer = scheduleCloudSaveIfChanged("pmSettings", pmSettings);
+    return () => { if (timer) clearTimeout(timer); };
   }, [user, pmSettings, canAutoSyncCloud]);
 
   // Recipient totals (using Day 1 as default baseline display)
