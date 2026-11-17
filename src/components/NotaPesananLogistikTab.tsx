@@ -142,7 +142,7 @@ export default function NotaPesananLogistikTab({
   paperSize = "A4",
   setPaperSize = () => {},
 }: NotaPesananLogistikTabProps) {
-  const logoSrc = localStorage.getItem("sisper_custom_logo") || "/src/assets/images/logo_sppg_1782256222616.jpg";
+  const logoSrc = leftLogo || rightLogo || localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || "/src/assets/images/logo_sppg_1782256222616.jpg";
 
   const totalDays = Math.max(profile?.periodeDates?.length || 10, 1);
 
@@ -472,14 +472,14 @@ export default function NotaPesananLogistikTab({
         const last = formatIndonesianDate(datesList[datesList.length - 1]);
         setTanggal(`Gabungan Siklus: ${first} s.d. ${last}`);
       } else {
-        setTanggal("Gabungan 12 Hari, Periode Juli 2026");
+        setTanggal("");
       }
     } else {
       const defaultDateStr = profile.periodeDates[selectedDay - 1] || "";
       if (defaultDateStr) {
         setTanggal(formatIndonesianDate(defaultDateStr));
       } else {
-        setTanggal(`Hari Ke-${selectedDay}, Periode Juli 2026`);
+        setTanggal("");
       }
     }
   }, [selectedDay, selectedDays, mode, profile.periodeDates]);

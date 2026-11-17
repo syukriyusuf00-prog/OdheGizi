@@ -1653,7 +1653,7 @@ export default function FoodCostTab({
     );
   };
 
-  const logoSrc = customLogo || localStorage.getItem("sisper_custom_logo") || "/src/assets/images/logo_sppg_1782256222616.jpg";
+  const logoSrc = customLogo || localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || "/src/assets/images/logo_sppg_1782256222616.jpg";
 
   const handleExportExcel = () => {
     const wb = XLSX.utils.book_new();

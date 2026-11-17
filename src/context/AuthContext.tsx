@@ -24,6 +24,36 @@ const DEMO_UID = "demo_user_5min";
 const DEMO_EMAIL = "demo@sispermbg.id";
 const DEMO_EXPIRES_KEY = "sisper_demo_expires_at";
 
+const PRESERVED_SISPER_KEYS = new Set([
+  "sisper_user_profile",
+  "sisper_global_app_logo",
+  "sisper_global_app_logo_right",
+  "sisper_global_admin_tkpi",
+  "sisper_demo_expires_at",
+  "sisper_demo_just_logged_in",
+]);
+
+export const clearPerUserWorksheetStorage = () => {
+  try {
+    Object.keys(localStorage).forEach((key) => {
+      if (PRESERVED_SISPER_KEYS.has(key)) return;
+      if (
+        key.startsWith("sisper_") ||
+        key.startsWith("kop_") ||
+        key.startsWith("sppg_") ||
+        key.startsWith("fc_header_") ||
+        key.startsWith("nota_") ||
+        key.startsWith("logo_")
+      ) {
+        localStorage.removeItem(key);
+      }
+    });
+    sessionStorage.removeItem("sisper_user_tab_chosen");
+  } catch (e) {
+    console.warn("Notice clearing per-user worksheet storage:", e);
+  }
+};
+
 const buildDemoProfile = () => ({
   uid: DEMO_UID,
   email: DEMO_EMAIL,
@@ -553,6 +583,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const loginDemoAccount = () => {
     setLoading(true);
     clearDriveSession();
+    clearPerUserWorksheetStorage();
     localStorage.removeItem("simulated_user_email");
     const expiresAt = Date.now() + DEMO_DURATION_MS;
     localStorage.setItem(DEMO_EXPIRES_KEY, String(expiresAt));
@@ -573,6 +604,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const signInWithGoogle = async () => {
     try {
       setLoading(true);
+      clearDriveSession();
+      clearPerUserWorksheetStorage();
       localStorage.removeItem(DEMO_EXPIRES_KEY);
       setDemoNotice(null);
       setAuthError(null);
@@ -605,12 +638,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         console.warn("Gagal melakukan Firebase auth signout:", authErr);
       }
       updateSession(null, null);
-      // Clean up localStorage keys prefixed with "sisper_" or "kop_"
-      Object.keys(localStorage).forEach((key) => {
-        if (key.startsWith("sisper_") || key.startsWith("kop_")) {
-          localStorage.removeItem(key);
-        }
-      });
+      clearPerUserWorksheetStorage();
       setLoading(false);
     } catch (error) {
       console.error("Sign-out failed:", error);
@@ -801,6 +829,13 @@ const removeDeletedTenantEmail = (email: string) => {
     setAuthError(null);
     try {
       const lowerEmail = email.toLowerCase().trim();
+      const targetCustomUid = isMainAdminEmail(lowerEmail)
+        ? "admin_syukriyusuf82"
+        : `custom_user_${lowerEmail.replace(/[@.]/g, "_")}`;
+      const previousUid = localStorage.getItem("custom_logged_in_uid") || localStorage.getItem("sisper_loaded_uid");
+      if (previousUid !== targetCustomUid) {
+        clearPerUserWorksheetStorage();
+      }
       
       // Override for official Admin credentials requested by user
       if (isMainAdminEmail(lowerEmail)) {

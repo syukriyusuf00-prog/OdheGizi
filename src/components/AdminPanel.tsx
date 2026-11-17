@@ -31,11 +31,14 @@ import {
   User,
   Briefcase,
   Building,
-  Key
+  Key,
+  Camera
 } from "lucide-react";
 
 interface AdminPanelProps {
   onClose: () => void;
+  globalLogoUrl?: string;
+  onUploadGlobalLogo?: (e: React.ChangeEvent<HTMLInputElement>) => void;
 }
 
 const fetchWithTimeout = <T,>(promise: Promise<T>, timeoutMs: number, defaultValue: T): Promise<T> => {
@@ -107,7 +110,7 @@ const getOfflineUsers = () => {
   return list;
 };
 
-export default function AdminPanel({ onClose }: AdminPanelProps) {
+export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo }: AdminPanelProps) {
   const [users, setUsers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
@@ -368,9 +371,58 @@ export default function AdminPanel({ onClose }: AdminPanelProps) {
     }
   };
 
-  // Enforce Single Main Admin rule
-  const handleToggleRole = async (_userId: string, _currentRole: string) => {
-    alert("Sistem dirancang secara khusus hanya memiliki 1 Administrator Utama (Main Admin). Pengguna lain terdaftar sebagai USER terisolasi.");
+  // Toggle role between USER and ADMIN (granting/revoking Panel Admin access), protecting Main Admin
+  const handleToggleRole = async (userId: string, currentRole: string) => {
+    const userObj = users.find(u => u.uid === userId || u.id === userId);
+    if (
+      userId === "admin_syukriyusuf82" ||
+      userId === "admin_sukriyusuf82" ||
+      isMainAdminEmail(userObj?.email)
+    ) {
+      alert("Peran Administrator Utama dilindungi dan tidak dapat diubah.");
+      return;
+    }
+
+    const nextRole = currentRole === "ADMIN" ? "USER" : "ADMIN";
+    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId) ? { ...u, peran: nextRole } : u));
+
+    const userEmail = (userObj?.email || "").toLowerCase().trim();
+    const emailSlug = userEmail.replace(/[@.]/g, '_');
+    const customUid = `custom_user_${emailSlug}`;
+    const docIds = Array.from(new Set([userId, customUid, userObj?.uid, userObj?.id].filter(Boolean)));
+
+    docIds.forEach((id) => {
+      const k = `offline_user_${id}`;
+      const saved = localStorage.getItem(k);
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          localStorage.setItem(k, JSON.stringify({ ...parsed, peran: nextRole }));
+        } catch (e) {}
+      }
+    });
+
+    const activeUid = localStorage.getItem("custom_logged_in_uid");
+    if (activeUid && docIds.includes(activeUid)) {
+      const activeProf = localStorage.getItem("sisper_user_profile");
+      if (activeProf) {
+        try {
+          const parsed = JSON.parse(activeProf);
+          localStorage.setItem("sisper_user_profile", JSON.stringify({ ...parsed, peran: nextRole }));
+        } catch (e) {}
+      }
+    }
+
+    for (const docId of docIds) {
+      try {
+        await setDoc(doc(db, "users", docId), {
+          peran: nextRole,
+          updatedAt: new Date().toISOString()
+        }, { merge: true });
+      } catch (e) {
+        console.warn("Notice updating user role:", e);
+      }
+    }
   };
 
   // Handle update expiration date
@@ -749,6 +801,40 @@ export default function AdminPanel({ onClose }: AdminPanelProps) {
           Tutup Panel
         </button>
       </div>
+
+      {/* Global App Logo Card for Admin / Panel Admin holders */}
+      {onUploadGlobalLogo && (
+        <div className="bg-white p-4 rounded-2xl border border-indigo-200/80 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div className="flex items-center gap-3.5">
+            <div className="w-14 h-14 rounded-full border-2 border-emerald-400 overflow-hidden bg-slate-100 shrink-0 flex items-center justify-center shadow-xs">
+              <img
+                src={globalLogoUrl || "/src/assets/images/logo_sppg_1782256222616.jpg"}
+                alt="Logo Aplikasi Global"
+                className="w-full h-full object-cover"
+                referrerPolicy="no-referrer"
+              />
+            </div>
+            <div>
+              <h3 className="text-xs font-extrabold text-slate-900 uppercase tracking-wide">
+                Logo Aplikasi Global (Login, Header & Kop Surat)
+              </h3>
+              <p className="text-[11px] text-slate-500 max-w-xl">
+                Perubahan logo di sini otomatis diterapkan ke halaman masuk (login) dan seluruh akun pengguna aktif secara real-time.
+              </p>
+            </div>
+          </div>
+          <label className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl transition cursor-pointer inline-flex items-center gap-2 shrink-0 shadow-xs">
+            <Camera className="w-4 h-4" />
+            <span>Ubah Logo Aplikasi Global</span>
+            <input
+              type="file"
+              accept="image/*"
+              onChange={onUploadGlobalLogo}
+              className="hidden"
+            />
+          </label>
+        </div>
+      )}
 
       {/* 4 Stats Cards matching Image 1 */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

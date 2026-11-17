@@ -82,25 +82,36 @@ import {
   PlayCircle
 } from "lucide-react";
 import * as XLSX from "xlsx";
-import { useAuth, isMainAdminEmail } from "./context/AuthContext.tsx";
+import { useAuth, isMainAdminEmail, clearPerUserWorksheetStorage } from "./context/AuthContext.tsx";
 import { db } from "./lib/firebase.ts";
 import { doc, getDoc, onSnapshot, setDoc } from "firebase/firestore";
 
+const DEFAULT_FALLBACK_LOGO = "/src/assets/images/logo_sppg_1782256222616.jpg";
+
 export default function App() {
-  // Load initial state from LocalStorage or use default initial values
+  // Load initial state from LocalStorage only when logged in; otherwise start completely empty
   const [profile, setProfile] = useState<SPPGProfile>(() => {
     const saved = localStorage.getItem("sisper_profile");
-    return saved ? JSON.parse(saved) : INITIAL_SPPG_PROFILE;
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return EMPTY_SPPG_PROFILE;
   });
 
   const [sekolahPM, setSekolahPM] = useState<SekolahPM[]>(() => {
     const saved = localStorage.getItem("sisper_sekolah");
-    return saved ? JSON.parse(saved) : INITIAL_SEKOLAH_PM;
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return EMPTY_SEKOLAH_PM;
   });
 
   const [tigaBPM, setTigaBPM] = useState<TigaBPM[]>(() => {
     const saved = localStorage.getItem("sisper_tigab");
-    return saved ? JSON.parse(saved) : INITIAL_TIGAB_PM;
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return EMPTY_TIGAB_PM;
   });
 
   const [harianPM, setHarianPM] = useState<HariPM[]>(() => {
@@ -112,17 +123,23 @@ export default function App() {
         console.error(e);
       }
     }
-    return INITIAL_HARIAN_PM;
+    return EMPTY_HARIAN_PM;
   });
 
   const [masterMenu, setMasterMenu] = useState<MasterMenu>(() => {
     const saved = localStorage.getItem("sisper_menu");
-    return saved ? JSON.parse(saved) : INITIAL_MASTER_MENU;
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return EMPTY_MASTER_MENU;
   });
 
   const [foodCostDays, setFoodCostDays] = useState<FoodCostDay[]>(() => {
     const saved = localStorage.getItem("sisper_food_cost");
-    return saved ? JSON.parse(saved) : INITIAL_FOOD_COST_DAYS;
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return EMPTY_FOOD_COST_DAYS;
   });
 
   const mergeWithTkpi2020 = (incoming: TKPIItem[]): TKPIItem[] => {
@@ -163,8 +180,17 @@ export default function App() {
     }
   }, [activeTab]);
   const [tkpiSearchQuery, setTkpiSearchQuery] = useState<string>("");
+
+  // Global App Logo controlled by Admin / Panel Admin holders and followed by all users & Login screen
+  const [globalAppLogo, setGlobalAppLogo] = useState<string>(() => {
+    return localStorage.getItem("sisper_global_app_logo") || DEFAULT_FALLBACK_LOGO;
+  });
+  const [globalRightLogo, setGlobalRightLogo] = useState<string>(() => {
+    return localStorage.getItem("sisper_global_app_logo_right") || "";
+  });
+
   const [customLogo, setCustomLogo] = useState<string>(() => {
-    return localStorage.getItem("sisper_custom_logo") || "/src/assets/images/logo_sppg_1782256222616.jpg";
+    return localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || DEFAULT_FALLBACK_LOGO;
   });
 
   // State untuk penyesuaian/pemotongan logo profil
@@ -180,10 +206,10 @@ export default function App() {
   // Synchronized KOP Surat, Logos, Logo Crop & Paper Size
   const [kopLine1, setKopLine1] = useState(() => localStorage.getItem("kop_line1") || "BADAN GIZI NASIONAL");
   const [kopLine2, setKopLine2] = useState(() => localStorage.getItem("kop_line2") || "SATUAN PELAYANAN PEMENUHAN GIZI");
-  const [kopLine3, setKopLine3] = useState(() => localStorage.getItem("kop_line3") || "SPPG MUNA BARAT SAWERIGADI ONDOKE");
-  const [kopLine4, setKopLine4] = useState(() => localStorage.getItem("kop_line4") || "Alamat : Jln. Poros Lagadi-Tondasi, Desa Ondoke, Kec. Sawerigadi, Kab. Muna Barat");
-  const [kopLeftLogo, setKopLeftLogo] = useState(() => localStorage.getItem("kop_left_logo") || "/src/assets/images/logo_sppg_1782256222616.jpg");
-  const [kopRightLogo, setKopRightLogo] = useState(() => localStorage.getItem("kop_right_logo") || "");
+  const [kopLine3, setKopLine3] = useState(() => localStorage.getItem("kop_line3") || "");
+  const [kopLine4, setKopLine4] = useState(() => localStorage.getItem("kop_line4") || "");
+  const [kopLeftLogo, setKopLeftLogo] = useState(() => localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("kop_left_logo") || DEFAULT_FALLBACK_LOGO);
+  const [kopRightLogo, setKopRightLogo] = useState(() => localStorage.getItem("sisper_global_app_logo_right") || localStorage.getItem("kop_right_logo") || "");
   
   const [leftLogoCrop, setLeftLogoCrop] = useState(() => {
     const saved = localStorage.getItem("kop_left_logo_crop");
@@ -199,38 +225,30 @@ export default function App() {
     return (localStorage.getItem("kop_paper_size") as "A4" | "F4") || "A4";
   });
 
-  useEffect(() => {
-    localStorage.setItem("kop_line1", kopLine1);
-    localStorage.setItem("kop_line2", kopLine2);
-    localStorage.setItem("kop_line3", kopLine3);
-    localStorage.setItem("kop_line4", kopLine4);
-    localStorage.setItem("kop_left_logo", kopLeftLogo);
-    localStorage.setItem("kop_right_logo", kopRightLogo);
-    localStorage.setItem("kop_left_logo_crop", JSON.stringify(leftLogoCrop));
-    localStorage.setItem("kop_right_logo_crop", JSON.stringify(rightLogoCrop));
-    localStorage.setItem("kop_paper_size", paperSize);
-  }, [kopLine1, kopLine2, kopLine3, kopLine4, kopLeftLogo, kopRightLogo, leftLogoCrop, rightLogoCrop, paperSize]);
-
-  // Synchronized Sandbox Gizi (Cek Gizi) items
+  // Synchronized Sandbox Gizi (Cek Gizi) items (empty by default for new users)
   const [cekGiziItems, setCekGiziItems] = useState<any[]>(() => {
     const saved = localStorage.getItem("sisper_cek_gizi_items");
-    return saved ? JSON.parse(saved) : [
-      { id: "item_1", namaMenu: "Menu Uji Coba", tkpiId: "beras_giling", berat: 80, urt: "1 piring" },
-      { id: "item_2", namaMenu: "Menu Uji Coba", tkpiId: "daging_ayam_tanpa_kulit", berat: 60, urt: "1 potong" },
-      { id: "item_3", namaMenu: "Menu Uji Coba", tkpiId: "wortel_segar", berat: 30, urt: "1/2 gelas" }
-    ];
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return [];
   });
 
   // Sistem Manajemen Multi-Periode & Riwayat Perencanaan
   const [savedPeriods, setSavedPeriods] = useState<any[]>(() => {
     const saved = localStorage.getItem("sisper_saved_periods");
-    return saved ? JSON.parse(saved) : [];
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
+    return [];
   });
 
   // Pengaturan Target Harga & Klasifikasi Sasaran PM
   const [pmSettings, setPmSettings] = useState<any>(() => {
     const saved = localStorage.getItem("sisper_pm_settings");
-    if (saved) return JSON.parse(saved);
+    if (saved) {
+      try { return JSON.parse(saved); } catch (e) {}
+    }
     return {
       porsiKecilHarga: 8000,
       porsiBesarHarga: 10000,
@@ -406,36 +424,41 @@ export default function App() {
   }, [isDemoUser, isAdminPanelOpen]);
 
   const [isCloudLoading, setIsCloudLoading] = useState(false);
+  const [loadedCloudUid, setLoadedCloudUid] = useState<string | null>(null);
   const [cloudStatusMessage, setCloudStatusMessage] = useState<string>("Mode Lokal");
 
-  // Sync state helpers & Real-time Global Logo & TKPI 2020 subscriptions
+  const isMainAdminAccount =
+    !isDemoUser && user
+      ? isMainAdminEmail(user.email) ||
+        user.uid === "admin_syukriyusuf82" ||
+        user.uid === "admin_sukriyusuf82"
+      : false;
+
+  // Real-time Global Logo & TKPI 2020 subscriptions (always active across Login screen and all user accounts)
   useEffect(() => {
-    // Real-time Global Logo Subscription
     const logoDocRef = doc(db, "configs", "app_logo");
     const unsubscribeLogo = onSnapshot(logoDocRef, (snap) => {
       if (snap.exists()) {
         const data = snap.data();
         if (data) {
-          const activeUrl = data.rightUrl || data.url;
-          if (activeUrl) {
-            setCustomLogo(activeUrl);
-            localStorage.setItem("sisper_custom_logo", activeUrl);
-          }
-          if (data.url) {
-            setKopLeftLogo(data.url);
-            localStorage.setItem("kop_left_logo", data.url);
-          }
-          if (data.rightUrl !== undefined) {
-            setKopRightLogo(data.rightUrl);
-            localStorage.setItem("kop_right_logo", data.rightUrl || "");
-          }
+          const primaryLogo = data.url || data.rightUrl || DEFAULT_FALLBACK_LOGO;
+          const rightLogoVal = data.rightUrl ?? "";
+          setGlobalAppLogo(primaryLogo);
+          setGlobalRightLogo(rightLogoVal);
+          setCustomLogo(primaryLogo);
+          setKopLeftLogo(data.url || primaryLogo);
+          setKopRightLogo(rightLogoVal);
+          localStorage.setItem("sisper_global_app_logo", primaryLogo);
+          localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
+          localStorage.setItem("sisper_custom_logo", primaryLogo);
+          localStorage.setItem("kop_left_logo", data.url || primaryLogo);
+          localStorage.setItem("kop_right_logo", rightLogoVal);
         }
       }
     }, (error) => {
       console.warn("Gagal berlangganan logo global dari awan:", error);
     });
 
-    // Real-time Global TKPI 2020 Database Subscription
     const tkpiDocRef = doc(db, "global_settings", "tkpi");
     const unsubscribeTkpi = onSnapshot(tkpiDocRef, (snap) => {
       if (snap.exists() && localStorage.getItem("sisper_tkpi_cleared") !== "true") {
@@ -458,11 +481,34 @@ export default function App() {
       console.warn("Gagal berlangganan TKPI global dari awan:", error);
     });
 
+    return () => {
+      unsubscribeLogo();
+      unsubscribeTkpi();
+    };
+  }, []);
+
+  // Keep global logo reflected for all non-admin users if globalAppLogo changes
+  useEffect(() => {
+    if (globalAppLogo) {
+      setCustomLogo(globalAppLogo);
+      setKopLeftLogo(globalAppLogo);
+    }
+    if (globalRightLogo !== undefined) {
+      setKopRightLogo(globalRightLogo);
+    }
+  }, [globalAppLogo, globalRightLogo]);
+
+  // Tenant State Loader: strict empty isolation for every new user & demo separation
+  useEffect(() => {
+    let cancelled = false;
+
     if (user && isDemoUser) {
+      setLoadedCloudUid(null);
       setIsCloudLoading(false);
       setCloudStatusMessage("Mode Demo 5 Menit (Lokal)");
       if (localStorage.getItem("sisper_demo_just_logged_in") === "true") {
         localStorage.removeItem("sisper_demo_just_logged_in");
+        localStorage.setItem("sisper_loaded_uid", user.uid);
         setProfile(INITIAL_SPPG_PROFILE);
         setSekolahPM(INITIAL_SEKOLAH_PM);
         setTigaBPM(INITIAL_TIGAB_PM);
@@ -474,39 +520,91 @@ export default function App() {
         setKopLine2("SATUAN PELAYANAN PEMENUHAN GIZI");
         setKopLine3("SPPG DEMO PERENCANAAN GIZI");
         setKopLine4("Alamat : Lingkungan Simulasi Sistem SISPERMBG");
+        setCekGiziItems([
+          { id: "item_1", namaMenu: "Menu Uji Coba", tkpiId: "beras_giling", berat: 80, urt: "1 piring" },
+          { id: "item_2", namaMenu: "Menu Uji Coba", tkpiId: "daging_ayam_tanpa_kulit", berat: 60, urt: "1 potong" },
+          { id: "item_3", namaMenu: "Menu Uji Coba", tkpiId: "wortel_segar", berat: 30, urt: "1/2 gelas" }
+        ]);
+        setSavedPeriods([]);
         setActiveTab("dashboard");
       }
-    } else if (user) {
+      return;
+    }
+
+    if (user) {
+      const canAccessWorkspace = userProfile?.statusPersetujuan === "aktif" || isMainAdminAccount;
+      if (!canAccessWorkspace) {
+        setLoadedCloudUid(null);
+        return;
+      }
+
+      const prevLoadedUid = localStorage.getItem("sisper_loaded_uid");
+      if (prevLoadedUid && prevLoadedUid !== user.uid) {
+        clearPerUserWorksheetStorage();
+      }
+
       const loadAllCloudData = async () => {
+        setLoadedCloudUid(null);
         setIsCloudLoading(true);
         setCloudStatusMessage("Sinkronisasi Awan...");
         try {
-          const cloudProfile = await loadStateFromCloud("profile");
-          const cloudSekolah = await loadStateFromCloud("sekolah");
-          const cloudTigab = await loadStateFromCloud("tigab");
-          const cloudHarianPM = await loadStateFromCloud("harianPM");
-          const cloudMenu = await loadStateFromCloud("menu");
-          const cloudFoodCost = await loadStateFromCloud("foodCost");
-          const cloudTkpi = await loadStateFromCloud("tkpi");
-          const cloudCustomLogo = await loadStateFromCloud("customLogo");
-          const cloudKopLine1 = await loadStateFromCloud("kopLine1");
-          const cloudKopLine2 = await loadStateFromCloud("kopLine2");
-          const cloudKopLine3 = await loadStateFromCloud("kopLine3");
-          const cloudKopLine4 = await loadStateFromCloud("kopLine4");
-          const cloudKopLeftLogo = await loadStateFromCloud("kopLeftLogo");
-          const cloudKopRightLogo = await loadStateFromCloud("kopRightLogo");
-          const cloudCekGiziItems = await loadStateFromCloud("cekGiziItems");
-          const cloudSavedPeriods = await loadStateFromCloud("savedPeriods");
-          const cloudPmSettings = await loadStateFromCloud("pmSettings");
+          const [
+            cloudProfile,
+            cloudSekolah,
+            cloudTigab,
+            cloudHarianPM,
+            cloudMenu,
+            cloudFoodCost,
+            cloudTkpi,
+            cloudKopLine1,
+            cloudKopLine2,
+            cloudKopLine3,
+            cloudKopLine4,
+            cloudCekGiziItems,
+            cloudSavedPeriods,
+            cloudPmSettings,
+            globalLogoSnap
+          ] = await Promise.all([
+            loadStateFromCloud("profile"),
+            loadStateFromCloud("sekolah"),
+            loadStateFromCloud("tigab"),
+            loadStateFromCloud("harianPM"),
+            loadStateFromCloud("menu"),
+            loadStateFromCloud("foodCost"),
+            loadStateFromCloud("tkpi"),
+            loadStateFromCloud("kopLine1"),
+            loadStateFromCloud("kopLine2"),
+            loadStateFromCloud("kopLine3"),
+            loadStateFromCloud("kopLine4"),
+            loadStateFromCloud("cekGiziItems"),
+            loadStateFromCloud("savedPeriods"),
+            loadStateFromCloud("pmSettings"),
+            getDoc(doc(db, "configs", "app_logo")).catch(() => null)
+          ]);
 
-          // Determine if user is the main admin or has an approved admin role
-          const isAdminUser = isMainAdminEmail(user.email) || userProfile?.peran === "ADMIN";
+          if (cancelled) return;
 
-          // Restore existing cloud states or seed with clean system defaults to guarantee strict isolation
+          // Apply latest Global Admin Logo to all users
+          if (globalLogoSnap && globalLogoSnap.exists()) {
+            const logoData = globalLogoSnap.data();
+            if (logoData) {
+              const primaryLogo = logoData.url || logoData.rightUrl || DEFAULT_FALLBACK_LOGO;
+              const rightLogoVal = logoData.rightUrl ?? "";
+              setGlobalAppLogo(primaryLogo);
+              setGlobalRightLogo(rightLogoVal);
+              setCustomLogo(primaryLogo);
+              setKopLeftLogo(logoData.url || primaryLogo);
+              setKopRightLogo(rightLogoVal);
+              localStorage.setItem("sisper_global_app_logo", primaryLogo);
+              localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
+            }
+          }
+
+          // New users (non-main-admin) always begin with completely empty worksheets until they fill them
           if (cloudProfile) {
             setProfile(cloudProfile);
           } else {
-            const initialProfile = isAdminUser ? INITIAL_SPPG_PROFILE : EMPTY_SPPG_PROFILE;
+            const initialProfile = isMainAdminAccount ? INITIAL_SPPG_PROFILE : EMPTY_SPPG_PROFILE;
             setProfile(initialProfile);
             await saveStateToCloud("profile", initialProfile);
           }
@@ -514,7 +612,7 @@ export default function App() {
           if (cloudSekolah) {
             setSekolahPM(cloudSekolah);
           } else {
-            const initialSekolah = isAdminUser ? INITIAL_SEKOLAH_PM : EMPTY_SEKOLAH_PM;
+            const initialSekolah = isMainAdminAccount ? INITIAL_SEKOLAH_PM : EMPTY_SEKOLAH_PM;
             setSekolahPM(initialSekolah);
             await saveStateToCloud("sekolah", initialSekolah);
           }
@@ -522,7 +620,7 @@ export default function App() {
           if (cloudTigab) {
             setTigaBPM(cloudTigab);
           } else {
-            const initialTigab = isAdminUser ? INITIAL_TIGAB_PM : EMPTY_TIGAB_PM;
+            const initialTigab = isMainAdminAccount ? INITIAL_TIGAB_PM : EMPTY_TIGAB_PM;
             setTigaBPM(initialTigab);
             await saveStateToCloud("tigab", initialTigab);
           }
@@ -530,7 +628,7 @@ export default function App() {
           if (cloudHarianPM) {
             setHarianPM(cloudHarianPM);
           } else {
-            const initialHarian = isAdminUser ? INITIAL_HARIAN_PM : EMPTY_HARIAN_PM;
+            const initialHarian = isMainAdminAccount ? INITIAL_HARIAN_PM : EMPTY_HARIAN_PM;
             setHarianPM(initialHarian);
             await saveStateToCloud("harianPM", initialHarian);
           }
@@ -538,7 +636,7 @@ export default function App() {
           if (cloudMenu) {
             setMasterMenu(cloudMenu);
           } else {
-            const initialMenu = isAdminUser ? INITIAL_MASTER_MENU : EMPTY_MASTER_MENU;
+            const initialMenu = isMainAdminAccount ? INITIAL_MASTER_MENU : EMPTY_MASTER_MENU;
             setMasterMenu(initialMenu);
             await saveStateToCloud("menu", initialMenu);
           }
@@ -546,7 +644,7 @@ export default function App() {
           if (cloudFoodCost) {
             setFoodCostDays(cloudFoodCost);
           } else {
-            const initialFoodCost = isAdminUser ? INITIAL_FOOD_COST_DAYS : EMPTY_FOOD_COST_DAYS;
+            const initialFoodCost = isMainAdminAccount ? INITIAL_FOOD_COST_DAYS : EMPTY_FOOD_COST_DAYS;
             setFoodCostDays(initialFoodCost);
             await saveStateToCloud("foodCost", initialFoodCost);
           }
@@ -573,10 +671,6 @@ export default function App() {
             await saveStateToCloud("tkpi", defaultTkpi);
           }
 
-          if (cloudCustomLogo) {
-            setCustomLogo(cloudCustomLogo);
-          }
-
           if (cloudKopLine1) {
             setKopLine1(cloudKopLine1);
           } else {
@@ -591,44 +685,32 @@ export default function App() {
             await saveStateToCloud("kopLine2", "SATUAN PELAYANAN PEMENUHAN GIZI");
           }
 
-          if (cloudKopLine3) {
+          if (cloudKopLine3 !== null && cloudKopLine3 !== undefined) {
             setKopLine3(cloudKopLine3);
           } else {
-            const defaultKop3 = isAdminUser ? "SPPG MUNA BARAT SAWERIGADI ONDOKE" : "";
+            const defaultKop3 = isMainAdminAccount ? "SPPG MUNA BARAT SAWERIGADI ONDOKE" : "";
             setKopLine3(defaultKop3);
             await saveStateToCloud("kopLine3", defaultKop3);
           }
 
-          if (cloudKopLine4) {
+          if (cloudKopLine4 !== null && cloudKopLine4 !== undefined) {
             setKopLine4(cloudKopLine4);
           } else {
-            const defaultKop4 = isAdminUser ? "Alamat : Jln. Poros Lagadi-Tondasi, Desa Ondoke, Kec. Sawerigadi, Kab. Muna Barat" : "";
+            const defaultKop4 = isMainAdminAccount ? "Alamat : Jln. Poros Lagadi-Tondasi, Desa Ondoke, Kec. Sawerigadi, Kab. Muna Barat" : "";
             setKopLine4(defaultKop4);
             await saveStateToCloud("kopLine4", defaultKop4);
-          }
-
-          if (cloudKopLeftLogo) {
-            setKopLeftLogo(cloudKopLeftLogo);
-          } else {
-            setKopLeftLogo("/src/assets/images/logo_sppg_1782256222616.jpg");
-            await saveStateToCloud("kopLeftLogo", "/src/assets/images/logo_sppg_1782256222616.jpg");
-          }
-
-          if (cloudKopRightLogo) {
-            setKopRightLogo(cloudKopRightLogo);
-          } else {
-            setKopRightLogo("");
-            await saveStateToCloud("kopRightLogo", "");
           }
 
           if (cloudCekGiziItems) {
             setCekGiziItems(cloudCekGiziItems);
           } else {
-            const defaultCekGizi = [
-              { id: "item_1", namaMenu: "Menu Uji Coba", tkpiId: "beras_giling", berat: 80, urt: "1 piring" },
-              { id: "item_2", namaMenu: "Menu Uji Coba", tkpiId: "daging_ayam_tanpa_kulit", berat: 60, urt: "1 potong" },
-              { id: "item_3", namaMenu: "Menu Uji Coba", tkpiId: "wortel_segar", berat: 30, urt: "1/2 gelas" }
-            ];
+            const defaultCekGizi = isMainAdminAccount
+              ? [
+                  { id: "item_1", namaMenu: "Menu Uji Coba", tkpiId: "beras_giling", berat: 80, urt: "1 piring" },
+                  { id: "item_2", namaMenu: "Menu Uji Coba", tkpiId: "daging_ayam_tanpa_kulit", berat: 60, urt: "1 potong" },
+                  { id: "item_3", namaMenu: "Menu Uji Coba", tkpiId: "wortel_segar", berat: 30, urt: "1/2 gelas" }
+                ]
+              : [];
             setCekGiziItems(defaultCekGizi);
             await saveStateToCloud("cekGiziItems", defaultCekGizi);
           }
@@ -652,38 +734,41 @@ export default function App() {
             setPmSettings(defaultPmSettings);
             await saveStateToCloud("pmSettings", defaultPmSettings);
           }
-          
-          setCloudStatusMessage("Awan Aktif");
+
+          if (!cancelled) {
+            localStorage.setItem("sisper_loaded_uid", user.uid);
+            setLoadedCloudUid(user.uid);
+            setCloudStatusMessage("Awan Aktif");
+          }
         } catch (error) {
           console.error("Gagal sinkronisasi awan:", error);
           setCloudStatusMessage("Gagal Sinkron");
         } finally {
-          setIsCloudLoading(false);
+          if (!cancelled) {
+            setIsCloudLoading(false);
+          }
         }
       };
       loadAllCloudData();
     } else {
+      setLoadedCloudUid(null);
       setCloudStatusMessage("Mode Lokal");
-      // Reset all states to pristine system defaults when user is logged out to prevent session/tenant bleed
-      setProfile(INITIAL_SPPG_PROFILE);
-      setSekolahPM(INITIAL_SEKOLAH_PM);
-      setTigaBPM(INITIAL_TIGAB_PM);
-      setHarianPM(INITIAL_HARIAN_PM);
-      setMasterMenu(INITIAL_MASTER_MENU);
-      setFoodCostDays(INITIAL_FOOD_COST_DAYS);
+      // Reset all worksheet states to completely empty on logout while keeping the Admin Global Logo for Login screen
+      setProfile(EMPTY_SPPG_PROFILE);
+      setSekolahPM(EMPTY_SEKOLAH_PM);
+      setTigaBPM(EMPTY_TIGAB_PM);
+      setHarianPM(EMPTY_HARIAN_PM);
+      setMasterMenu(EMPTY_MASTER_MENU);
+      setFoodCostDays(EMPTY_FOOD_COST_DAYS);
       setTkpiList(INITIAL_TKPI_DATABASE);
-      setCustomLogo("/src/assets/images/logo_sppg_1782256222616.jpg");
       setKopLine1("BADAN GIZI NASIONAL");
       setKopLine2("SATUAN PELAYANAN PEMENUHAN GIZI");
-      setKopLine3("SPPG MUNA BARAT SAWERIGADI ONDOKE");
-      setKopLine4("Alamat : Jln. Poros Lagadi-Tondasi, Desa Ondoke, Kec. Sawerigadi, Kab. Muna Barat");
-      setKopLeftLogo("/src/assets/images/logo_sppg_1782256222616.jpg");
-      setKopRightLogo("");
-      setCekGiziItems([
-        { id: "item_1", namaMenu: "Menu Uji Coba", tkpiId: "beras_giling", berat: 80, urt: "1 piring" },
-        { id: "item_2", namaMenu: "Menu Uji Coba", tkpiId: "daging_ayam_tanpa_kulit", berat: 60, urt: "1 potong" },
-        { id: "item_3", namaMenu: "Menu Uji Coba", tkpiId: "wortel_segar", berat: 30, urt: "1/2 gelas" }
-      ]);
+      setKopLine3("");
+      setKopLine4("");
+      setCustomLogo(globalAppLogo || DEFAULT_FALLBACK_LOGO);
+      setKopLeftLogo(globalAppLogo || DEFAULT_FALLBACK_LOGO);
+      setKopRightLogo(globalRightLogo || "");
+      setCekGiziItems([]);
       setSavedPeriods([]);
       setPmSettings({
         porsiKecilHarga: 8000,
@@ -691,96 +776,90 @@ export default function App() {
         porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11"],
         porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"]
       });
- 
-      // Wipe local storage keys so next login is completely fresh
-      localStorage.removeItem("sisper_profile");
-      localStorage.removeItem("sisper_sekolah");
-      localStorage.removeItem("sisper_tigab");
-      localStorage.removeItem("sisper_harian_pm");
-      localStorage.removeItem("sisper_menu");
-      localStorage.removeItem("sisper_food_cost");
-      localStorage.removeItem("sisper_tkpi_list");
-      localStorage.removeItem("sisper_custom_logo");
-      localStorage.removeItem("kop_line1");
-      localStorage.removeItem("kop_line2");
-      localStorage.removeItem("kop_line3");
-      localStorage.removeItem("kop_line4");
-      localStorage.removeItem("kop_left_logo");
-      localStorage.removeItem("kop_right_logo");
-      localStorage.removeItem("sisper_cek_gizi_items");
-      localStorage.removeItem("sisper_saved_periods");
-      localStorage.removeItem("sisper_pm_settings");
+      clearPerUserWorksheetStorage();
     }
 
     return () => {
-      unsubscribeLogo();
-      unsubscribeTkpi();
+      cancelled = true;
     };
-  }, [user]);
+  }, [user?.uid, isDemoUser, userProfile?.statusPersetujuan, isMainAdminAccount]);
 
-  // Save states to local storage and Cloud (with debounce)
+  const canAutoSyncCloud = Boolean(
+    isCloudActive &&
+    !isCloudLoading &&
+    user?.uid &&
+    loadedCloudUid === user.uid
+  );
+
+  // Save states to local storage (only when logged in) and Cloud (only after initial load completes for current UID)
   useEffect(() => {
-    localStorage.setItem("sisper_custom_logo", customLogo);
-    if (isCloudActive && !isCloudLoading) {
-      const timer = setTimeout(() => saveStateToCloud("customLogo", customLogo), 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [customLogo, isCloudActive, isCloudLoading]);
+    if (!user) return;
+    localStorage.setItem("kop_left_logo_crop", JSON.stringify(leftLogoCrop));
+    localStorage.setItem("kop_right_logo_crop", JSON.stringify(rightLogoCrop));
+    localStorage.setItem("kop_paper_size", paperSize);
+  }, [user, leftLogoCrop, rightLogoCrop, paperSize]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_profile", JSON.stringify(profile));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("profile", profile), 1500);
       return () => clearTimeout(timer);
     }
-  }, [profile, isCloudActive, isCloudLoading]);
+  }, [user, profile, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_sekolah", JSON.stringify(sekolahPM));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("sekolah", sekolahPM), 1500);
       return () => clearTimeout(timer);
     }
-  }, [sekolahPM, isCloudActive, isCloudLoading]);
+  }, [user, sekolahPM, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_tigab", JSON.stringify(tigaBPM));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("tigab", tigaBPM), 1500);
       return () => clearTimeout(timer);
     }
-  }, [tigaBPM, isCloudActive, isCloudLoading]);
+  }, [user, tigaBPM, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_menu", JSON.stringify(masterMenu));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("menu", masterMenu), 1500);
       return () => clearTimeout(timer);
     }
-  }, [masterMenu, isCloudActive, isCloudLoading]);
+  }, [user, masterMenu, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_food_cost", JSON.stringify(foodCostDays));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("foodCost", foodCostDays), 1500);
       return () => clearTimeout(timer);
     }
-  }, [foodCostDays, isCloudActive, isCloudLoading]);
+  }, [user, foodCostDays, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_harian_pm", JSON.stringify(harianPM));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("harianPM", harianPM), 1500);
       return () => clearTimeout(timer);
     }
-  }, [harianPM, isCloudActive, isCloudLoading]);
+  }, [user, harianPM, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_tkpi_list", JSON.stringify(tkpiList));
     if (isAdminUser) {
       localStorage.setItem("sisper_global_admin_tkpi", JSON.stringify(tkpiList));
     }
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => {
         saveStateToCloud("tkpi", tkpiList);
         if (isAdminUser) {
@@ -794,79 +873,70 @@ export default function App() {
       }, 1500);
       return () => clearTimeout(timer);
     }
-  }, [tkpiList, isCloudActive, isCloudLoading, isAdminUser]);
+  }, [user, tkpiList, canAutoSyncCloud, isAdminUser]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("kop_line1", kopLine1);
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("kopLine1", kopLine1), 1500);
       return () => clearTimeout(timer);
     }
-  }, [kopLine1, isCloudActive, isCloudLoading]);
+  }, [user, kopLine1, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("kop_line2", kopLine2);
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("kopLine2", kopLine2), 1500);
       return () => clearTimeout(timer);
     }
-  }, [kopLine2, isCloudActive, isCloudLoading]);
+  }, [user, kopLine2, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("kop_line3", kopLine3);
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("kopLine3", kopLine3), 1500);
       return () => clearTimeout(timer);
     }
-  }, [kopLine3, isCloudActive, isCloudLoading]);
+  }, [user, kopLine3, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("kop_line4", kopLine4);
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("kopLine4", kopLine4), 1500);
       return () => clearTimeout(timer);
     }
-  }, [kopLine4, isCloudActive, isCloudLoading]);
+  }, [user, kopLine4, canAutoSyncCloud]);
 
   useEffect(() => {
-    localStorage.setItem("kop_left_logo", kopLeftLogo);
-    if (isCloudActive && !isCloudLoading) {
-      const timer = setTimeout(() => saveStateToCloud("kopLeftLogo", kopLeftLogo), 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [kopLeftLogo, isCloudActive, isCloudLoading]);
-
-  useEffect(() => {
-    localStorage.setItem("kop_right_logo", kopRightLogo);
-    if (isCloudActive && !isCloudLoading) {
-      const timer = setTimeout(() => saveStateToCloud("kopRightLogo", kopRightLogo), 1500);
-      return () => clearTimeout(timer);
-    }
-  }, [kopRightLogo, isCloudActive, isCloudLoading]);
-
-  useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_cek_gizi_items", JSON.stringify(cekGiziItems));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("cekGiziItems", cekGiziItems), 1500);
       return () => clearTimeout(timer);
     }
-  }, [cekGiziItems, isCloudActive, isCloudLoading]);
+  }, [user, cekGiziItems, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_saved_periods", JSON.stringify(savedPeriods));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("savedPeriods", savedPeriods), 1500);
       return () => clearTimeout(timer);
     }
-  }, [savedPeriods, isCloudActive, isCloudLoading]);
+  }, [user, savedPeriods, canAutoSyncCloud]);
 
   useEffect(() => {
+    if (!user) return;
     localStorage.setItem("sisper_pm_settings", JSON.stringify(pmSettings));
-    if (isCloudActive && !isCloudLoading) {
+    if (canAutoSyncCloud) {
       const timer = setTimeout(() => saveStateToCloud("pmSettings", pmSettings), 1500);
       return () => clearTimeout(timer);
     }
-  }, [pmSettings, isCloudActive, isCloudLoading]);
+  }, [user, pmSettings, canAutoSyncCloud]);
 
   // Recipient totals (using Day 1 as default baseline display)
   const defaultDayCounts = getCountsForDay(harianPM, 1);
@@ -1102,8 +1172,8 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (userProfile?.peran !== "ADMIN") {
-      alert("Hanya Administrator yang memiliki wewenang untuk mengubah logo aplikasi!");
+    if (!isAdminUser) {
+      alert("Hanya Administrator atau pemilik akses Panel Admin yang memiliki wewenang untuk mengubah logo aplikasi!");
       return;
     }
 
@@ -1203,20 +1273,24 @@ export default function App() {
         ctx.drawImage(img, xDraw, yDraw, wDraw, hDraw);
 
         const compressedBase64 = canvas.toDataURL("image/jpeg", 0.85);
-        if (compressedBase64) {
+        if (compressedBase64 && isAdminUser) {
+          setGlobalAppLogo(compressedBase64);
+          setGlobalRightLogo(compressedBase64);
           setCustomLogo(compressedBase64);
           setKopLeftLogo(compressedBase64);
           setKopRightLogo(compressedBase64);
+          localStorage.setItem("sisper_global_app_logo", compressedBase64);
+          localStorage.setItem("sisper_global_app_logo_right", compressedBase64);
           localStorage.setItem("sisper_custom_logo", compressedBase64);
           localStorage.setItem("kop_left_logo", compressedBase64);
           localStorage.setItem("kop_right_logo", compressedBase64);
 
           try {
-            // Write directly to configs/app_logo for global propagation
+            // Write directly to configs/app_logo for global propagation across all users & login screen
             await setDoc(doc(db, "configs", "app_logo"), {
               url: compressedBase64,
               rightUrl: compressedBase64,
-              updatedBy: user?.email || "Syukri Yusuf",
+              updatedBy: user?.email || "Admin SISPERMBG",
               updatedAt: new Date().toISOString()
             }, { merge: true });
           } catch (err) {
@@ -1230,16 +1304,15 @@ export default function App() {
   };
 
   const handleUpdateLeftLogo = async (newLogo: string) => {
+    if (!isAdminUser) return;
+    setGlobalAppLogo(newLogo);
     setKopLeftLogo(newLogo);
     setCustomLogo(newLogo);
+    localStorage.setItem("sisper_global_app_logo", newLogo);
     localStorage.setItem("kop_left_logo", newLogo);
     localStorage.setItem("sisper_custom_logo", newLogo);
 
     try {
-      if (user) {
-        await saveStateToCloud("kopLeftLogo", newLogo);
-        await saveStateToCloud("customLogo", newLogo);
-      }
       await setDoc(doc(db, "configs", "app_logo"), {
         url: newLogo,
         updatedBy: user?.email || "Admin SISPERMBG",
@@ -1251,18 +1324,14 @@ export default function App() {
   };
 
   const handleUpdateRightLogo = async (newLogo: string) => {
+    if (!isAdminUser) return;
+    setGlobalRightLogo(newLogo);
     setKopRightLogo(newLogo);
-    setCustomLogo(newLogo);
+    localStorage.setItem("sisper_global_app_logo_right", newLogo);
     localStorage.setItem("kop_right_logo", newLogo);
-    localStorage.setItem("sisper_custom_logo", newLogo);
 
     try {
-      if (user) {
-        await saveStateToCloud("kopRightLogo", newLogo);
-        await saveStateToCloud("customLogo", newLogo);
-      }
       await setDoc(doc(db, "configs", "app_logo"), {
-        url: newLogo,
         rightUrl: newLogo,
         updatedBy: user?.email || "Admin SISPERMBG",
         updatedAt: new Date().toISOString()
@@ -1640,9 +1709,9 @@ export default function App() {
             {/* Top Logo and branding - Centered and Uploadable */}
             <div className="flex flex-col items-center gap-3 w-full">
               <div className="relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-xl bg-slate-900/40 flex items-center justify-center">
-                {customLogo ? (
+                {globalAppLogo || customLogo ? (
                   <img
-                    src={customLogo}
+                    src={globalAppLogo || customLogo}
                     alt="Logo GiziSync"
                     className="w-full h-full object-cover"
                     referrerPolicy="no-referrer"
@@ -2596,9 +2665,13 @@ export default function App() {
       </section>
 
       {/* ACTIVE SCREEN CONTENT */}
-      <main className={`flex-grow p-6 ${isAdminPanelOpen && isAdminUser ? "max-w-full" : activeTab === "notalogistik" ? "max-w-full px-4 md:px-8" : activeTab === "foodcost" ? "max-w-[1600px]" : "max-w-7xl"} w-full mx-auto overflow-y-auto`}>
+      <main key={user?.uid || "guest"} className={`flex-grow p-6 ${isAdminPanelOpen && isAdminUser ? "max-w-full" : activeTab === "notalogistik" ? "max-w-full px-4 md:px-8" : activeTab === "foodcost" ? "max-w-[1600px]" : "max-w-7xl"} w-full mx-auto overflow-y-auto`}>
         {isAdminPanelOpen && isAdminUser ? (
-          <AdminPanel onClose={() => setIsAdminPanelOpen(false)} />
+          <AdminPanel
+            onClose={() => setIsAdminPanelOpen(false)}
+            globalLogoUrl={globalAppLogo || customLogo}
+            onUploadGlobalLogo={handleLogoUpload}
+          />
         ) : (
           <>
             {/* PERSONALIZED ROLE-BASED DASHBOARD BANNER FOR USERS */}
