@@ -14,6 +14,7 @@ import { TARGET_AKG_LIMITS } from "../tkpiData";
 import * as XLSX from "xlsx";
 
 import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import AutoSignatureBlock from "./AutoSignatureBlock";
 import PrintPreviewModal from "./PrintPreviewModal";
 import {
   composeMenuName,
@@ -4865,6 +4866,13 @@ export default function FoodCostTab({
                   </div>
                 );
               })}
+              {profile && (
+                <AutoSignatureBlock
+                  profile={profile}
+                  docKey="foodcost"
+                  dateText={currentCalendarDate || undefined}
+                />
+              )}
             </div>
           </div>
         </div>

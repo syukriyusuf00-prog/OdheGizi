@@ -28,6 +28,7 @@ import {
 import * as XLSX from "xlsx";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import AutoSignatureBlock from "./AutoSignatureBlock";
 import PrintPreviewModal from "./PrintPreviewModal";
 
 interface PenerimaManfaatTabProps {
@@ -693,6 +694,18 @@ export default function PenerimaManfaatTab({
             </tbody>
           </table>
         </div>
+
+        {profile && (
+          <AutoSignatureBlock
+            profile={profile}
+            docKey="penerima"
+            dateText={
+              profile.periodeDates?.[selectedDay - 1]
+                ? formatIndonesianDate(profile.periodeDates[selectedDay - 1])
+                : undefined
+            }
+          />
+        )}
 
         {/* Informational Footer note with customizable targets and target selector */}
         <div className="p-5 bg-slate-50 border-t border-slate-100 space-y-4 no-print">

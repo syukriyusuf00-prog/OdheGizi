@@ -17,6 +17,7 @@ import {
 } from "../types";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import AutoSignatureBlock from "./AutoSignatureBlock";
 import PrintPreviewModal from "./PrintPreviewModal";
 import {
   SASARAN_KATEGORI_LIST,
@@ -1308,6 +1309,7 @@ export default function MasterMenuTab({
               </table>
             );
           })}
+          <AutoSignatureBlock profile={profile} docKey="menu" />
         </div>
       </div>
 

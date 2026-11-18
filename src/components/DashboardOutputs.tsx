@@ -11,6 +11,7 @@ import { TARGET_AKG_LIMITS } from "../tkpiData";
 import { PieChart, ListOrdered, PiggyBank, CalendarRange, TrendingDown, TrendingUp, AlertTriangle, Printer, Download, Image as ImageIcon, Eye, X, ZoomIn, RefreshCw, RotateCcw } from "lucide-react";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import AutoSignatureBlock from "./AutoSignatureBlock";
 import PrintPreviewModal from "./PrintPreviewModal";
 
 interface DashboardOutputsProps {
@@ -1296,6 +1297,7 @@ export default function DashboardOutputs({
                   </div>
                 </div>
               )}
+              {profile && <AutoSignatureBlock profile={profile} docKey="dashboard" />}
             </div>
           </div>
         </div>

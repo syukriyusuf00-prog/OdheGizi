@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "./types";
+import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG, IkssDataState } from "./types";
 import { 
   INITIAL_SPPG_PROFILE, 
   INITIAL_SEKOLAH_PM, 
@@ -35,6 +35,7 @@ import NotaPesananLogistikTab from "./components/NotaPesananLogistikTab";
 import RujukanJuknisTab from "./components/RujukanJuknisTab";
 import HandbookTab from "./components/HandbookTab";
 import ArsipTab from "./components/ArsipTab";
+import IkssMenuTab from "./components/IkssMenuTab";
 import AdminPanel from "./components/AdminPanel";
 
 // Icons & Animation
@@ -86,7 +87,8 @@ import {
   UserCheck,
   Building2,
   Copy,
-  Check
+  Check,
+  ClipboardList
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import {
@@ -324,6 +326,33 @@ export default function App() {
       }
     } catch {}
     return 10;
+  });
+
+  // Menu IKSS (Nilai Gizi & Foto Menu Makanan) state persisted to localStorage + Cloud
+  const DEFAULT_IKSS_STATE: IkssDataState = {
+    selectedFoodCostTypes: ["Basah", "3B-Basah"],
+    selectedSasaranIds: ["anak_balita", "anak_balita_13_59"],
+    customCategoryTitle: "",
+    customPeriodeLabel: "",
+    showKopOnIkss: false,
+    photos: {},
+  };
+
+  const [ikssData, setIkssData] = useState<IkssDataState>(() => {
+    try {
+      const saved = localStorage.getItem("sisper_ikss_data");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === "object") {
+          return {
+            ...DEFAULT_IKSS_STATE,
+            ...parsed,
+            photos: parsed.photos && typeof parsed.photos === "object" ? parsed.photos : {},
+          };
+        }
+      }
+    } catch {}
+    return DEFAULT_IKSS_STATE;
   });
 
   const userHasCustomLeftLogoRef = React.useRef<boolean>(false);
@@ -568,6 +597,7 @@ export default function App() {
             cloudKopLeftLogo,
             cloudKopRightLogo,
             cloudBumbuPct,
+            cloudIkssData,
             globalLogoSnap
           ] = await Promise.all([
             loadStateFromCloud("profile"),
@@ -588,6 +618,7 @@ export default function App() {
             loadStateFromCloud("kopLeftLogo"),
             loadStateFromCloud("kopRightLogo"),
             loadStateFromCloud("bumbuPct"),
+            loadStateFromCloud("ikssData"),
             getDoc(doc(db, "configs", "app_logo")).catch(() => null)
           ]);
 
@@ -643,6 +674,23 @@ export default function App() {
             localStorage.setItem("sisper_bumbu_pct", String(parsedBumbu));
           } else {
             setBumbuPct(10);
+          }
+
+          if (cloudIkssData && typeof cloudIkssData === "object") {
+            const mergedIkss: IkssDataState = {
+              ...DEFAULT_IKSS_STATE,
+              ...cloudIkssData,
+              photos:
+                cloudIkssData.photos && typeof cloudIkssData.photos === "object"
+                  ? cloudIkssData.photos
+                  : {},
+            };
+            setIkssData(mergedIkss);
+            try {
+              localStorage.setItem("sisper_ikss_data", JSON.stringify(mergedIkss));
+            } catch {}
+          } else {
+            setIkssData(DEFAULT_IKSS_STATE);
           }
 
           if (!hasCurrentLogoSchema && isAdminUser) {
@@ -819,6 +867,8 @@ export default function App() {
       setKopRightLogo("");
       setKopConfig(DEFAULT_UNIFIED_KOP_CONFIG);
       setBumbuPct(10);
+      setIkssData(DEFAULT_IKSS_STATE);
+      localStorage.removeItem("sisper_ikss_data");
       setCekGiziItems([]);
       setSavedPeriods([]);
       setPmSettings({
@@ -873,6 +923,7 @@ export default function App() {
         pmSettings: JSON.stringify(pmSettings),
         kopConfig: JSON.stringify(kopConfig),
         bumbuPct: JSON.stringify(bumbuPct),
+        ikssData: JSON.stringify(ikssData),
       };
     }
   }, [canAutoSyncCloud, user?.uid]);
@@ -1033,6 +1084,18 @@ export default function App() {
     const timer = scheduleCloudSaveIfChanged("bumbuPct", bumbuPct);
     return () => { if (timer) clearTimeout(timer); };
   }, [user, bumbuPct, canAutoSyncCloud]);
+
+  useEffect(() => {
+    if (!user) return;
+    try {
+      const serialized = JSON.stringify(ikssData);
+      localStorage.setItem("sisper_ikss_data", serialized);
+      if (serialized.length < 900000) {
+        const timer = scheduleCloudSaveIfChanged("ikssData", ikssData);
+        return () => { if (timer) clearTimeout(timer); };
+      }
+    } catch {}
+  }, [user, ikssData, canAutoSyncCloud]);
 
   // Recipient totals (using Day 1 as default baseline display)
   const defaultDayCounts = getCountsForDay(harianPM, 1);
@@ -1887,7 +1950,7 @@ export default function App() {
                 Sistem Perencanaan &amp; Pemantauan Gizi Nasional
               </h1>
               <p className="text-slate-300 text-xs leading-relaxed font-normal">
-                Platform terpadu untuk perencanaan menu siklus, perhitungan kecukupan gizi TKPI 2020, food cost, nota pesanan logistik, dan arsip bulanan SPPG.
+                Platform terpadu untuk perencanaan menu siklus, perhitungan kecukupan gizi TKPI 2020, food cost, menu IKSS, nota pesanan logistik, dan arsip dokumen SPPG.
               </p>
             </div>
 
@@ -2826,8 +2889,9 @@ export default function App() {
               { id: "penerima", label: "Penerima Manfaat", icon: Users, color: "text-cyan-500" },
               { id: "menu", label: "Master Menu", icon: Utensils, color: "text-emerald-500" },
               { id: "foodcost", label: "Food Cost", icon: DollarSign, color: "text-amber-500" },
+              { id: "ikss", label: "Menu IKSS", icon: ClipboardList, color: "text-emerald-600" },
               { id: "notalogistik", label: "Gabungan Semua Food Cost", icon: FileText, color: "text-orange-500" },
-              { id: "arsip", label: "Arsip Bulanan", icon: Archive, color: "text-indigo-600" },
+              { id: "arsip", label: "Arsip Dokumen", icon: Archive, color: "text-indigo-600" },
               { id: "cekgizi", label: "Sandbox Gizi", icon: Search, color: "text-purple-500" },
               { id: "tkpi", label: "Database TKPI 2020", icon: Database, color: "text-rose-500" },
               { id: "handbook", label: "Handbook", icon: Book, color: "text-indigo-500" }
@@ -2882,7 +2946,7 @@ export default function App() {
       </section>
 
       {/* ACTIVE SCREEN CONTENT */}
-      <main key={user?.uid || "guest"} className={`flex-grow p-6 ${isAdminPanelOpen && isAdminUser ? "max-w-full" : activeTab === "notalogistik" ? "max-w-full px-4 md:px-8" : activeTab === "foodcost" ? "max-w-[1600px]" : "max-w-7xl"} w-full mx-auto overflow-y-auto`}>
+      <main key={user?.uid || "guest"} className={`flex-grow p-6 ${isAdminPanelOpen && isAdminUser ? "max-w-full" : activeTab === "notalogistik" || activeTab === "ikss" ? "max-w-full px-4 md:px-8" : activeTab === "foodcost" ? "max-w-[1600px]" : "max-w-7xl"} w-full mx-auto overflow-y-auto`}>
         {isAdminPanelOpen && isAdminUser ? (
           <AdminPanel
             onClose={() => setIsAdminPanelOpen(false)}
@@ -3032,6 +3096,29 @@ export default function App() {
           />
         )}
 
+        {activeTab === "ikss" && (
+          <IkssMenuTab
+            profile={profile}
+            foodCostDays={foodCostDays}
+            tkpiList={tkpiList}
+            harianPM={harianPM}
+            masterMenu={masterMenu}
+            ikssData={ikssData}
+            setIkssData={setIkssData}
+            kopLine1={kopLine1}
+            kopLine2={kopLine2}
+            kopLine3={kopLine3}
+            kopLine4={kopLine4}
+            leftLogo={kopLeftLogo}
+            rightLogo={kopRightLogo}
+            leftLogoCrop={leftLogoCrop}
+            rightLogoCrop={rightLogoCrop}
+            kopConfig={kopConfig}
+            paperSize={paperSize}
+            bumbuPct={bumbuPct}
+          />
+        )}
+
         {activeTab === "arsip" && (
           <ArsipTab
             profile={profile}
@@ -3042,6 +3129,14 @@ export default function App() {
             pmSettings={pmSettings}
             savedPeriods={savedPeriods}
             setSavedPeriods={setSavedPeriods}
+            loadPeriod={(period: any) => {
+              if (period.profile) setProfile(period.profile);
+              if (period.sekolahPM) setSekolahPM(period.sekolahPM);
+              if (period.tigaBPM) setTigaBPM(period.tigaBPM);
+              if (period.harianPM) setHarianPM(period.harianPM);
+              if (period.masterMenu) setMasterMenu(period.masterMenu);
+              if (period.foodCostDays) setFoodCostDays(period.foodCostDays);
+            }}
             activeSekolahPM={sekolahPM}
             activeTigaBPM={tigaBPM}
             kopLines={[kopLine1, kopLine2, kopLine3, kopLine4]}
@@ -3059,23 +3154,6 @@ export default function App() {
           <SPPGProfileTab
             profile={profile}
             onChange={setProfile}
-            savedPeriods={savedPeriods}
-            setSavedPeriods={setSavedPeriods}
-            activeState={{
-              sekolahPM,
-              tigaBPM,
-              harianPM,
-              masterMenu,
-              foodCostDays
-            }}
-            loadPeriod={(period: any) => {
-              setProfile(period.profile);
-              setSekolahPM(period.sekolahPM);
-              setTigaBPM(period.tigaBPM);
-              setHarianPM(period.harianPM);
-              setMasterMenu(period.masterMenu);
-              setFoodCostDays(period.foodCostDays);
-            }}
             kopLine1={kopLine1}
             setKopLine1={setKopLine1}
             kopLine2={kopLine2}
@@ -3310,6 +3388,7 @@ export default function App() {
             rightLogoCrop={rightLogoCrop}
             setRightLogoCrop={setRightLogoCrop}
             kopConfig={kopConfig}
+            profile={profile}
             paperSize={paperSize}
             setPaperSize={setPaperSize}
             isAdmin={isAdminUser}

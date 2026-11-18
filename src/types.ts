@@ -9,6 +9,7 @@ export type KopDocKey =
   | "menu"
   | "foodcost"
   | "nota"
+  | "ikss"
   | "cekgizi"
   | "arsip";
 
@@ -32,16 +33,75 @@ export const DEFAULT_UNIFIED_KOP_CONFIG: UnifiedKopConfig = {
     menu: true,
     foodcost: true,
     nota: true,
+    ikss: true,
     cekgizi: true,
     arsip: true,
   },
   autoPrintFormat: true,
 };
 
+export interface SPPGSignatureConfig {
+  kotaTTD: string;
+  showKepala: boolean;
+  showAhliGizi: boolean;
+  showAkuntan: boolean;
+  showYayasan: boolean;
+  jabatanKepala: string;
+  jabatanAhliGizi: string;
+  jabatanAkuntan: string;
+  jabatanYayasan: string;
+  enabledDocs: Record<KopDocKey, boolean>;
+}
+
+export const DEFAULT_SIGNATURE_CONFIG: SPPGSignatureConfig = {
+  kotaTTD: "",
+  showKepala: true,
+  showAhliGizi: true,
+  showAkuntan: false,
+  showYayasan: false,
+  jabatanKepala: "Kepala Satuan Pelayanan Pemenuhan Gizi",
+  jabatanAhliGizi: "Ahli Gizi / SPPI",
+  jabatanAkuntan: "Akuntan SPPG",
+  jabatanYayasan: "Ketua Yayasan",
+  enabledDocs: {
+    dashboard: true,
+    penerima: true,
+    menu: true,
+    foodcost: true,
+    nota: true,
+    ikss: true,
+    cekgizi: false,
+    arsip: false,
+  },
+};
+
+export interface IkssAkgOverride {
+  label?: string;
+  energi?: number;
+  protein?: number;
+  lemak?: number;
+  kh?: number;
+  serat?: number;
+}
+
+export interface IkssDataState {
+  selectedFoodCostTypes: string[];
+  selectedSasaranIds: string[];
+  customCategoryTitle?: string;
+  customPeriodeLabel?: string;
+  showKopOnIkss?: boolean;
+  akgOverride?: IkssAkgOverride;
+  /** Map keyed by `${groupKey}__day_${hariKe}` -> compressed JPEG data URL */
+  photos: Record<string, string>;
+}
+
 export interface SPPGProfile {
   idSPPG?: string;
   namaLembaga: string;
   alamat: string;
+  kabKota?: string;
+  provinsi?: string;
+  noHpSPPI?: string;
   namaKepala: string;
   namaAhliGizi: string;
   namaYayasan: string;
@@ -50,6 +110,7 @@ export interface SPPGProfile {
   tahunAnggaran: string;
   periodeDates: string[]; // dynamic dates synchronized from Master Menu
   awalPeriodeBerikutnya: string;
+  ttdConfig?: SPPGSignatureConfig;
 }
 
 export interface SekolahPM {

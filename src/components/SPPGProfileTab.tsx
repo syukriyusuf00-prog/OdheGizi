@@ -8,41 +8,29 @@ import {
   SPPGProfile,
   UnifiedKopConfig,
   DEFAULT_UNIFIED_KOP_CONFIG,
+  DEFAULT_SIGNATURE_CONFIG,
+  SPPGSignatureConfig,
   KopDocKey,
 } from "../types";
 import {
   Building,
-  Save,
   Trash2,
-  FolderOpen,
-  Clock,
   AlertCircle,
   CheckCircle2,
-  Users,
-  Archive,
-  Calendar,
   ImagePlus,
   Link2,
   RotateCcw,
   RefreshCw,
   FileText,
   Sliders,
+  PenTool,
   X,
 } from "lucide-react";
+import AutoSignatureBlock, { resolveSignatureConfig } from "./AutoSignatureBlock";
 
 interface SPPGProfileTabProps {
   profile: SPPGProfile;
   onChange: (updated: SPPGProfile) => void;
-  savedPeriods?: any[];
-  setSavedPeriods?: (updated: any[]) => void;
-  activeState?: {
-    sekolahPM: any[];
-    tigaBPM: any[];
-    harianPM: any[];
-    masterMenu: any;
-    foodCostDays: any[];
-  };
-  loadPeriod?: (period: any) => void;
   kopLine1?: string;
   setKopLine1?: (val: string) => void;
   kopLine2?: string;
@@ -67,17 +55,24 @@ const DOC_SYNC_OPTIONS: Array<{ key: KopDocKey; label: string }> = [
   { key: "menu", label: "Master Menu" },
   { key: "foodcost", label: "Food Cost" },
   { key: "nota", label: "Nota Pesanan Logistik" },
+  { key: "ikss", label: "Menu IKSS" },
   { key: "cekgizi", label: "Cek Gizi" },
-  { key: "arsip", label: "Arsip Bulanan" },
+  { key: "arsip", label: "Arsip Dokumen" },
+];
+
+const TTD_DOC_OPTIONS: Array<{ key: KopDocKey; label: string }> = [
+  { key: "dashboard", label: "Dashboard & Output" },
+  { key: "penerima", label: "Penerima Manfaat" },
+  { key: "menu", label: "Master Menu" },
+  { key: "foodcost", label: "Food Cost" },
+  { key: "nota", label: "Nota Pesanan Logistik" },
+  { key: "ikss", label: "Menu IKSS" },
+  { key: "cekgizi", label: "Sandbox / Cek Gizi" },
 ];
 
 export default function SPPGProfileTab({
   profile,
   onChange,
-  savedPeriods = [],
-  setSavedPeriods,
-  activeState,
-  loadPeriod,
   kopLine1 = "BADAN GIZI NASIONAL",
   setKopLine1,
   kopLine2 = "SATUAN PELAYANAN PEMENUHAN GIZI",
@@ -95,17 +90,12 @@ export default function SPPGProfileTab({
   paperSize = "A4",
   setPaperSize,
 }: SPPGProfileTabProps) {
-  const [periodNameInput, setPeriodNameInput] = useState("");
   const [feedbackBanner, setFeedbackBanner] = useState<{
     type: "success" | "warning";
     text: string;
   } | null>(null);
   const [showLeftWidthSlider, setShowLeftWidthSlider] = useState(false);
   const [showRightWidthSlider, setShowRightWidthSlider] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<{
-    kind: "load" | "delete";
-    period: any;
-  } | null>(null);
 
   const showToast = (type: "success" | "warning", text: string) => {
     setFeedbackBanner({ type, text });
@@ -116,6 +106,31 @@ export default function SPPGProfileTab({
 
   const handleChange = (field: keyof SPPGProfile, value: any) => {
     onChange({ ...profile, [field]: value });
+  };
+
+  const ttdConfig = resolveSignatureConfig(profile);
+
+  const updateTtdConfig = (patch: Partial<SPPGSignatureConfig>) => {
+    const next: SPPGSignatureConfig = {
+      ...ttdConfig,
+      ...patch,
+      enabledDocs: {
+        ...DEFAULT_SIGNATURE_CONFIG.enabledDocs,
+        ...(ttdConfig.enabledDocs || {}),
+        ...(patch.enabledDocs || {}),
+      },
+    };
+    onChange({ ...profile, ttdConfig: next });
+  };
+
+  const toggleTtdDoc = (key: KopDocKey) => {
+    const current = ttdConfig.enabledDocs?.[key] !== false;
+    updateTtdConfig({
+      enabledDocs: {
+        ...ttdConfig.enabledDocs,
+        [key]: !current,
+      },
+    });
   };
 
   const updateKopConfig = (patch: Partial<UnifiedKopConfig>) => {
@@ -155,10 +170,16 @@ export default function SPPGProfileTab({
       if (typeof result === "string") {
         if (side === "left" && setLeftLogo) {
           setLeftLogo(result);
-          showToast("success", "Logo Kiri diperbarui dan otomatis diterapkan ke seluruh lembar kerja terpilih.");
+          showToast(
+            "success",
+            "Logo Kiri diperbarui dan otomatis diterapkan ke seluruh lembar kerja terpilih."
+          );
         } else if (side === "right" && setRightLogo) {
           setRightLogo(result);
-          showToast("success", "Logo Kanan berhasil diunggah dan dihubungkan ke kop dokumen.");
+          showToast(
+            "success",
+            "Logo Kanan berhasil diunggah dan dihubungkan ke kop dokumen."
+          );
         }
       }
     };
@@ -173,73 +194,10 @@ export default function SPPGProfileTab({
     if (setKopLine4 && profile.alamat?.trim()) {
       setKopLine4(`Alamat : ${profile.alamat.trim()}`);
     }
-    showToast("success", "Baris KOP disinkronkan dari Nama Lembaga & Alamat Profil SPPG.");
-  };
-
-  const formatDateFriendly = (dateStr: string) => {
-    if (!dateStr) return "";
-    try {
-      const d = new Date(dateStr);
-      return d.toLocaleDateString("id-ID", {
-        day: "numeric",
-        month: "short",
-        year: "2-digit",
-      });
-    } catch {
-      return dateStr;
-    }
-  };
-
-  const handleSaveToHistory = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!periodNameInput.trim()) {
-      showToast("warning", "Mohon masukkan nama atau label periode perencanaan terlebih dahulu.");
-      return;
-    }
-
-    if (!setSavedPeriods || !activeState) {
-      showToast("warning", "Layanan penyimpanan belum siap.");
-      return;
-    }
-
-    const currentJakartaTime =
-      new Date().toLocaleString("id-ID", {
-        timeZone: "Asia/Jakarta",
-        day: "numeric",
-        month: "long",
-        year: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        second: "2-digit",
-      }) + " WIB";
-
-    const newPeriodRecord = {
-      id: "period_" + Date.now(),
-      namaPeriode: periodNameInput.trim(),
-      createdAt: currentJakartaTime,
-      profile: JSON.parse(JSON.stringify(profile)),
-      sekolahPM: JSON.parse(JSON.stringify(activeState.sekolahPM)),
-      tigaBPM: JSON.parse(JSON.stringify(activeState.tigaBPM)),
-      harianPM: JSON.parse(JSON.stringify(activeState.harianPM)),
-      masterMenu: JSON.parse(JSON.stringify(activeState.masterMenu)),
-      foodCostDays: JSON.parse(JSON.stringify(activeState.foodCostDays)),
-    };
-
-    setSavedPeriods([newPeriodRecord, ...savedPeriods]);
-    setPeriodNameInput("");
-    showToast("success", "Perencanaan berhasil diarsipkan secara permanen ke database cloud.");
-  };
-
-  const executeConfirmedAction = () => {
-    if (!confirmAction) return;
-    if (confirmAction.kind === "load" && loadPeriod) {
-      loadPeriod(confirmAction.period);
-      showToast("success", `Berhasil memuat arsip "${confirmAction.period.namaPeriode}".`);
-    } else if (confirmAction.kind === "delete" && setSavedPeriods) {
-      setSavedPeriods(savedPeriods.filter((p) => p.id !== confirmAction.period.id));
-      showToast("success", `Arsip "${confirmAction.period.namaPeriode}" telah dihapus.`);
-    }
-    setConfirmAction(null);
+    showToast(
+      "success",
+      "Baris KOP disinkronkan dari Nama Lembaga & Alamat Profil SPPG."
+    );
   };
 
   const previewLeftPx = Math.min(120, Math.max(32, Number(kopConfig.leftLogoWidth) || 56));
@@ -276,12 +234,19 @@ export default function SPPGProfileTab({
         </div>
       )}
 
-      {/* 1. INFORMASI LEMBAGA SPPG */}
+      {/* 1. INFORMASI LEMBAGA SPPG (OTOMATIS SINKRON KE SEMUA LEMBAR KERJA & IKSS) */}
       <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs">
-        <h3 className="text-lg font-bold text-slate-800 mb-5 flex items-center gap-2">
-          <Building className="w-5 h-5 text-indigo-600" />
-          Informasi Lembaga SPPG
-        </h3>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-5">
+          <div>
+            <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+              <Building className="w-5 h-5 text-indigo-600" />
+              Informasi Lembaga SPPG
+            </h3>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Identitas di bawah ini terisi otomatis ke seluruh lembar kerja cetak, Menu IKSS (Nilai Gizi &amp; Foto Menu), Nota Pesanan, dan blok tanda tangan.
+            </p>
+          </div>
+        </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
           <div className="space-y-1.5">
@@ -294,13 +259,13 @@ export default function SPPGProfileTab({
               value={profile.idSPPG || ""}
               onChange={(e) => handleChange("idSPPG", e.target.value)}
               className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
-              placeholder="Contoh: SPPG-7413-001"
+              placeholder="Contoh: AT9ENIQ6"
             />
           </div>
 
           <div className="space-y-1.5 lg:col-span-2">
             <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
-              Nama Lembaga
+              Nama Lembaga / SPPG
             </label>
             <input
               id="input-nama-lembaga"
@@ -328,6 +293,48 @@ export default function SPPGProfileTab({
 
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
+              Kabupaten / Kota
+            </label>
+            <input
+              id="input-kab-kota"
+              type="text"
+              value={profile.kabKota || ""}
+              onChange={(e) => handleChange("kabKota", e.target.value)}
+              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
+              placeholder="Contoh: MUNA BARAT"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
+              Provinsi
+            </label>
+            <input
+              id="input-provinsi"
+              type="text"
+              value={profile.provinsi || ""}
+              onChange={(e) => handleChange("provinsi", e.target.value)}
+              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
+              placeholder="Contoh: SULAWESI TENGGARA"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
+              Nomor Handphone (SPPI / AG)
+            </label>
+            <input
+              id="input-no-hp-sppi"
+              type="text"
+              value={profile.noHpSPPI || ""}
+              onChange={(e) => handleChange("noHpSPPI", e.target.value)}
+              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 tabular-nums"
+              placeholder="Contoh: 082271095251"
+            />
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
               Nama Kepala SPPG
             </label>
             <input
@@ -342,7 +349,7 @@ export default function SPPGProfileTab({
 
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
-              Nama Ahli Gizi
+              Nama Ahli Gizi / SPPI
             </label>
             <input
               id="input-ahli-gizi"
@@ -405,7 +412,7 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.tahunAnggaran}
               onChange={(e) => handleChange("tahunAnggaran", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
+              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 tabular-nums"
               placeholder="2026"
             />
           </div>
@@ -416,7 +423,7 @@ export default function SPPGProfileTab({
       <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-5">
         <div>
           <h3 className="text-base sm:text-lg font-bold text-slate-900">
-            Pengaturan Logo Kiri (BGN) & Logo Kanan Terpusat
+            Pengaturan Logo Kiri (BGN) &amp; Logo Kanan Terpusat
           </h3>
           <p className="text-xs sm:text-sm text-slate-500 mt-1">
             Unggah logo KOP surat dan atur lebar ukurannya sebelum diterapkan ke seluruh lembar kerja &amp; cetak/PDF. Pengaturan ini khusus untuk KOP dokumen dan tidak mengubah logo utama aplikasi di header atas.
@@ -626,7 +633,7 @@ export default function SPPGProfileTab({
         <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2.5">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs font-bold text-slate-700 uppercase tracking-wider">
-              Dokumen Lembar Kerja yang Mengikuti KOP & Logo Serentak
+              Dokumen Lembar Kerja yang Mengikuti KOP &amp; Logo Serentak
             </span>
             <div className="flex items-center gap-2 text-xs">
               <span className="text-slate-500 font-semibold flex items-center gap-1">
@@ -737,7 +744,7 @@ export default function SPPGProfileTab({
               PRATINJAU KOP SURAT BERSAMA
             </span>
             <span className="text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 rounded-md">
-              Format Cetak & Unduh: Arial Presisi • Auto Potret / Lansekap • Sinkron Cloud
+              Format Cetak &amp; Unduh: Arial Presisi • Auto Potret / Lansekap • Sinkron Cloud
             </span>
           </div>
 
@@ -749,7 +756,10 @@ export default function SPPGProfileTab({
               <div
                 className="flex items-center justify-center shrink-0"
                 style={{
-                  width: `${Math.max(previewShowLeft ? previewLeftPx + 8 : 0, previewShowRight ? previewRightPx + 8 : 64)}px`,
+                  width: `${Math.max(
+                    previewShowLeft ? previewLeftPx + 8 : 0,
+                    previewShowRight ? previewRightPx + 8 : 64
+                  )}px`,
                 }}
               >
                 {previewShowLeft && (
@@ -785,7 +795,10 @@ export default function SPPGProfileTab({
               <div
                 className="flex items-center justify-center shrink-0"
                 style={{
-                  width: `${Math.max(previewShowLeft ? previewLeftPx + 8 : 0, previewShowRight ? previewRightPx + 8 : 64)}px`,
+                  width: `${Math.max(
+                    previewShowLeft ? previewLeftPx + 8 : 0,
+                    previewShowRight ? previewRightPx + 8 : 64
+                  )}px`,
                 }}
               >
                 {previewShowRight && (
@@ -803,199 +816,154 @@ export default function SPPGProfileTab({
         </div>
       </div>
 
-      {/* 3. PUSAT ARSIP & RIWAYAT PERENCANAAN OTOMATIS */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6" id="sppg-archive-section">
-        {/* Form Simpan Arsip Manual + Penjelasan Arsip Otomatis */}
-        <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs lg:col-span-5 space-y-4">
-          <div className="flex items-center gap-2.5">
-            <div className="p-2 bg-indigo-50 rounded-xl text-indigo-600 shrink-0">
-              <Archive className="w-5 h-5" />
-            </div>
-            <div>
-              <h4 className="font-bold text-slate-800 text-sm">Arsipkan Perencanaan Aktif</h4>
-              <p className="text-xs text-slate-500">
-                Simpan penanda khusus kapan saja selain arsip otomatis pergantian tanggal
-              </p>
-            </div>
-          </div>
-
-          <form onSubmit={handleSaveToHistory} className="space-y-4">
-            <div className="space-y-1.5">
-              <label className="text-xs font-bold text-slate-600 block">
-                Nama / Label Periode Perencanaan:
-              </label>
-              <input
-                type="text"
-                value={periodNameInput}
-                onChange={(e) => setPeriodNameInput(e.target.value)}
-                placeholder="Contoh: Periode Juli 2026 - Realisasi Siklus 1"
-                className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-xs text-slate-800 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 bg-slate-50/50"
-              />
-              <span className="text-[11px] text-slate-500 block leading-snug">
-                Setiap pergantian tanggal siklus di Master Menu juga otomatis mengarsipkan perencanaan sebelumnya ke daftar riwayat.
-              </span>
-            </div>
-
-            <button
-              type="submit"
-              className="w-full py-2.5 px-4 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition cursor-pointer flex items-center justify-center gap-2 shadow-sm"
-            >
-              <Save className="w-4 h-4" />
-              <span>Simpan Arsip ke Riwayat</span>
-            </button>
-          </form>
-
-          {/* Info Banner */}
-          <div className="bg-slate-50 p-4 rounded-xl border border-slate-200/70 text-xs text-slate-600 space-y-1.5 leading-relaxed">
-            <span className="font-bold text-slate-800 block">
-              Pengarsipan Otomatis Pergantian Tanggal
-            </span>
-            <p>
-              Sistem menyimpan perencanaan sebelumnya secara otomatis setiap kali tanggal perencanaan berubah. Anda tidak perlu mengosongkan lembar kerja dan dapat membuka kembali perencanaan maupun realisasi terdahulu kapan saja.
+      {/* 3. KONFIGURASI PENANDATANGAN (TTD) OTOMATIS LEMBAR KERJA */}
+      <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs space-y-5">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div>
+            <h3 className="text-base sm:text-lg font-bold text-slate-900 flex items-center gap-2">
+              <PenTool className="w-5 h-5 text-indigo-600" />
+              Konfigurasi Tanda Tangan (TTD) Otomatis Lembar Kerja
+            </h3>
+            <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
+              Atur pejabat penandatangan dan lembar kerja yang membutuhkan blok TTD secara serentak dari Profil SPPG.
             </p>
           </div>
         </div>
 
-        {/* Daftar Riwayat Perencanaan */}
-        <div className="bg-white p-6 rounded-2xl border border-slate-200/80 shadow-xs lg:col-span-7 space-y-4 flex flex-col">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100 shrink-0">
-            <div className="flex items-center gap-2.5">
-              <div className="p-2 bg-emerald-50 rounded-xl text-emerald-600 shrink-0">
-                <Clock className="w-5 h-5" />
-              </div>
-              <div>
-                <h4 className="font-bold text-slate-800 text-sm">Daftar Riwayat Perencanaan</h4>
-                <p className="text-xs text-slate-500">
-                  Arsip perencanaan & realisasi tersimpan otomatis di cloud
-                </p>
-              </div>
-            </div>
-            <span className="bg-indigo-50 text-indigo-700 text-xs font-bold px-2.5 py-1 rounded-lg tabular-nums">
-              {savedPeriods.length} Arsip
-            </span>
+        {/* Kota/Tempat TTD */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-slate-500 uppercase tracking-wider block">
+              Kota / Tempat Tanda Tangan
+            </label>
+            <input
+              type="text"
+              value={ttdConfig.kotaTTD}
+              onChange={(e) => updateTtdConfig({ kotaTTD: e.target.value })}
+              placeholder={profile.kabKota || "Contoh: Muna Barat"}
+              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm text-slate-800 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+            />
           </div>
+          <div className="md:col-span-2 flex items-end">
+            <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200/80 rounded-xl px-4 py-2.5 w-full">
+              Nama pejabat diambil otomatis dari <strong>Informasi Lembaga SPPG</strong> di atas. Centang pejabat yang ditampilkan dan ubah redaksi jabatan jika diperlukan.
+            </p>
+          </div>
+        </div>
 
-          <div className="flex-grow overflow-y-auto max-h-[380px] pr-1 space-y-3">
-            {savedPeriods.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center py-12 space-y-2">
-                <Archive className="w-8 h-8 text-slate-300" />
-                <div>
-                  <p className="text-xs font-bold text-slate-600">Belum Ada Riwayat Tersimpan</p>
-                  <p className="text-xs text-slate-400 max-w-xs mx-auto mt-0.5">
-                    Arsip akan tercatat otomatis saat tanggal perencanaan berganti, atau simpan manual lewat formulir di samping.
-                  </p>
+        {/* Signers Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          {[
+            {
+              flagKey: "showKepala" as const,
+              roleKey: "jabatanKepala" as const,
+              label: "Kepala SPPG",
+              personName: profile.namaKepala,
+              placeholder: "Kepala Satuan Pelayanan Pemenuhan Gizi",
+            },
+            {
+              flagKey: "showAhliGizi" as const,
+              roleKey: "jabatanAhliGizi" as const,
+              label: "Ahli Gizi / SPPI",
+              personName: profile.namaAhliGizi,
+              placeholder: "Ahli Gizi / SPPI",
+            },
+            {
+              flagKey: "showAkuntan" as const,
+              roleKey: "jabatanAkuntan" as const,
+              label: "Akuntan SPPG",
+              personName: profile.namaAkuntan,
+              placeholder: "Akuntan SPPG",
+            },
+            {
+              flagKey: "showYayasan" as const,
+              roleKey: "jabatanYayasan" as const,
+              label: "Ketua Yayasan",
+              personName: profile.ketuaYayasan,
+              placeholder: "Ketua Yayasan",
+            },
+          ].map((item) => {
+            const checked = ttdConfig[item.flagKey];
+            return (
+              <div
+                key={item.flagKey}
+                className={`p-4 rounded-xl border transition space-y-2.5 ${
+                  checked
+                    ? "bg-white border-indigo-200"
+                    : "bg-slate-50/70 border-slate-200/80 opacity-80"
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <label className="inline-flex items-center gap-2 text-xs font-bold text-slate-800 cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={(e) =>
+                        updateTtdConfig({ [item.flagKey]: e.target.checked })
+                      }
+                      className="w-4 h-4 accent-indigo-600 rounded cursor-pointer"
+                    />
+                    <span>{item.label}</span>
+                  </label>
+                  <span className="text-[11px] font-semibold text-slate-500 truncate max-w-[200px]">
+                    {item.personName || "Belum diisi"}
+                  </span>
                 </div>
+
+                <input
+                  type="text"
+                  value={ttdConfig[item.roleKey]}
+                  onChange={(e) =>
+                    updateTtdConfig({ [item.roleKey]: e.target.value })
+                  }
+                  placeholder={item.placeholder}
+                  className="w-full px-3 py-2 border border-slate-200 rounded-lg text-xs text-slate-800 font-medium bg-slate-50/40 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500"
+                />
               </div>
-            ) : (
-              savedPeriods.map((period: any) => {
-                const totalSchools = period.sekolahPM?.length || 0;
-                const totalVillages = period.tigaBPM?.length || 0;
-                const dateRange = period.profile?.periodeDates || [];
-                const firstDate = dateRange[0] ? formatDateFriendly(dateRange[0]) : "-";
-                const lastDate = dateRange[dateRange.length - 1]
-                  ? formatDateFriendly(dateRange[dateRange.length - 1])
-                  : "-";
+            );
+          })}
+        </div>
 
-                return (
-                  <div
-                    key={period.id}
-                    className="p-4 rounded-xl border border-slate-200/80 hover:border-slate-300 hover:bg-slate-50/40 transition flex flex-col sm:flex-row sm:items-center justify-between gap-4"
-                  >
-                    <div className="space-y-1">
-                      <h5 className="font-bold text-slate-800 text-xs">{period.namaPeriode}</h5>
-                      <p className="text-[11px] text-slate-500 flex items-center gap-1">
-                        <Clock className="w-3 h-3 text-slate-400 shrink-0" />
-                        Diarsipkan: {period.createdAt}
-                      </p>
+        {/* Which Worksheets Receive Auto TTD */}
+        <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2.5">
+          <span className="text-xs font-bold text-slate-700 uppercase tracking-wider block">
+            Lembar Kerja yang Menampilkan Blok TTD Otomatis
+          </span>
+          <div className="flex flex-wrap gap-2">
+            {TTD_DOC_OPTIONS.map((doc) => {
+              const checked = ttdConfig.enabledDocs?.[doc.key] !== false;
+              return (
+                <label
+                  key={doc.key}
+                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold cursor-pointer transition select-none ${
+                    checked
+                      ? "bg-white border-indigo-300 text-indigo-900"
+                      : "bg-slate-100/70 border-slate-200 text-slate-500"
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleTtdDoc(doc.key)}
+                    className="w-3.5 h-3.5 accent-indigo-600 cursor-pointer"
+                  />
+                  <span>{doc.label}</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
 
-                      <div className="flex flex-wrap gap-2 pt-1.5">
-                        <span className="inline-flex items-center gap-1 bg-slate-100 text-slate-600 text-[10px] font-semibold px-2 py-0.5 rounded-md">
-                          <Users className="w-3 h-3 text-slate-400" />
-                          {totalSchools} Sekolah • {totalVillages} Desa
-                        </span>
-                        <span className="inline-flex items-center gap-1 bg-indigo-50 text-indigo-700 text-[10px] font-semibold px-2 py-0.5 rounded-md">
-                          <Calendar className="w-3 h-3 text-indigo-400" />
-                          {firstDate} s/d {lastDate}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2 shrink-0 self-end sm:self-center">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmAction({ kind: "delete", period })}
-                        title="Hapus Arsip"
-                        className="p-2 text-rose-500 hover:bg-rose-50 rounded-xl transition cursor-pointer border border-transparent hover:border-rose-100"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => setConfirmAction({ kind: "load", period })}
-                        className="py-1.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition cursor-pointer flex items-center gap-1.5 shadow-xs"
-                      >
-                        <FolderOpen className="w-3.5 h-3.5" />
-                        <span>Buka Arsip</span>
-                      </button>
-                    </div>
-                  </div>
-                );
-              })
-            )}
+        {/* Live Preview of Auto TTD Block */}
+        <div className="space-y-2">
+          <span className="text-xs font-bold text-slate-500 uppercase tracking-wider block">
+            Pratinjau Blok Tanda Tangan (Format Cetak Arial)
+          </span>
+          <div className="rounded-xl border border-slate-200 bg-white px-6 pb-5 pt-2">
+            <AutoSignatureBlock profile={profile} docKey="nota" forceShow />
           </div>
         </div>
       </div>
-
-      {/* In-App Confirmation Modal (replaces window.confirm) */}
-      {confirmAction && (
-        <div className="fixed inset-0 z-[1000] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-md w-full p-6 space-y-4">
-            <div className="flex items-start justify-between gap-3">
-              <div>
-                <h4 className="text-base font-bold text-slate-900">
-                  {confirmAction.kind === "load"
-                    ? "Buka Arsip Perencanaan?"
-                    : "Hapus Arsip Secara Permanen?"}
-                </h4>
-                <p className="text-xs text-slate-500 mt-1">
-                  {confirmAction.kind === "load"
-                    ? `Data lembar kerja aktif akan menampilkan arsip "${confirmAction.period.namaPeriode}". Pastikan perencanaan aktif Anda sudah tersimpan bila masih diperlukan.`
-                    : `Arsip "${confirmAction.period.namaPeriode}" akan dihapus permanen dari daftar riwayat cloud dan tidak dapat dibatalkan.`}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setConfirmAction(null)}
-                className="p-1 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="flex items-center justify-end gap-2 pt-2">
-              <button
-                type="button"
-                onClick={() => setConfirmAction(null)}
-                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold cursor-pointer"
-              >
-                Batal
-              </button>
-              <button
-                type="button"
-                onClick={executeConfirmedAction}
-                className={`px-4 py-2 rounded-xl text-white text-xs font-bold cursor-pointer ${
-                  confirmAction.kind === "load"
-                    ? "bg-emerald-600 hover:bg-emerald-700"
-                    : "bg-rose-600 hover:bg-rose-700"
-                }`}
-              >
-                {confirmAction.kind === "load" ? "Ya, Buka Arsip" : "Ya, Hapus Permanen"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

@@ -4,13 +4,14 @@
  */
 
 import React, { useState } from "react";
-import { TKPIItem, CekGiziInput, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
+import { TKPIItem, CekGiziInput, SPPGProfile, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import { Sparkles, Plus, Trash2, ArrowUpRight, Scale, Activity, Settings, Sliders, ChevronDown, ChevronUp, Printer, Download, Image as ImageIcon, Eye } from "lucide-react";
 import SearchableTkpiDropdown from "./SearchableTkpiDropdown";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 
 import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import AutoSignatureBlock from "./AutoSignatureBlock";
 import PrintPreviewModal from "./PrintPreviewModal";
 
 interface CekGiziTabProps {
@@ -36,6 +37,7 @@ interface CekGiziTabProps {
   paperSize?: "A4" | "F4";
   setPaperSize?: (val: "A4" | "F4") => void;
   kopConfig?: UnifiedKopConfig;
+  profile?: SPPGProfile;
   isAdmin?: boolean;
 }
 
@@ -61,7 +63,8 @@ export default function CekGiziTab({
   setRightLogoCrop = () => {},
   paperSize = "A4",
   setPaperSize = () => {},
-  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
+  profile
 }: CekGiziTabProps) {
   const [rujukanAkgType, setRujukanAkgType] = useState<string>("sd_besar");
   const [customRujukanAkg, setCustomRujukanAkg] = useState<number>(700); // kkal
@@ -697,6 +700,7 @@ export default function CekGiziTab({
                   })}
                 </div>
               </div>
+              {profile && <AutoSignatureBlock profile={profile} docKey="cekgizi" />}
             </div>
           </div>
         </div>

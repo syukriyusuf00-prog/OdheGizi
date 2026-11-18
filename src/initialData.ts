@@ -3,12 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, KelompokSasaranPM, HariPM } from "./types";
+import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, KelompokSasaranPM, HariPM, DEFAULT_SIGNATURE_CONFIG } from "./types";
 
 export const INITIAL_SPPG_PROFILE: SPPGProfile = {
   idSPPG: "",
   namaLembaga: "SPPG Muna Barat Sawerigadi Ondoke",
   alamat: "Jl. Poros Sawerigadi No. 12, Ondoke, Muna Barat, Sulawesi Tenggara",
+  kabKota: "MUNA BARAT",
+  provinsi: "SULAWESI TENGGARA",
+  noHpSPPI: "",
   namaKepala: "JABARNUR SALIM, S. H.",
   namaAhliGizi: "LA ODE MUHAMMAD SUKRI YUSUF, S.Tr.Gz",
   namaYayasan: "LAWOROKU",
@@ -19,7 +22,11 @@ export const INITIAL_SPPG_PROFILE: SPPGProfile = {
     "2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10", "2026-07-11",
     "2026-07-13", "2026-07-14", "2026-07-15", "2026-07-16", "2026-07-17", "2026-07-18"
   ],
-  awalPeriodeBerikutnya: "2026-07-20"
+  awalPeriodeBerikutnya: "2026-07-20",
+  ttdConfig: {
+    ...DEFAULT_SIGNATURE_CONFIG,
+    kotaTTD: "Muna Barat",
+  },
 };
 
 export const INITIAL_SEKOLAH_PM: SekolahPM[] = [
@@ -239,6 +246,9 @@ export const EMPTY_SPPG_PROFILE: SPPGProfile = {
   idSPPG: "",
   namaLembaga: "",
   alamat: "",
+  kabKota: "",
+  provinsi: "",
+  noHpSPPI: "",
   namaKepala: "",
   namaAhliGizi: "",
   namaYayasan: "",
@@ -246,7 +256,8 @@ export const EMPTY_SPPG_PROFILE: SPPGProfile = {
   namaAkuntan: "",
   tahunAnggaran: "",
   periodeDates: Array.from({ length: 10 }, () => ""),
-  awalPeriodeBerikutnya: ""
+  awalPeriodeBerikutnya: "",
+  ttdConfig: { ...DEFAULT_SIGNATURE_CONFIG },
 };
 
 export const EMPTY_SEKOLAH_PM: SekolahPM[] = [];

@@ -12,18 +12,21 @@ import {
   ChefHat,
   ChevronDown,
   ChevronRight,
+  Clock,
   CloudUpload,
   DollarSign,
   Download,
   ExternalLink,
   FileText,
   Folder,
+  FolderOpen,
   FolderPlus,
   Loader2,
   Package,
   Save,
   Search,
   ShoppingCart,
+  Trash2,
   Users,
   X,
   AlertCircle,
@@ -76,6 +79,7 @@ interface ArsipTabProps {
   pmSettings: any;
   savedPeriods: any[];
   setSavedPeriods?: (updated: any[]) => void;
+  loadPeriod?: (period: any) => void;
   activeSekolahPM?: SekolahPM[];
   activeTigaBPM?: TigaBPM[];
   kopLines: [string, string, string, string];
@@ -482,6 +486,7 @@ export default function ArsipTab({
   pmSettings,
   savedPeriods = [],
   setSavedPeriods,
+  loadPeriod,
   activeSekolahPM = [],
   activeTigaBPM = [],
   kopLines,
@@ -493,6 +498,11 @@ export default function ArsipTab({
   userEmail,
   isDemo = false,
 }: ArsipTabProps) {
+  const [confirmPeriodAction, setConfirmPeriodAction] = useState<{
+    kind: "load" | "delete";
+    period: any;
+  } | null>(null);
+  const [showSavedHistory, setShowSavedHistory] = useState<boolean>(true);
   const tkpiMap = useMemo(() => createTkpiMap(tkpiList), [tkpiList]);
 
   // Combine Active Planning Cycle + Historical Saved Periods into a monthly/daily index
@@ -758,7 +768,7 @@ export default function ArsipTab({
     setSavedPeriods([newRecord, ...savedPeriods]);
     setSnapshotMessage({
       type: "success",
-      text: `Berhasil menyimpan snapshot "${label}" ke Riwayat Arsip Bulanan.`,
+      text: `Berhasil menyimpan snapshot "${label}" ke Riwayat Arsip Dokumen.`,
     });
     setTimeout(() => setSnapshotMessage(null), 5000);
   };
@@ -908,15 +918,35 @@ export default function ArsipTab({
     }
   };
 
+  const executeConfirmedPeriodAction = () => {
+    if (!confirmPeriodAction) return;
+    if (confirmPeriodAction.kind === "load" && loadPeriod) {
+      loadPeriod(confirmPeriodAction.period);
+      setSnapshotMessage({
+        type: "success",
+        text: `Berhasil membuka arsip "${confirmPeriodAction.period.namaPeriode}" ke lembar kerja aktif.`,
+      });
+    } else if (confirmPeriodAction.kind === "delete" && setSavedPeriods) {
+      setSavedPeriods(
+        savedPeriods.filter((p) => p.id !== confirmPeriodAction.period.id)
+      );
+      setSnapshotMessage({
+        type: "success",
+        text: `Arsip "${confirmPeriodAction.period.namaPeriode}" telah dihapus dari riwayat cloud.`,
+      });
+    }
+    setConfirmPeriodAction(null);
+  };
+
   return (
-    <div id="arsip-bulanan-tab" className="space-y-6 font-sans">
+    <div id="arsip-dokumen-tab" className="space-y-6 font-sans">
       {/* HEADER & SNAPSHOT CONTROLS */}
       <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div className="space-y-1">
           <div className="flex flex-wrap items-center gap-2">
             <h2 className="text-lg font-extrabold text-slate-900 flex items-center gap-2">
               <Archive className="w-5 h-5 text-indigo-600" />
-              Arsip Perencanaan Bulanan & Sinkronisasi Google Drive
+              Arsip Dokumen &amp; Sinkronisasi Google Drive
             </h2>
             {isDemo && (
               <span className="px-2.5 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md text-[10px] font-extrabold uppercase tracking-wider">
@@ -925,7 +955,7 @@ export default function ArsipTab({
             )}
           </div>
           <p className="text-xs text-slate-500 max-w-3xl">
-            Riwayat otomatis dikelompokkan per bulan dan tanggal perencanaan, dibedakan menjadi arsip <strong>Jumlah PM</strong>, <strong>Menu</strong>, <strong>Food Cost</strong>, dan <strong>Nota Pesanan</strong>. Kirim arsip terpilih dalam format <strong>PDF otomatis</strong> ke folder terpisah per nama menu di Google Drive email aktif Anda.
+            Pusat <strong>Arsip Dokumen</strong> otomatis per bulan &amp; tanggal perencanaan mencakup <strong>Jumlah PM</strong>, <strong>Menu</strong>, <strong>Food Cost</strong>, <strong>Nota Pesanan</strong>, serta riwayat arsip cloud yang dapat dibuka kembali kapan saja atau dikirim dalam format <strong>PDF otomatis</strong> ke Google Drive Anda.
           </p>
         </div>
 
@@ -936,7 +966,7 @@ export default function ArsipTab({
             className="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer shadow-xs"
           >
             <Save className="w-4 h-4 text-emerald-400" />
-            Simpan Snapshot ke Riwayat
+            Simpan Snapshot ke Arsip Dokumen
           </button>
         </div>
       </div>
@@ -1702,6 +1732,163 @@ export default function ArsipTab({
                 )}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* RIWAYAT SNAPSHOT ARSIP DOKUMEN CLOUD (BUKA / PULIHKAN PERENCANAAN) */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <button
+            type="button"
+            onClick={() => setShowSavedHistory((v) => !v)}
+            className="flex items-center gap-2.5 text-left cursor-pointer"
+          >
+            <div className="p-2 bg-emerald-50 rounded-xl text-emerald-600 shrink-0">
+              <Clock className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-1.5">
+                Daftar Riwayat Arsip Perencanaan Cloud
+                {showSavedHistory ? (
+                  <ChevronDown className="w-4 h-4 text-slate-400" />
+                ) : (
+                  <ChevronRight className="w-4 h-4 text-slate-400" />
+                )}
+              </h3>
+              <p className="text-xs text-slate-500">
+                Otomatis terarsip setiap pergantian tanggal siklus di Master Menu atau saat klik Simpan Snapshot.
+              </p>
+            </div>
+          </button>
+          <span className="px-2.5 py-1 rounded-lg bg-indigo-50 text-indigo-700 text-xs font-bold tabular-nums">
+            {savedPeriods.length} Arsip Tersimpan
+          </span>
+        </div>
+
+        {showSavedHistory && (
+          <div className="space-y-2.5">
+            {savedPeriods.length === 0 ? (
+              <div className="p-6 text-center rounded-xl border border-dashed border-slate-200 bg-slate-50/50 text-xs text-slate-500">
+                Belum ada riwayat arsip perencanaan tersimpan. Klik <strong>Simpan Snapshot ke Arsip Dokumen</strong> atau ubah tanggal siklus di Master Menu untuk membuat arsip otomatis.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {savedPeriods.map((period: any) => {
+                  const totalSchools = period.sekolahPM?.length || 0;
+                  const totalVillages = period.tigaBPM?.length || 0;
+                  const dates: string[] = period.profile?.periodeDates || [];
+                  const firstDate = dates[0] ? formatIndonesianDate(dates[0]) : "-";
+                  const lastDate = dates[dates.length - 1]
+                    ? formatIndonesianDate(dates[dates.length - 1])
+                    : "-";
+                  return (
+                    <div
+                      key={period.id}
+                      className="p-3.5 rounded-xl border border-slate-200 hover:border-slate-300 bg-slate-50/40 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                    >
+                      <div className="space-y-1 min-w-0">
+                        <h4 className="font-bold text-slate-900 text-xs truncate">
+                          {period.namaPeriode}
+                        </h4>
+                        <p className="text-[11px] text-slate-500 flex items-center gap-1">
+                          <Clock className="w-3 h-3 text-slate-400 shrink-0" />
+                          <span>Diarsipkan: {period.createdAt}</span>
+                        </p>
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          <span className="inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-600 text-[10px] font-semibold px-2 py-0.5 rounded-md tabular-nums">
+                            <Users className="w-3 h-3 text-slate-400" />
+                            {totalSchools} Sekolah • {totalVillages} Desa
+                          </span>
+                          <span className="inline-flex items-center gap-1 bg-indigo-50 text-indigo-700 text-[10px] font-semibold px-2 py-0.5 rounded-md">
+                            <Calendar className="w-3 h-3 text-indigo-400" />
+                            {firstDate} s/d {lastDate}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-center">
+                        {setSavedPeriods && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setConfirmPeriodAction({ kind: "delete", period })
+                            }
+                            title="Hapus Arsip"
+                            className="p-2 text-rose-500 hover:bg-rose-50 rounded-xl transition cursor-pointer"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
+                        {loadPeriod && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setConfirmPeriodAction({ kind: "load", period })
+                            }
+                            className="py-1.5 px-3 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold rounded-xl transition cursor-pointer inline-flex items-center gap-1.5"
+                          >
+                            <FolderOpen className="w-3.5 h-3.5" />
+                            <span>Buka Arsip</span>
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* IN-APP CONFIRMATION MODAL FOR OPENING OR DELETING SAVED ARCHIVE */}
+      {confirmPeriodAction && (
+        <div className="fixed inset-0 z-[99999] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-md w-full p-6 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h4 className="text-base font-bold text-slate-900">
+                  {confirmPeriodAction.kind === "load"
+                    ? "Buka Arsip Perencanaan?"
+                    : "Hapus Arsip Permanen?"}
+                </h4>
+                <p className="text-xs text-slate-500 mt-1">
+                  {confirmPeriodAction.kind === "load"
+                    ? `Lembar kerja aktif akan memuat arsip "${confirmPeriodAction.period.namaPeriode}". Pastikan perencanaan aktif saat ini sudah tersimpan jika masih diperlukan.`
+                    : `Arsip "${confirmPeriodAction.period.namaPeriode}" akan dihapus permanen dari daftar arsip cloud.`}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmPeriodAction(null)}
+                className="p-1 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setConfirmPeriodAction(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={executeConfirmedPeriodAction}
+                className={`px-4 py-2 rounded-xl text-white text-xs font-bold cursor-pointer ${
+                  confirmPeriodAction.kind === "load"
+                    ? "bg-emerald-600 hover:bg-emerald-700"
+                    : "bg-rose-600 hover:bg-rose-700"
+                }`}
+              >
+                {confirmPeriodAction.kind === "load"
+                  ? "Ya, Buka Arsip"
+                  : "Ya, Hapus Permanen"}
+              </button>
+            </div>
           </div>
         </div>
       )}
