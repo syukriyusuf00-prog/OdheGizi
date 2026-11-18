@@ -82,6 +82,10 @@ export const syncUserToRealtimeHub = async (profileData: Record<string, any> | n
     const payload = {
       ...profileData,
       createdAt: normalizeTimestampForRelay(profileData.createdAt) || new Date().toISOString(),
+      loginPertama:
+        normalizeTimestampForRelay(profileData.loginPertama) ||
+        normalizeTimestampForRelay(profileData.createdAt) ||
+        new Date().toISOString(),
       updatedAt: new Date().toISOString(),
       loginTerakhir:
         profileData.loginTerakhir === null
@@ -282,6 +286,8 @@ const getRecordTimeMs = (val: any): number => {
   return 0;
 };
 
+export const DEFAULT_WAITING_NOTE = "Daftar Tunggu - Menunggu ACC Admin Odhe Gizi";
+
 const getDefaultExpirationDate = () => {
   const nextYear = new Date();
   nextYear.setFullYear(nextYear.getFullYear() + 1);
@@ -406,6 +412,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       try {
         const userSnap: any = await fetchWithTimeout(getDoc(userRef), 3500, null);
         const existingData = userSnap && userSnap.exists() ? userSnap.data() : {};
+        const adminFirstLogin =
+          normalizeTimestampForRelay(existingData.loginPertama) ||
+          normalizeTimestampForRelay(existingData.createdAt) ||
+          nowIso;
         const mergedAdmin = {
           ...fallbackAdminProfile,
           ...existingData,
@@ -415,7 +425,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           statusPersetujuan: "aktif" as const,
           authProvider: "google",
           emailVerified: true,
-          berakhirPada: "2035-12-31",
+          mulaiPada: typeof existingData.mulaiPada === "string" ? existingData.mulaiPada : "",
+          berakhirPada: "",
+          keterangan: typeof existingData.keterangan === "string" ? existingData.keterangan : "Administrator Utama",
+          loginPertama: adminFirstLogin,
+          loginCount: (Number(existingData.loginCount) || 0) + 1,
           updatedAt: nowIso,
           loginTerakhir: nowIso,
         };
@@ -490,6 +504,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ]);
 
       let firestoreData: any = uidSnap && uidSnap.exists() ? uidSnap.data() : null;
+      let migratedFromSheetDocId = "";
 
       // Migrate seamlessly if pre-registered via Spreadsheet (sheet_user_<slug>) or legacy custom_user_<slug>
       if (!firestoreData && !hubUser && sheetDocUid) {
@@ -497,6 +512,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const sheetSnap: any = await fetchWithTimeout(getDoc(doc(db, "users", sheetDocUid)), 2500, null);
           if (sheetSnap && sheetSnap.exists()) {
             firestoreData = sheetSnap.data();
+            migratedFromSheetDocId = sheetDocUid;
           }
         } catch {}
       }
@@ -544,7 +560,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             sumber: sheetUser.sumber || "Spreadsheet",
           };
         } else {
-          // Fill missing identity fields from Spreadsheet and promote menunggu -> aktif if Spreadsheet grants aktif
           const shouldPromoteFromSheet =
             resolvedProfile.statusPersetujuan === "menunggu" && sheetUser.statusPersetujuan === "aktif";
           resolvedProfile = {
@@ -553,7 +568,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             profesi: resolvedProfile.profesi || sheetUser.profesi,
             namaSPPG: resolvedProfile.namaSPPG || sheetUser.namaSPPG,
             noHp: resolvedProfile.noHp || sheetUser.noHp,
-            berakhirPada: resolvedProfile.berakhirPada || sheetUser.berakhirPada,
+            mulaiPada:
+              resolvedProfile.mulaiPada !== undefined ? resolvedProfile.mulaiPada : sheetUser.mulaiPada ?? "",
+            berakhirPada:
+              resolvedProfile.berakhirPada !== undefined
+                ? resolvedProfile.berakhirPada
+                : sheetUser.berakhirPada ?? "",
+            keterangan:
+              resolvedProfile.keterangan !== undefined && resolvedProfile.keterangan !== ""
+                ? resolvedProfile.keterangan
+                : sheetUser.keterangan ?? "",
             statusPersetujuan: shouldPromoteFromSheet
               ? "aktif"
               : resolvedProfile.statusPersetujuan || sheetUser.statusPersetujuan,
@@ -564,8 +588,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       const isNewTenant = !resolvedProfile;
-      // Strict security: new tenants ALWAYS start as peran: "USER" (no Panel Admin) and statusPersetujuan: "menunggu"
-      // unless explicitly added directly by Admin in the linked Google Spreadsheet.
       const resolvedRole = !isNewTenant && resolvedProfile.peran === "ADMIN" ? "ADMIN" : "USER";
       const resolvedStatus = isNewTenant
         ? "menunggu"
@@ -584,6 +606,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
       const compactDev = toCompactDeviceSummary(devRecord);
 
+      const resolvedFirstLogin =
+        normalizeTimestampForRelay(resolvedProfile?.loginPertama) ||
+        normalizeTimestampForRelay(resolvedProfile?.createdAt) ||
+        nowIso;
+      const previousLoginCount = Number(resolvedProfile?.loginCount) || 0;
+      const resolvedMulaiPada =
+        typeof resolvedProfile?.mulaiPada === "string" ? resolvedProfile.mulaiPada.trim() : "";
+      const resolvedBerakhirPada =
+        typeof resolvedProfile?.berakhirPada === "string"
+          ? resolvedProfile.berakhirPada.trim()
+          : "";
+      const resolvedKeterangan =
+        typeof resolvedProfile?.keterangan === "string" && resolvedProfile.keterangan.trim() !== ""
+          ? resolvedProfile.keterangan.trim()
+          : resolvedStatus === "menunggu"
+          ? DEFAULT_WAITING_NOTE
+          : "";
+
       const finalProfile: Record<string, any> = {
         ...(resolvedProfile || {}),
         uid: currentUser.uid,
@@ -601,19 +641,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         noHp: resolvedProfile?.noHp || "",
         peran: resolvedRole,
         statusPersetujuan: resolvedStatus,
+        mulaiPada: resolvedMulaiPada,
+        berakhirPada: resolvedBerakhirPada,
+        keterangan: resolvedKeterangan,
         authProvider: "google",
         emailVerified: true,
         registeredViaSpreadsheet: Boolean(isFromSpreadsheet || resolvedProfile?.registeredViaSpreadsheet),
         sumber: resolvedProfile?.sumber || (isFromSpreadsheet ? "Spreadsheet" : "Login Google"),
-        berakhirPada: resolvedProfile?.berakhirPada || getDefaultExpirationDate(),
         lastDevice: compactDev,
         lastDeviceLabel: formatDeviceShortLabel(compactDev),
         lastDeviceId: devRecord.deviceId,
         lastDeviceSeenAt: nowIso,
+        loginPertama: resolvedFirstLogin,
+        loginCount: previousLoginCount + 1,
         createdAt: resolvedProfile?.createdAt ? normalizeTimestampForRelay(resolvedProfile.createdAt) : nowIso,
         updatedAt: nowIso,
         loginTerakhir: nowIso,
       };
+      if (migratedFromSheetDocId) {
+        finalProfile.migratedFromDocId = migratedFromSheetDocId;
+      }
       delete finalProfile.isNotRegistered;
 
       // Clear deleted-email blocklist marker if user is signing in cleanly
@@ -677,9 +724,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         noHp: "",
         peran: "USER",
         statusPersetujuan: "menunggu",
+        mulaiPada: "",
+        berakhirPada: "",
+        keterangan: DEFAULT_WAITING_NOTE,
         authProvider: "google",
         emailVerified: true,
-        berakhirPada: getDefaultExpirationDate(),
+        loginPertama: nowIso,
+        loginCount: 1,
         createdAt: nowIso,
         updatedAt: nowIso,
         loginTerakhir: nowIso,
@@ -901,6 +952,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setUserProfile((prev: any) => {
         const nextStatus = freshData.statusPersetujuan || prev?.statusPersetujuan || "menunggu";
         const nextRole = freshData.peran === "ADMIN" ? "ADMIN" : (freshData.peran || prev?.peran || "USER");
+        const nextMulaiPada =
+          freshData.mulaiPada !== undefined
+            ? String(freshData.mulaiPada ?? "").trim()
+            : String(prev?.mulaiPada ?? "").trim();
+        const nextBerakhirPada =
+          freshData.berakhirPada !== undefined
+            ? String(freshData.berakhirPada ?? "").trim()
+            : String(prev?.berakhirPada ?? "").trim();
+        const nextKeterangan =
+          freshData.keterangan !== undefined
+            ? String(freshData.keterangan ?? "").trim()
+            : String(prev?.keterangan ?? "").trim();
         const updated = {
           ...(prev || {}),
           ...freshData,
@@ -909,6 +972,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           email: activeEmail || freshData.email || prev?.email || "",
           peran: nextRole,
           statusPersetujuan: nextStatus,
+          mulaiPada: nextMulaiPada,
+          berakhirPada: nextBerakhirPada,
+          keterangan: nextKeterangan,
         };
         delete updated.isNotRegistered;
         try {
@@ -1208,13 +1274,26 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       noHp: formData.noHp.trim(),
       peran: currentRole,
       statusPersetujuan: currentStatus,
+      mulaiPada: typeof userProfile?.mulaiPada === "string" ? userProfile.mulaiPada : "",
+      berakhirPada: typeof userProfile?.berakhirPada === "string" ? userProfile.berakhirPada : "",
+      keterangan:
+        typeof userProfile?.keterangan === "string"
+          ? userProfile.keterangan
+          : currentStatus === "menunggu"
+          ? DEFAULT_WAITING_NOTE
+          : "",
       authProvider: "google",
       emailVerified: true,
-      berakhirPada: userProfile?.berakhirPada || getDefaultExpirationDate(),
       lastDevice: compactDev,
       lastDeviceLabel: formatDeviceShortLabel(compactDev),
       lastDeviceId: devRecord.deviceId,
       lastDeviceSeenAt: nowIso,
+      loginPertama: userProfile?.loginPertama
+        ? normalizeTimestampForRelay(userProfile.loginPertama)
+        : userProfile?.createdAt
+        ? normalizeTimestampForRelay(userProfile.createdAt)
+        : nowIso,
+      loginCount: Number(userProfile?.loginCount) || 1,
       createdAt: userProfile?.createdAt ? normalizeTimestampForRelay(userProfile.createdAt) : nowIso,
       updatedAt: nowIso,
       loginTerakhir: nowIso,

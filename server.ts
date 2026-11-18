@@ -257,6 +257,10 @@ interface ServerSheetSyncConfig {
   gid: string;
   sheetTitle: string;
   spreadsheetTitle: string;
+  webhookUrl?: string;
+  autoWebhookEnabled?: boolean;
+  lastWebhookPushAt?: string;
+  lastWebhookStatus?: string;
   updatedAt: string;
   updatedBy?: string;
 }
@@ -270,8 +274,12 @@ interface ServerSheetUserRow {
   noHp: string;
   peran: "USER" | "ADMIN";
   statusPersetujuan: "aktif" | "menunggu" | "diblokir";
+  mulaiPada: string;
   berakhirPada: string;
+  keterangan: string;
+  loginPertama: string;
   loginTerakhir: string;
+  loginCount: number;
   sumber: string;
 }
 
@@ -283,6 +291,7 @@ let sheetSyncConfig: ServerSheetSyncConfig | null = null;
 let lastPublicSheetFetchAt = 0;
 const sseClients = new Set<express.Response>();
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let autoWebhookTimer: ReturnType<typeof setTimeout> | null = null;
 
 const loadRealtimeCacheFromDisk = () => {
   try {
@@ -303,7 +312,11 @@ const loadRealtimeCacheFromDisk = () => {
         }
       });
     }
-    if (parsed?.sheetSyncConfig && typeof parsed.sheetSyncConfig.spreadsheetId === "string") {
+    if (
+      parsed?.sheetSyncConfig &&
+      (typeof parsed.sheetSyncConfig.spreadsheetId === "string" ||
+        typeof parsed.sheetSyncConfig.webhookUrl === "string")
+    ) {
       sheetSyncConfig = parsed.sheetSyncConfig;
     }
     if (Array.isArray(parsed?.cachedSheetUsers)) {
@@ -411,10 +424,238 @@ const normalizeServerSheetStatus = (raw: unknown): "aktif" | "menunggu" | "diblo
   return "aktif";
 };
 
-const getDefaultSheetExpDate = (): string => {
-  const d = new Date();
-  d.setFullYear(d.getFullYear() + 1);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const normalizeDateCell = (raw: string): string => {
+  const val = String(raw ?? "").trim();
+  if (!val) return "";
+  const lower = val.toLowerCase();
+  if (
+    lower === "tanpa batas" ||
+    lower === "unlimited" ||
+    lower === "selamanya" ||
+    lower === "-" ||
+    lower === "none" ||
+    lower === "tidak ada"
+  ) {
+    return "";
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(val)) return val;
+  const slashMatch = val.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slashMatch) {
+    const [, a, b, y] = slashMatch;
+    const first = Number(a);
+    const second = Number(b);
+    const month = first > 12 ? second : first;
+    const day = first > 12 ? first : second;
+    return `${y}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+  return val.slice(0, 32);
+};
+
+const isValidAppsScriptWebhookUrl = (rawUrl: string): boolean => {
+  try {
+    const parsed = new URL(rawUrl.trim());
+    if (parsed.protocol !== "https:") return false;
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host === "script.google.com" ||
+      host === "script.googleusercontent.com"
+    );
+  } catch {
+    return false;
+  }
+};
+
+const getTodayIsoLocal = (): string => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const computeUserEffectiveCategory = (
+  u: Record<string, any>
+): "aktif" | "menunggu" | "kedaluwarsa" | "diblokir" => {
+  const status = String(u?.statusPersetujuan || "menunggu").toLowerCase();
+  if (status === "diblokir") return "diblokir";
+  if (status === "menunggu" || status === "pending") return "menunggu";
+  const berakhir = typeof u?.berakhirPada === "string" ? u.berakhirPada.trim() : "";
+  if (berakhir && u?.peran !== "ADMIN" && getTodayIsoLocal() > berakhir) {
+    return "kedaluwarsa";
+  }
+  return "aktif";
+};
+
+const buildAppsScriptWebhookPayload = (usersList: Record<string, any>[]) => {
+  const dedupByEmail = new Map<string, Record<string, any>>();
+  for (const u of usersList) {
+    const email = normalizeEmail(u?.email);
+    if (!email) continue;
+    dedupByEmail.set(email, u);
+  }
+  const uniqueUsers = Array.from(dedupByEmail.values());
+  let menunggu = 0;
+  let aktif = 0;
+  let kedaluwarsa = 0;
+  let diblokir = 0;
+
+  const rows = uniqueUsers.map((u) => {
+    const cat = computeUserEffectiveCategory(u);
+    if (cat === "menunggu") menunggu++;
+    else if (cat === "aktif") aktif++;
+    else if (cat === "kedaluwarsa") kedaluwarsa++;
+    else if (cat === "diblokir") diblokir++;
+
+    const statusLabel =
+      cat === "menunggu"
+        ? "Daftar Tunggu (Menunggu ACC)"
+        : cat === "aktif"
+        ? "Aktif (ACC)"
+        : cat === "kedaluwarsa"
+        ? "Kedaluwarsa"
+        : "Diblokir";
+
+    return {
+      email: normalizeEmail(u.email),
+      namaLengkap: String(u.namaLengkap || "").trim(),
+      profesi: String(u.profesi || "").trim(),
+      namaSPPG: String(u.namaSPPG || "").trim(),
+      noHp: String(u.noHp || "").trim(),
+      peran: u.peran === "ADMIN" ? "ADMIN" : "USER",
+      statusPersetujuan: String(u.statusPersetujuan || "menunggu"),
+      statusEfektif: cat,
+      statusLabel,
+      mulaiPada: typeof u.mulaiPada === "string" ? u.mulaiPada.trim() : "",
+      berakhirPada:
+        typeof u.berakhirPada === "string" && u.berakhirPada.trim()
+          ? u.berakhirPada.trim()
+          : "Tanpa Batas",
+      keterangan: typeof u.keterangan === "string" ? u.keterangan.trim() : "",
+      loginPertama: String(u.loginPertama || u.createdAt || ""),
+      loginTerakhir: String(u.loginTerakhir || ""),
+      loginCount: Number(u.loginCount) || 1,
+      sumber: String(u.sumber || (u.registeredViaSpreadsheet ? "Spreadsheet" : "Login Google")),
+    };
+  });
+
+  return {
+    action: "sync_users",
+    app: "SISPERMBG",
+    syncedAt: new Date().toISOString(),
+    summary: {
+      total: rows.length,
+      menunggu,
+      aktif,
+      kedaluwarsa,
+      diblokir,
+    },
+    users: rows,
+  };
+};
+
+const dispatchAppsScriptWebhook = async (
+  webhookUrl: string,
+  usersList: Record<string, any>[]
+): Promise<{
+  ok: boolean;
+  statusCode?: number;
+  pushedCount: number;
+  syncedAt: string;
+  message: string;
+}> => {
+  const trimmedUrl = (webhookUrl || "").trim();
+  const nowIso = new Date().toISOString();
+  if (!isValidAppsScriptWebhookUrl(trimmedUrl)) {
+    return {
+      ok: false,
+      pushedCount: 0,
+      syncedAt: nowIso,
+      message:
+        "URL Webhook harus berupa tautan HTTPS Google Apps Script Web App (https://script.google.com/macros/s/.../exec).",
+    };
+  }
+
+  const payload = buildAppsScriptWebhookPayload(usersList);
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12_000);
+    const resp = await fetch(trimmedUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "text/plain;charset=utf-8",
+      },
+      redirect: "follow",
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    const text = await resp.text().catch(() => "");
+    if (!resp.ok) {
+      return {
+        ok: false,
+        statusCode: resp.status,
+        pushedCount: 0,
+        syncedAt: nowIso,
+        message: `Apps Script Webhook mengembalikan status ${resp.status}. Pastikan Web App dideploy dengan akses "Anyone" (Siapa saja).`,
+      };
+    }
+
+    let parsedResp: any = null;
+    try {
+      parsedResp = JSON.parse(text);
+    } catch {}
+
+    if (parsedResp && parsedResp.ok === false) {
+      return {
+        ok: false,
+        statusCode: resp.status,
+        pushedCount: 0,
+        syncedAt: nowIso,
+        message: parsedResp.error || "Apps Script Webhook melaporkan kegagalan pemrosesan.",
+      };
+    }
+
+    if (sheetSyncConfig && sheetSyncConfig.webhookUrl === trimmedUrl) {
+      sheetSyncConfig = {
+        ...sheetSyncConfig,
+        lastWebhookPushAt: nowIso,
+        lastWebhookStatus: `Berhasil (${payload.users.length} pengguna)`,
+      };
+      schedulePersistRealtimeCache();
+    }
+
+    return {
+      ok: true,
+      statusCode: resp.status,
+      pushedCount: payload.users.length,
+      syncedAt: nowIso,
+      message: `Data ${payload.users.length} pengguna & ringkasan status berhasil dikirim ke Google Spreadsheet melalui Apps Script Webhook.`,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      pushedCount: 0,
+      syncedAt: nowIso,
+      message:
+        err?.name === "AbortError"
+          ? "Waktu koneksi ke Google Apps Script Webhook habis (timeout 12 detik)."
+          : err?.message || "Gagal mengirim data ke Google Apps Script Webhook.",
+    };
+  }
+};
+
+const scheduleAutoWebhookPush = () => {
+  if (!sheetSyncConfig?.autoWebhookEnabled || !sheetSyncConfig?.webhookUrl) return;
+  if (!isValidAppsScriptWebhookUrl(sheetSyncConfig.webhookUrl)) return;
+  if (autoWebhookTimer) clearTimeout(autoWebhookTimer);
+  const targetUrl = sheetSyncConfig.webhookUrl;
+  autoWebhookTimer = setTimeout(() => {
+    autoWebhookTimer = null;
+    dispatchAppsScriptWebhook(targetUrl, Array.from(realtimeUsers.values())).catch((err) => {
+      console.warn("[AppsScriptWebhook] Auto-push notice:", err);
+    });
+  }, 1800);
 };
 
 const parseSheetRowsOnServer = (rows: string[][]): ServerSheetUserRow[] => {
@@ -437,8 +678,12 @@ const parseSheetRowsOnServer = (rows: string[][]): ServerSheetUserRow[] => {
   let hpIdx = 4;
   let peranIdx = 5;
   let statusIdx = 6;
+  let mulaiIdx = -1;
   let berakhirIdx = 7;
+  let keteranganIdx = -1;
+  let loginPertamaIdx = -1;
   let loginIdx = 8;
+  let loginCountIdx = -1;
   let sumberIdx = 9;
 
   if (!firstRowHasEmail) {
@@ -454,8 +699,12 @@ const parseSheetRowsOnServer = (rows: string[][]): ServerSheetUserRow[] => {
       hpIdx = findHeader([/no\.?\s*hp/, /^hp$/, /whatsapp/, /\bwa\b/, /telepon/, /phone/, /kontak/]);
       peranIdx = findHeader([/^peran$/, /^role$/, /hak\s*akses/, /level/]);
       statusIdx = hStatus;
-      berakhirIdx = findHeader([/berakhir/, /masa\s*aktif/, /expir/, /kadaluarsa/, /berlaku/]);
+      mulaiIdx = findHeader([/mulai/, /start\s*date/, /tanggal\s*mulai/]);
+      berakhirIdx = findHeader([/berakhir/, /masa\s*aktif/, /expir/, /kadaluarsa/, /kedaluwarsa/, /berlaku/]);
+      keteranganIdx = findHeader([/keterangan/, /catatan/, /note/, /alasan/]);
+      loginPertamaIdx = findHeader([/login\s*pertama/, /first\s*login/]);
       loginIdx = findHeader([/login\s*terakhir/, /last\s*login/, /terakhir\s*masuk/]);
+      loginCountIdx = findHeader([/jumlah\s*login/, /login\s*count/, /total\s*login/]);
       sumberIdx = findHeader([/sumber/, /source/]);
     }
   }
@@ -488,6 +737,7 @@ const parseSheetRowsOnServer = (rows: string[][]): ServerSheetUserRow[] => {
     const safeName =
       rawName && normalizeEmail(rawName) !== email ? rawName : email.split("@")[0] || "Pengguna SISPERMBG";
     const rawRole = getVal(peranIdx).toUpperCase();
+    const rawCount = Number(getVal(loginCountIdx));
 
     byEmail.set(email, {
       rowNumber: i + 1,
@@ -498,8 +748,12 @@ const parseSheetRowsOnServer = (rows: string[][]): ServerSheetUserRow[] => {
       noHp: getVal(hpIdx).slice(0, 40),
       peran: rawRole === "ADMIN" || rawRole === "ADMINISTRATOR" ? "ADMIN" : "USER",
       statusPersetujuan: normalizeServerSheetStatus(getVal(statusIdx)),
-      berakhirPada: (getVal(berakhirIdx) || getDefaultSheetExpDate()).slice(0, 32),
+      mulaiPada: normalizeDateCell(getVal(mulaiIdx)),
+      berakhirPada: normalizeDateCell(getVal(berakhirIdx)),
+      keterangan: getVal(keteranganIdx).slice(0, 300),
+      loginPertama: getVal(loginPertamaIdx).slice(0, 64),
       loginTerakhir: getVal(loginIdx).slice(0, 64),
+      loginCount: Number.isFinite(rawCount) && rawCount > 0 ? Math.floor(rawCount) : 1,
       sumber: (getVal(sumberIdx) || "Spreadsheet").slice(0, 64),
     });
   }
@@ -525,14 +779,16 @@ const mergeSheetUsersIntoRealtimeHub = (sheetUsers: ServerSheetUserRow[]) => {
     }
 
     if (existingVal && existingKey) {
-      // Preserve real Firebase UID; promote menunggu -> aktif if spreadsheet explicitly grants aktif
       const mergedUser: Record<string, any> = {
         ...existingVal,
         namaLengkap: existingVal.namaLengkap || su.namaLengkap,
         profesi: existingVal.profesi || su.profesi,
         namaSPPG: existingVal.namaSPPG || su.namaSPPG,
         noHp: existingVal.noHp || su.noHp,
-        berakhirPada: existingVal.berakhirPada || su.berakhirPada,
+        mulaiPada: existingVal.mulaiPada ?? su.mulaiPada ?? "",
+        berakhirPada:
+          existingVal.berakhirPada !== undefined ? existingVal.berakhirPada : su.berakhirPada ?? "",
+        keterangan: existingVal.keterangan || su.keterangan || "",
         peran: existingVal.peran === "ADMIN" ? "ADMIN" : su.peran,
         statusPersetujuan:
           existingVal.statusPersetujuan === "menunggu" && su.statusPersetujuan === "aktif"
@@ -556,11 +812,15 @@ const mergeSheetUsersIntoRealtimeHub = (sheetUsers: ServerSheetUserRow[]) => {
         noHp: su.noHp,
         peran: su.peran,
         statusPersetujuan: su.statusPersetujuan,
-        berakhirPada: su.berakhirPada,
+        mulaiPada: su.mulaiPada || "",
+        berakhirPada: su.berakhirPada || "",
+        keterangan: su.keterangan || "",
         authProvider: "google",
         emailVerified: true,
         registeredViaSpreadsheet: true,
         sumber: su.sumber || "Spreadsheet",
+        loginPertama: su.loginPertama || nowIso,
+        loginCount: su.loginCount || 1,
         createdAt: nowIso,
         updatedAt: nowIso,
         loginTerakhir: su.loginTerakhir || null,
@@ -685,6 +945,27 @@ const sanitizeRealtimeUser = (raw: Record<string, any>): Record<string, any> | n
       }
     }
   }
+  const resolvedMulaiPada =
+    raw.mulaiPada !== undefined
+      ? clampField(raw.mulaiPada === null ? "" : String(raw.mulaiPada), 32)
+      : clampField(prev.mulaiPada ?? "", 32);
+  const resolvedBerakhirPada =
+    raw.berakhirPada !== undefined
+      ? clampField(raw.berakhirPada === null ? "" : String(raw.berakhirPada), 32)
+      : clampField(prev.berakhirPada ?? "", 32);
+  const resolvedKeterangan =
+    raw.keterangan !== undefined
+      ? clampField(raw.keterangan === null ? "" : String(raw.keterangan), 300)
+      : clampField(prev.keterangan ?? "", 300);
+  const incomingLoginCount = Number(raw.loginCount);
+  const prevLoginCount = Number(prev.loginCount);
+  const resolvedLoginCount =
+    Number.isFinite(incomingLoginCount) && incomingLoginCount > 0
+      ? Math.floor(incomingLoginCount)
+      : Number.isFinite(prevLoginCount) && prevLoginCount > 0
+      ? Math.floor(prevLoginCount)
+      : 1;
+
   const merged: Record<string, any> = {
     ...prev,
     uid,
@@ -696,7 +977,9 @@ const sanitizeRealtimeUser = (raw: Record<string, any>): Record<string, any> | n
     noHp: clampField(raw.noHp ?? prev.noHp ?? "", 40),
     peran: clampField(raw.peran ?? prev.peran ?? "USER", 32) || "USER",
     statusPersetujuan: clampField(raw.statusPersetujuan ?? prev.statusPersetujuan ?? "menunggu", 32) || "menunggu",
-    berakhirPada: clampField(raw.berakhirPada ?? prev.berakhirPada ?? "", 32),
+    mulaiPada: resolvedMulaiPada,
+    berakhirPada: resolvedBerakhirPada,
+    keterangan: resolvedKeterangan,
     authProvider: clampField(raw.authProvider ?? prev.authProvider ?? "", 32) || undefined,
     sumber: clampField(raw.sumber ?? prev.sumber ?? "", 64) || undefined,
     registeredViaSpreadsheet:
@@ -711,6 +994,17 @@ const sanitizeRealtimeUser = (raw: Record<string, any>): Record<string, any> | n
     lastDeviceLabel: clampField(raw.lastDeviceLabel ?? prev.lastDeviceLabel ?? "", 160) || undefined,
     lastDeviceSeenAt: clampField(raw.lastDeviceSeenAt ?? prev.lastDeviceSeenAt ?? "", 64) || undefined,
     lastDevice: raw.lastDevice && typeof raw.lastDevice === "object" ? raw.lastDevice : prev.lastDevice,
+    loginPertama:
+      typeof prev.loginPertama === "string" && prev.loginPertama
+        ? prev.loginPertama
+        : typeof raw.loginPertama === "string" && raw.loginPertama
+        ? raw.loginPertama
+        : typeof prev.createdAt === "string" && prev.createdAt
+        ? prev.createdAt
+        : typeof raw.createdAt === "string" && raw.createdAt
+        ? raw.createdAt
+        : nowIso,
+    loginCount: resolvedLoginCount,
     createdAt: typeof raw.createdAt === "string" && raw.createdAt ? raw.createdAt : prev.createdAt || nowIso,
     updatedAt: nowIso,
     loginTerakhir:
@@ -891,6 +1185,7 @@ async function startServer() {
     realtimeUsers.set(sanitized.uid, sanitized);
     schedulePersistRealtimeCache();
     broadcastRealtimeEvent("user_upsert", sanitized);
+    scheduleAutoWebhookPush();
     res.json({ ok: true, user: sanitized, serverTime: new Date().toISOString() });
   });
 
@@ -910,6 +1205,7 @@ async function startServer() {
     }
     schedulePersistRealtimeCache();
     broadcastRealtimeEvent("user_delete", { uid, email, removedUids });
+    scheduleAutoWebhookPush();
     res.json({ ok: true, removedUids });
   });
 
@@ -938,7 +1234,7 @@ async function startServer() {
     res.json({ ok: true, deviceId });
   });
 
-  // 1c. Google Sheets Bidirectional User Sync Config & Live Lookup Routes
+  // 1c. Google Sheets Bidirectional User Sync Config, Apps Script Webhook & Live Lookup Routes
   app.get("/api/realtime/sheet-config", (_req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.json({
@@ -951,24 +1247,80 @@ async function startServer() {
 
   app.post("/api/realtime/sheet-config", (req, res) => {
     const body = parseJsonBodySafe(req.body);
-    const spreadsheetId = clampField(body.spreadsheetId, 128);
-    if (!spreadsheetId || !/^[a-zA-Z0-9_-]+$/.test(spreadsheetId)) {
+    const spreadsheetId = clampField(body.spreadsheetId ?? sheetSyncConfig?.spreadsheetId ?? "", 128);
+    const webhookUrl = clampField(body.webhookUrl ?? sheetSyncConfig?.webhookUrl ?? "", 512);
+
+    if (spreadsheetId && !/^[a-zA-Z0-9_-]+$/.test(spreadsheetId)) {
       res.status(400).json({ ok: false, error: "ID Google Spreadsheet tidak valid." });
       return;
     }
+    if (webhookUrl && !isValidAppsScriptWebhookUrl(webhookUrl)) {
+      res.status(400).json({
+        ok: false,
+        error: "URL Apps Script Webhook harus diawali https://script.google.com/macros/s/...",
+      });
+      return;
+    }
+    if (!spreadsheetId && !webhookUrl) {
+      res.status(400).json({
+        ok: false,
+        error: "Masukkan tautan Google Spreadsheet atau URL Apps Script Webhook terlebih dahulu.",
+      });
+      return;
+    }
+
     sheetSyncConfig = {
-      sheetUrl: clampField(body.sheetUrl, 512) || `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit`,
+      sheetUrl:
+        clampField(body.sheetUrl ?? sheetSyncConfig?.sheetUrl ?? "", 512) ||
+        (spreadsheetId ? `https://docs.google.com/spreadsheets/d/${spreadsheetId}/edit` : ""),
       spreadsheetId,
-      gid: clampField(body.gid, 40),
-      sheetTitle: clampField(body.sheetTitle, 120),
-      spreadsheetTitle: clampField(body.spreadsheetTitle, 200),
+      gid: clampField(body.gid ?? sheetSyncConfig?.gid ?? "", 40),
+      sheetTitle: clampField(body.sheetTitle ?? sheetSyncConfig?.sheetTitle ?? "", 120),
+      spreadsheetTitle: clampField(body.spreadsheetTitle ?? sheetSyncConfig?.spreadsheetTitle ?? "", 200),
+      webhookUrl,
+      autoWebhookEnabled:
+        typeof body.autoWebhookEnabled === "boolean"
+          ? body.autoWebhookEnabled
+          : Boolean(sheetSyncConfig?.autoWebhookEnabled),
+      lastWebhookPushAt:
+        clampField(body.lastWebhookPushAt ?? sheetSyncConfig?.lastWebhookPushAt ?? "", 64) || undefined,
+      lastWebhookStatus:
+        clampField(body.lastWebhookStatus ?? sheetSyncConfig?.lastWebhookStatus ?? "", 160) || undefined,
       updatedAt: new Date().toISOString(),
-      updatedBy: clampField(body.updatedBy, 160) || undefined,
+      updatedBy: clampField(body.updatedBy ?? sheetSyncConfig?.updatedBy ?? "", 160) || undefined,
     };
     lastPublicSheetFetchAt = 0; // Force fresh lookup on next login
     schedulePersistRealtimeCache();
     broadcastRealtimeEvent("sheet_config_update", sheetSyncConfig);
     res.json({ ok: true, config: sheetSyncConfig });
+  });
+
+  app.post("/api/sheets/webhook-push", async (req, res) => {
+    const body = parseJsonBodySafe(req.body);
+    const targetUrl = clampField(body.webhookUrl || sheetSyncConfig?.webhookUrl || "", 512);
+    if (!targetUrl) {
+      res.status(400).json({
+        ok: false,
+        error: "URL Apps Script Webhook belum diatur. Tempel URL Web App Google Apps Script terlebih dahulu.",
+      });
+      return;
+    }
+
+    const incomingUsers = Array.isArray(body.users) ? body.users : [];
+    const combinedByEmail = new Map<string, Record<string, any>>();
+    for (const u of realtimeUsers.values()) {
+      const em = normalizeEmail(u.email);
+      if (em) combinedByEmail.set(em, u);
+    }
+    for (const u of incomingUsers) {
+      const em = normalizeEmail(u?.email);
+      if (em) {
+        combinedByEmail.set(em, { ...(combinedByEmail.get(em) || {}), ...u, email: em });
+      }
+    }
+
+    const result = await dispatchAppsScriptWebhook(targetUrl, Array.from(combinedByEmail.values()));
+    res.status(result.ok ? 200 : 400).json(result);
   });
 
   app.post("/api/realtime/sheet-users-cache", (req, res) => {
@@ -987,8 +1339,12 @@ async function startServer() {
         noHp: clampField(item?.noHp, 40),
         peran: String(item?.peran || "").toUpperCase() === "ADMIN" ? "ADMIN" : "USER",
         statusPersetujuan: normalizeServerSheetStatus(item?.statusPersetujuan),
-        berakhirPada: clampField(item?.berakhirPada, 32) || getDefaultSheetExpDate(),
+        mulaiPada: normalizeDateCell(String(item?.mulaiPada ?? "")),
+        berakhirPada: normalizeDateCell(String(item?.berakhirPada ?? "")),
+        keterangan: clampField(item?.keterangan, 300),
+        loginPertama: clampField(item?.loginPertama, 64),
         loginTerakhir: clampField(item?.loginTerakhir, 64),
+        loginCount: Number(item?.loginCount) > 0 ? Math.floor(Number(item.loginCount)) : 1,
         sumber: clampField(item?.sumber, 64) || "Spreadsheet",
       });
     }

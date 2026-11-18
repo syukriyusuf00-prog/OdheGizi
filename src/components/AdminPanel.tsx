@@ -1,98 +1,91 @@
-import React, { useState, useEffect, useRef } from "react";
-import { 
-  collection, 
-  getDocs, 
-  doc, 
-  setDoc,
-  updateDoc, 
-  deleteDoc, 
+import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import {
+  collection,
   onSnapshot,
-  serverTimestamp 
+  doc,
+  setDoc,
+  deleteDoc,
+  serverTimestamp,
 } from "firebase/firestore";
+import { db, reportFirestoreWriteResult } from "../lib/firebase.ts";
 import {
-  db,
-  FIREBASE_PROJECT_ID,
-  FIRESTORE_DATABASE_ID,
-  FIRESTORE_UPGRADE_URL,
-  FirestoreHealthState,
-  getFirestoreHealth,
-  subscribeFirestoreHealth,
-  testFirestoreConnection,
-  reportFirestoreWriteResult,
-} from "../lib/firebase.ts";
-import {
+  DEFAULT_WAITING_NOTE,
   isMainAdminEmail,
   syncUserToRealtimeHub,
   deleteUserFromRealtimeHub,
 } from "../context/AuthContext.tsx";
-import { 
-  Users, 
-  CheckCircle, 
-  Clock, 
-  Search, 
-  Trash2, 
-  Calendar, 
-  Shield, 
-  ShieldAlert, 
-  RefreshCw, 
-  UserCheck, 
-  XCircle, 
-  Database, 
-  Cpu, 
-  History,
-  Mail,
-  User,
-  Briefcase,
-  Building,
-  Key,
-  Camera,
+import {
+  Search,
+  Download,
+  UserCheck,
+  Ban,
+  Trash2,
+  RotateCcw,
+  Save,
+  X,
+  CheckCircle2,
+  AlertCircle,
+  Loader2,
   Smartphone,
   Tablet,
-  Laptop,
   Monitor,
-  Globe,
-  Wifi,
-  WifiOff,
-  MailCheck,
-  AlertTriangle,
-  ExternalLink
+  Camera,
+  ChevronDown,
+  ChevronUp,
+  ArrowLeft,
 } from "lucide-react";
-import { DeviceRecord, getCachedLocalDevice, formatDeviceShortLabel } from "../lib/deviceTracker.ts";
+import { DeviceRecord } from "../lib/deviceTracker.ts";
+import { downloadUsersCsv } from "../lib/googleSheetsSync.ts";
 import SpreadsheetUserSyncCard from "./SpreadsheetUserSyncCard.tsx";
+
+const isDeviceCurrentlyOnline = (d: DeviceRecord): boolean => {
+  if (!d || d.isOnline === false) return false;
+  const lastMs = d.lastSeenAt ? new Date(d.lastSeenAt).getTime() : 0;
+  if (!lastMs || Number.isNaN(lastMs)) return Boolean(d.isOnline);
+  return Date.now() - lastMs <= 2 * 60 * 1000;
+};
+
+const deleteDeviceFromRealtimeHub = async (deviceId: string): Promise<void> => {
+  try {
+    await fetch("/api/realtime/delete-device", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId }),
+    });
+  } catch {}
+};
 
 interface AdminPanelProps {
   onClose: () => void;
-  globalLogoUrl?: string;
+  globalLogoUrl?: string | null;
   onUploadGlobalLogo?: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  adminEmail?: string;
+}
+
+type StatusFilter = "semua" | "menunggu" | "aktif" | "kedaluwarsa" | "diblokir";
+
+interface UserDraft {
+  mulaiPada: string;
+  berakhirPada: string;
+  keterangan: string;
 }
 
 const fetchWithTimeout = <T,>(promise: Promise<T>, timeoutMs: number, defaultValue: T): Promise<T> => {
   return Promise.race([
     promise,
-    new Promise<T>((resolve) => setTimeout(() => resolve(defaultValue), timeoutMs))
+    new Promise<T>((resolve) => setTimeout(() => resolve(defaultValue), timeoutMs)),
   ]);
 };
 
-const DEFAULT_DELETED_EMAILS = [
-  "sofstory96@gmail.com",
-  "desylarasati33@gmail.com",
-  "saharhesa781@gmail.com",
-  "raniramadani696@gmail.com",
-  "erickhernando1@gmail.com",
-  "imranjho373@gmail.com",
-  "widyaainunpratiwi@gmail.com"
-];
-
-// Helper to manage deleted tenant emails persistence
 export const getDeletedTenantEmails = (): Set<string> => {
   try {
     const raw = localStorage.getItem("deleted_tenant_emails");
-    if (raw !== null) {
-      const arr = JSON.parse(raw);
-      return new Set(arr.map((e: string) => e.toLowerCase().trim()));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return new Set(parsed.map((e: string) => e.toLowerCase().trim()));
     }
-  } catch (e) {}
-  return new Set(DEFAULT_DELETED_EMAILS.map(e => e.toLowerCase().trim()));
+  } catch {}
+  return new Set();
 };
 
 export const addDeletedTenantEmail = (email: string) => {
@@ -105,2131 +98,1610 @@ export const addDeletedTenantEmail = (email: string) => {
 export const removeDeletedTenantEmail = (email: string) => {
   if (!email) return;
   const set = getDeletedTenantEmails();
-  set.delete(email.toLowerCase().trim());
-  localStorage.setItem("deleted_tenant_emails", JSON.stringify(Array.from(set)));
+  if (set.delete(email.toLowerCase().trim())) {
+    localStorage.setItem("deleted_tenant_emails", JSON.stringify(Array.from(set)));
+  }
 };
 
-// Scan localStorage for any offline registered user profiles
-const getOfflineUsers = () => {
-  const list: any[] = [];
+const getTodayIsoLocal = (): string => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+    now.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const addDurationToDateIso = (
+  baseIso: string | undefined,
+  delta: { days?: number; months?: number; years?: number }
+): string => {
+  const todayIso = getTodayIsoLocal();
+  const baseStr = baseIso && /^\d{4}-\d{2}-\d{2}$/.test(baseIso) && baseIso >= todayIso ? baseIso : todayIso;
+  const [y, m, d] = baseStr.split("-").map(Number);
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  if (delta.days) dt.setDate(dt.getDate() + delta.days);
+  if (delta.months) dt.setMonth(dt.getMonth() + delta.months);
+  if (delta.years) dt.setFullYear(dt.getFullYear() + delta.years);
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, "0")}-${String(
+    dt.getDate()
+  ).padStart(2, "0")}`;
+};
+
+const getTimestampMs = (ts: any): number => {
+  if (!ts) return 0;
+  try {
+    if (typeof ts?.seconds === "number") return ts.seconds * 1000;
+    if (typeof ts?.toDate === "function") return ts.toDate().getTime();
+    const d = new Date(ts);
+    return Number.isNaN(d.getTime()) ? 0 : d.getTime();
+  } catch {
+    return 0;
+  }
+};
+
+const formatDateTimeId = (ts: any): string => {
+  const ms = getTimestampMs(ts);
+  if (!ms) return "—";
+  try {
+    const dt = new Date(ms);
+    const datePart = dt.toLocaleDateString("id-ID", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+    const timePart = dt
+      .toLocaleTimeString("id-ID", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      })
+      .replace(":", ".");
+    return `${datePart}, ${timePart}`;
+  } catch {
+    return "—";
+  }
+};
+
+const getEffectiveCategory = (
+  u: any,
+  todayIso: string
+): "menunggu" | "aktif" | "kedaluwarsa" | "diblokir" => {
+  const rawStatus = String(u?.statusPersetujuan || "menunggu").toLowerCase();
+  if (rawStatus === "diblokir") return "diblokir";
+  if (rawStatus === "menunggu" || rawStatus === "pending") return "menunggu";
+  const berakhir = typeof u?.berakhirPada === "string" ? u.berakhirPada.trim() : "";
+  if (berakhir && u?.peran !== "ADMIN" && !isMainAdminEmail(u?.email) && todayIso > berakhir) {
+    return "kedaluwarsa";
+  }
+  return "aktif";
+};
+
+const isScheduledInFuture = (u: any, todayIso: string): boolean => {
+  if (u?.peran === "ADMIN" || isMainAdminEmail(u?.email)) return false;
+  if (String(u?.statusPersetujuan || "").toLowerCase() !== "aktif") return false;
+  const mulai = typeof u?.mulaiPada === "string" ? u.mulaiPada.trim() : "";
+  return Boolean(mulai && todayIso < mulai);
+};
+
+const readLocalCachedUsers = (): any[] => {
+  const localUsers: any[] = [];
   const deletedEmails = getDeletedTenantEmails();
   try {
     for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith("offline_user_")) {
-        const val = localStorage.getItem(key);
+      const k = localStorage.key(i);
+      if (k && k.startsWith("offline_user_")) {
+        const val = localStorage.getItem(k);
         if (val) {
-          try {
-            const parsed = JSON.parse(val);
-            const userEmail = (parsed.email || "").toLowerCase().trim();
-            if (!deletedEmails.has(userEmail)) {
-              list.push(parsed);
+          const parsed = JSON.parse(val);
+          if (parsed && parsed.email) {
+            const em = parsed.email.toLowerCase().trim();
+            if (!deletedEmails.has(em) && em !== "demo@sispermbg.id") {
+              localUsers.push({
+                id: parsed.uid || k.replace("offline_user_", ""),
+                ...parsed,
+              });
             }
-          } catch (e) {}
+          }
         }
       }
     }
-  } catch (e) {
-    console.warn("Notice reading offline users:", e);
-  }
-  return list;
+  } catch {}
+  return localUsers;
 };
 
-export default function AdminPanel({ onClose, globalLogoUrl, onUploadGlobalLogo }: AdminPanelProps) {
-  const [users, setUsers] = useState<any[]>([]);
-  const [devices, setDevices] = useState<DeviceRecord[]>(() => {
-    const localDev = getCachedLocalDevice();
-    return localDev ? [localDev] : [];
-  });
-  const [deviceFilter, setDeviceFilter] = useState<"all" | "online" | "Desktop / Laptop" | "Mobile" | "Tablet" | "guest" | "demo">("all");
-  const [deviceSearchQuery, setDeviceSearchQuery] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [searchQuery, setSearchQuery] = useState("");
-  const [activeTab, setActiveTab] = useState<"manajemen" | "perangkat" | "riwayat" | "diagnostik">(() => {
-    return (localStorage.getItem("sisper_admin_tab") as any) || "manajemen";
-  });
-  const [refreshTrigger, setRefreshTrigger] = useState(0);
-  const [selectedUserUids, setSelectedUserUids] = useState<string[]>([]);
-  const [nowTick, setNowTick] = useState(() => Date.now());
-  const [firestoreHealth, setFirestoreHealth] = useState<FirestoreHealthState>(() => getFirestoreHealth());
-  const [sseStatus, setSseStatus] = useState<"connecting" | "connected" | "reconnecting">("connecting");
-  const [lastLiveEventAt, setLastLiveEventAt] = useState<string | null>(null);
-  const [testingDb, setTestingDb] = useState(false);
+const mergeDeduplicatedUsers = (sources: any[][]): any[] => {
+  const deletedEmails = getDeletedTenantEmails();
+  const byEmail = new Map<string, any>();
 
-  // Keep dual-channel real-time stores (Firestore + Express SSE Hub) merged cleanly without clobbering
+  const isPlaceholderId = (id: string) =>
+    id.startsWith("custom_user_") || id.startsWith("sheet_user_") || id.startsWith("admin_");
+
+  sources.flat().forEach((raw) => {
+    if (!raw || !raw.email) return;
+    const em = String(raw.email).toLowerCase().trim();
+    if (!em || em === "demo@sispermbg.id" || deletedEmails.has(em)) return;
+
+    const uid = String(raw.uid || raw.id || `user_${em.replace(/[^a-z0-9]/g, "_")}`);
+    const normalized = {
+      ...raw,
+      id: uid,
+      uid,
+      email: em,
+    };
+
+    const existing = byEmail.get(em);
+    if (!existing) {
+      byEmail.set(em, {
+        ...normalized,
+        _allIds: [uid],
+      });
+      return;
+    }
+
+    const allIds = Array.from(new Set([...(existing._allIds || [existing.id]), uid]));
+    const existingMs = Math.max(getTimestampMs(existing.updatedAt), getTimestampMs(existing.loginTerakhir));
+    const incomingMs = Math.max(getTimestampMs(normalized.updatedAt), getTimestampMs(normalized.loginTerakhir));
+
+    const preferredId =
+      !isPlaceholderId(uid) && isPlaceholderId(existing.id)
+        ? uid
+        : !isPlaceholderId(existing.id) && isPlaceholderId(uid)
+        ? existing.id
+        : incomingMs >= existingMs
+        ? uid
+        : existing.id;
+
+    const base = incomingMs >= existingMs ? { ...existing, ...normalized } : { ...normalized, ...existing };
+    const firstMsExisting = getTimestampMs(existing.loginPertama || existing.createdAt);
+    const firstMsIncoming = getTimestampMs(normalized.loginPertama || normalized.createdAt);
+    const earliestFirst =
+      firstMsExisting > 0 && (firstMsIncoming === 0 || firstMsExisting <= firstMsIncoming)
+        ? existing.loginPertama || existing.createdAt
+        : normalized.loginPertama || normalized.createdAt;
+
+    byEmail.set(em, {
+      ...base,
+      id: preferredId,
+      uid: preferredId,
+      email: em,
+      loginPertama: earliestFirst || base.createdAt,
+      loginCount: Math.max(Number(existing.loginCount) || 1, Number(normalized.loginCount) || 1),
+      mulaiPada:
+        incomingMs >= existingMs
+          ? normalized.mulaiPada !== undefined
+            ? String(normalized.mulaiPada ?? "")
+            : String(existing.mulaiPada ?? "")
+          : existing.mulaiPada !== undefined
+          ? String(existing.mulaiPada ?? "")
+          : String(normalized.mulaiPada ?? ""),
+      berakhirPada:
+        incomingMs >= existingMs
+          ? normalized.berakhirPada !== undefined
+            ? String(normalized.berakhirPada ?? "")
+            : String(existing.berakhirPada ?? "")
+          : existing.berakhirPada !== undefined
+          ? String(existing.berakhirPada ?? "")
+          : String(normalized.berakhirPada ?? ""),
+      keterangan:
+        incomingMs >= existingMs
+          ? normalized.keterangan !== undefined
+            ? String(normalized.keterangan ?? "")
+            : String(existing.keterangan ?? "")
+          : existing.keterangan !== undefined
+          ? String(existing.keterangan ?? "")
+          : String(normalized.keterangan ?? ""),
+      _allIds: allIds,
+    });
+  });
+
+  const todayIso = getTodayIsoLocal();
+  const priorityWeight = (u: any): number => {
+    const cat = getEffectiveCategory(u, todayIso);
+    if (cat === "menunggu") return 0;
+    if (cat === "kedaluwarsa") return 1;
+    if (cat === "diblokir") return 2;
+    return 3;
+  };
+
+  return Array.from(byEmail.values()).sort((a, b) => {
+    const diff = priorityWeight(a) - priorityWeight(b);
+    if (diff !== 0) return diff;
+    const tA = Math.max(getTimestampMs(a.loginTerakhir), getTimestampMs(a.updatedAt), getTimestampMs(a.createdAt));
+    const tB = Math.max(getTimestampMs(b.loginTerakhir), getTimestampMs(b.updatedAt), getTimestampMs(b.createdAt));
+    return tB - tA;
+  });
+};
+
+export default function AdminPanel({
+  onClose,
+  globalLogoUrl,
+  onUploadGlobalLogo,
+  adminEmail,
+}: AdminPanelProps) {
   const firestoreUsersRef = useRef<any[]>([]);
-  const hubUsersRef = useRef<Map<string, any>>(new Map());
+  const hubUsersRef = useRef<any[]>([]);
   const firestoreDevicesRef = useRef<DeviceRecord[]>([]);
-  const hubDevicesRef = useRef<Map<string, DeviceRecord>>(new Map());
+  const hubDevicesRef = useRef<DeviceRecord[]>([]);
 
-  useEffect(() => {
-    const unsub = subscribeFirestoreHealth(setFirestoreHealth);
-    testFirestoreConnection().catch(() => {});
-    return unsub;
+  const [users, setUsers] = useState<any[]>(() => mergeDeduplicatedUsers([readLocalCachedUsers()]));
+  const [devices, setDevices] = useState<DeviceRecord[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const [searchInput, setSearchInput] = useState("");
+  const [appliedSearch, setAppliedSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("semua");
+  const [highlightedEmail, setHighlightedEmail] = useState<string | null>(null);
+
+  const [drafts, setDrafts] = useState<Record<string, UserDraft>>({});
+  const [savingEmail, setSavingEmail] = useState<string | null>(null);
+  const [recentlySavedEmail, setRecentlySavedEmail] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
+
+  // Modals & compact drawers
+  const [deleteTargetUser, setDeleteTargetUser] = useState<any | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isLogoModalOpen, setIsLogoModalOpen] = useState(false);
+  const [showDevicesDrawer, setShowDevicesDrawer] = useState(false);
+
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+
+  const showToast = useCallback((type: "success" | "error" | "info", text: string) => {
+    setToast({ type, text });
   }, []);
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNowTick(Date.now()), 30_000);
-    return () => window.clearInterval(timer);
+    if (!toast) return;
+    const timer = window.setTimeout(() => setToast(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [toast]);
+
+  const recomputeUsers = useCallback(() => {
+    const merged = mergeDeduplicatedUsers([
+      firestoreUsersRef.current,
+      hubUsersRef.current,
+      readLocalCachedUsers(),
+    ]);
+    setUsers(merged);
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem("sisper_admin_tab", activeTab);
-  }, [activeTab]);
-
-  // Load all users & devices combining Firestore real-time onSnapshot + Server SSE Real-Time Hub + local cache
-  useEffect(() => {
-    setLoading(true);
-
-    const mainAdminDoc = {
-      id: "admin_syukriyusuf82",
-      uid: "admin_syukriyusuf82",
-      email: "syukriyusuf82@gmail.com",
-      namaLengkap: "LA ODE MUHAMMAD SUKRI YUSUF",
-      profesi: "AHLI GIZI",
-      namaSPPG: "SPPG MUNA BARAT SAWERIGADI ONDOKE",
-      noHp: "082271095251",
-      peran: "ADMIN",
-      statusPersetujuan: "aktif",
-      berakhirPada: "2035-12-31"
-    };
-
-    const getRecordTimeMs = (val: any): number => {
-      if (!val) return 0;
-      if (typeof val === "string") {
-        const t = new Date(val).getTime();
-        return Number.isNaN(t) ? 0 : t;
+  const recomputeDevices = useCallback(() => {
+    const byId = new Map<string, DeviceRecord>();
+    [...firestoreDevicesRef.current, ...hubDevicesRef.current].forEach((d) => {
+      if (!d?.deviceId) return;
+      const prev = byId.get(d.deviceId);
+      if (!prev || getTimestampMs(d.lastSeenAt) >= getTimestampMs(prev.lastSeenAt)) {
+        byId.set(d.deviceId, d);
       }
-      if (typeof val?.seconds === "number") return val.seconds * 1000;
-      return 0;
-    };
+    });
+    const sorted = Array.from(byId.values()).sort(
+      (a, b) => getTimestampMs(b.lastSeenAt) - getTimestampMs(a.lastSeenAt)
+    );
+    setDevices(sorted);
+  }, []);
 
-    const rebuildMergedUsers = () => {
-      const map = new Map<string, any>();
-      map.set("admin_syukriyusuf82", mainAdminDoc);
-      const deletedEmails = getDeletedTenantEmails();
+  // Dual-Channel Real-Time Sync: Firestore onSnapshot + Express SSE Real-Time Hub
+  useEffect(() => {
+    let mounted = true;
 
-      const addToMap = (u: any, isRemote = false) => {
-        if (!u) return;
-        const userEmail = (u.email || "").toLowerCase().trim();
-        if (
-          u.uid === "admin_sukriyusuf82" ||
-          u.uid === "admin_syukriyusuf82" ||
-          (userEmail && isMainAdminEmail(userEmail))
-        ) {
-          return;
+    // 1. Express Real-Time Snapshot + SSE Stream (instant mobile -> laptop detection)
+    fetch("/api/realtime/snapshot", { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((snap) => {
+        if (!mounted || !snap) return;
+        if (Array.isArray(snap.users)) {
+          hubUsersRef.current = snap.users;
+          recomputeUsers();
         }
-        // Only apply local deleted-email filter to stale localStorage caches — NEVER drop live remote registrations from mobile/cloud!
-        if (!isRemote && userEmail && deletedEmails.has(userEmail)) {
-          return;
+        if (Array.isArray(snap.devices)) {
+          hubDevicesRef.current = snap.devices;
+          recomputeDevices();
         }
-
-        const primaryKey = u.uid || u.id || (userEmail ? `custom_user_${userEmail.replace(/[@.]/g, "_")}` : null);
-        if (!primaryKey && !userEmail) return;
-
-        let existingKey: string | null = null;
-        if (primaryKey && map.has(primaryKey)) {
-          existingKey = primaryKey;
-        } else if (userEmail) {
-          for (const [k, v] of map.entries()) {
-            if ((v.email || "").toLowerCase().trim() === userEmail) {
-              existingKey = k;
-              break;
-            }
-          }
-        }
-
-        const existing = existingKey ? map.get(existingKey) : null;
-        // Prefer real Firebase Auth UID over legacy custom_user_* or pre-registered sheet_user_* key when merging same email
-        const incomingIsRealUid = Boolean(
-          primaryKey && !primaryKey.startsWith("custom_user_") && !primaryKey.startsWith("sheet_user_")
-        );
-        const existingIsLegacyUid = Boolean(
-          existingKey && (existingKey.startsWith("custom_user_") || existingKey.startsWith("sheet_user_"))
-        );
-        const keyToUse =
-          existingKey && existingIsLegacyUid && incomingIsRealUid && primaryKey
-            ? primaryKey
-            : existingKey || primaryKey || `custom_user_${userEmail.replace(/[@.]/g, "_")}`;
-
-        if (!existing) {
-          map.set(keyToUse, {
-            ...u,
-            uid: keyToUse,
-            id: keyToUse,
-            statusPersetujuan: u.statusPersetujuan || "menunggu",
-          });
-          return;
-        }
-
-        if (existingKey && existingKey !== keyToUse) {
-          map.delete(existingKey);
-        }
-
-        const existingUpdated = Math.max(
-          getRecordTimeMs(existing.updatedAt),
-          getRecordTimeMs(existing.loginTerakhir),
-          getRecordTimeMs(existing.lastDeviceSeenAt)
-        );
-        const incomingUpdated = Math.max(
-          getRecordTimeMs(u.updatedAt),
-          getRecordTimeMs(u.loginTerakhir),
-          getRecordTimeMs(u.lastDeviceSeenAt)
-        );
-
-        const newer = incomingUpdated >= existingUpdated ? u : existing;
-        const older = incomingUpdated >= existingUpdated ? existing : u;
-
-        const finalStatus = newer.statusPersetujuan || older.statusPersetujuan || "menunggu";
-
-        const merged = {
-          ...older,
-          ...newer,
-          uid: keyToUse,
-          id: keyToUse,
-          statusPersetujuan: finalStatus,
-          loginTerakhir:
-            getRecordTimeMs(u.loginTerakhir) >= getRecordTimeMs(existing.loginTerakhir)
-              ? u.loginTerakhir || existing.loginTerakhir
-              : existing.loginTerakhir || u.loginTerakhir,
-        };
-
-        map.set(keyToUse, merged);
-      };
-
-      // 1. Local offline cache first
-      const offlineList = getOfflineUsers();
-      offlineList.forEach((u) => addToMap(u, false));
-
-      // 2. Remote Firestore documents
-      firestoreUsersRef.current.forEach((u) => addToMap(u, true));
-
-      // 3. Live Server Real-Time Hub users (instant Mobile -> Laptop sync)
-      hubUsersRef.current.forEach((u) => addToMap(u, true));
-
-      const userList = Array.from(map.values());
-      userList.sort((a, b) => {
-        const timeA = Math.max(getRecordTimeMs(a.loginTerakhir), getRecordTimeMs(a.updatedAt), getRecordTimeMs(a.createdAt));
-        const timeB = Math.max(getRecordTimeMs(b.loginTerakhir), getRecordTimeMs(b.updatedAt), getRecordTimeMs(b.createdAt));
-        return timeB - timeA;
+        setLoading(false);
+      })
+      .catch(() => {
+        if (mounted) setLoading(false);
       });
 
-      setUsers(userList);
-      setLoading(false);
-    };
-
-    const rebuildMergedDevices = () => {
-      const map = new Map<string, DeviceRecord>();
-      const upsert = (d: DeviceRecord) => {
-        if (!d?.deviceId) return;
-        const prev = map.get(d.deviceId);
-        if (!prev) {
-          map.set(d.deviceId, d);
-          return;
-        }
-        const prevTime = new Date(prev.lastSeenAt || 0).getTime();
-        const nextTime = new Date(d.lastSeenAt || 0).getTime();
-        map.set(d.deviceId, nextTime >= prevTime ? { ...prev, ...d } : { ...d, ...prev });
-      };
-
-      const localDev = getCachedLocalDevice();
-      if (localDev?.deviceId) upsert(localDev);
-      firestoreDevicesRef.current.forEach(upsert);
-      hubDevicesRef.current.forEach(upsert);
-
-      const sorted = Array.from(map.values()).sort(
-        (a, b) => new Date(b.lastSeenAt || 0).getTime() - new Date(a.lastSeenAt || 0).getTime()
-      );
-      setDevices(sorted);
-    };
-
-    // Immediate initial render
-    rebuildMergedUsers();
-    rebuildMergedDevices();
-
-    // Channel A: Firestore real-time listeners (/users & /devices)
-    const usersCol = collection(db, "users");
-    const unsubscribeUsers = onSnapshot(
-      usersCol,
-      (snapshot) => {
-        const remoteList: any[] = [];
-        snapshot.docs.forEach((docSnap) => {
-          const data = docSnap.data();
-          if (docSnap.id === "admin_sukriyusuf82" || docSnap.id === "admin_syukriyusuf82" || (data.email && isMainAdminEmail(data.email))) {
-            return;
-          }
-          const userUid = data.uid || docSnap.id;
-          remoteList.push({
-            ...data,
-            id: docSnap.id,
-            uid: userUid,
-          });
-        });
-        firestoreUsersRef.current = remoteList;
-        setLastLiveEventAt(new Date().toISOString());
-        rebuildMergedUsers();
-      },
-      (err) => {
-        console.warn("Firestore user listener notice:", err);
-        setLoading(false);
-      }
-    );
-
-    const devicesCol = collection(db, "devices");
-    const unsubscribeDevices = onSnapshot(
-      devicesCol,
-      (snapshot) => {
-        firestoreDevicesRef.current = snapshot.docs.map((docSnap) => {
-          const data = docSnap.data() as DeviceRecord;
-          return {
-            ...data,
-            deviceId: data.deviceId || docSnap.id,
-          };
-        });
-        setLastLiveEventAt(new Date().toISOString());
-        rebuildMergedDevices();
-      },
-      (err) => {
-        console.warn("Firestore devices listener notice:", err);
-      }
-    );
-
-    // Channel B: Real-Time Server SSE Hub (/api/realtime/stream + /api/realtime/snapshot)
-    // Guarantees instant (<1s) Mobile -> Laptop synchronization across networks
-    const hydrateFromServerSnapshot = async () => {
-      try {
-        const resp = await fetch("/api/realtime/snapshot", { cache: "no-store" });
-        if (!resp.ok) return;
-        const json = await resp.json();
-        if (Array.isArray(json?.users)) {
-          hubUsersRef.current = new Map(json.users.filter((u: any) => u?.uid).map((u: any) => [u.uid, u]));
-          rebuildMergedUsers();
-        }
-        if (Array.isArray(json?.devices)) {
-          hubDevicesRef.current = new Map(json.devices.filter((d: any) => d?.deviceId).map((d: any) => [d.deviceId, d]));
-          rebuildMergedDevices();
-        }
-      } catch {}
-    };
-
-    hydrateFromServerSnapshot();
-
-    let eventSource: EventSource | null = null;
+    let sse: EventSource | null = null;
     try {
-      setSseStatus("connecting");
-      eventSource = new EventSource("/api/realtime/stream");
-
-      eventSource.onopen = () => {
-        setSseStatus("connected");
-      };
-
-      eventSource.addEventListener("snapshot", (ev: MessageEvent) => {
+      sse = new EventSource("/api/realtime/stream");
+      sse.addEventListener("snapshot", (ev: MessageEvent) => {
+        if (!mounted) return;
         try {
-          const parsed = JSON.parse(ev.data);
-          setSseStatus("connected");
-          setLastLiveEventAt(new Date().toISOString());
-          if (Array.isArray(parsed?.users)) {
-            hubUsersRef.current = new Map(parsed.users.filter((u: any) => u?.uid).map((u: any) => [u.uid, u]));
-            rebuildMergedUsers();
+          const data = JSON.parse(ev.data);
+          if (Array.isArray(data?.users)) {
+            hubUsersRef.current = data.users;
+            recomputeUsers();
           }
-          if (Array.isArray(parsed?.devices)) {
-            hubDevicesRef.current = new Map(parsed.devices.filter((d: any) => d?.deviceId).map((d: any) => [d.deviceId, d]));
-            rebuildMergedDevices();
+          if (Array.isArray(data?.devices)) {
+            hubDevicesRef.current = data.devices;
+            recomputeDevices();
           }
+          setLoading(false);
         } catch {}
       });
-
-      eventSource.addEventListener("user_upsert", (ev: MessageEvent) => {
+      sse.addEventListener("user_upsert", (ev: MessageEvent) => {
+        if (!mounted) return;
         try {
           const incoming = JSON.parse(ev.data);
-          if (incoming?.uid) {
-            hubUsersRef.current.set(incoming.uid, incoming);
-            setLastLiveEventAt(new Date().toISOString());
-            rebuildMergedUsers();
-          }
+          if (!incoming?.email) return;
+          const em = String(incoming.email).toLowerCase().trim();
+          removeDeletedTenantEmail(em);
+          const next = hubUsersRef.current.filter(
+            (u) => String(u.email || "").toLowerCase().trim() !== em && u.uid !== incoming.uid
+          );
+          next.unshift(incoming);
+          hubUsersRef.current = next;
+          recomputeUsers();
         } catch {}
       });
-
-      eventSource.addEventListener("user_delete", (ev: MessageEvent) => {
+      sse.addEventListener("user_delete", (ev: MessageEvent) => {
+        if (!mounted) return;
         try {
           const payload = JSON.parse(ev.data);
-          const targetEmail = (payload?.email || "").toLowerCase().trim();
-          const targetUid = payload?.uid || "";
-          for (const [k, u] of hubUsersRef.current.entries()) {
-            if ((targetUid && (k === targetUid || u.uid === targetUid)) || (targetEmail && (u.email || "").toLowerCase().trim() === targetEmail)) {
-              hubUsersRef.current.delete(k);
-            }
-          }
-          setLastLiveEventAt(new Date().toISOString());
-          rebuildMergedUsers();
+          const delEmail = String(payload?.email || "").toLowerCase().trim();
+          const delUid = String(payload?.uid || "");
+          hubUsersRef.current = hubUsersRef.current.filter(
+            (u) =>
+              !(
+                (delUid && (u.uid === delUid || u.id === delUid)) ||
+                (delEmail && String(u.email || "").toLowerCase().trim() === delEmail)
+              )
+          );
+          recomputeUsers();
         } catch {}
       });
-
-      eventSource.addEventListener("device_upsert", (ev: MessageEvent) => {
+      sse.addEventListener("device_upsert", (ev: MessageEvent) => {
+        if (!mounted) return;
         try {
-          const incoming = JSON.parse(ev.data) as DeviceRecord;
-          if (incoming?.deviceId) {
-            hubDevicesRef.current.set(incoming.deviceId, incoming);
-            setLastLiveEventAt(new Date().toISOString());
-            rebuildMergedDevices();
-          }
+          const incoming = JSON.parse(ev.data);
+          if (!incoming?.deviceId) return;
+          hubDevicesRef.current = [
+            incoming,
+            ...hubDevicesRef.current.filter((d) => d.deviceId !== incoming.deviceId),
+          ];
+          recomputeDevices();
         } catch {}
       });
-
-      eventSource.addEventListener("device_delete", (ev: MessageEvent) => {
+      sse.addEventListener("device_delete", (ev: MessageEvent) => {
+        if (!mounted) return;
         try {
           const payload = JSON.parse(ev.data);
           if (payload?.deviceId) {
-            hubDevicesRef.current.delete(payload.deviceId);
-            setLastLiveEventAt(new Date().toISOString());
-            rebuildMergedDevices();
+            hubDevicesRef.current = hubDevicesRef.current.filter(
+              (d) => d.deviceId !== payload.deviceId
+            );
+            recomputeDevices();
           }
         } catch {}
       });
+    } catch {}
 
-      eventSource.onerror = () => {
-        setSseStatus("reconnecting");
-      };
+    // 2. Firestore real-time collection listeners
+    let unsubUsers: (() => void) | null = null;
+    let unsubDevices: (() => void) | null = null;
+
+    try {
+      unsubUsers = onSnapshot(
+        collection(db, "users"),
+        (snapshot) => {
+          if (!mounted) return;
+          const list: any[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data();
+            if (data && data.email) {
+              list.push({ id: docSnap.id, uid: data.uid || docSnap.id, ...data });
+            }
+          });
+          firestoreUsersRef.current = list;
+          recomputeUsers();
+          setLoading(false);
+        },
+        (err) => {
+          console.warn("Firestore users listener notice:", err);
+          if (mounted) setLoading(false);
+        }
+      );
     } catch {
-      setSseStatus("reconnecting");
+      if (mounted) setLoading(false);
     }
 
-    // Periodic lightweight snapshot safety poll (every 12s) in case a corporate proxy buffers SSE
-    const safetyPoll = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        hydrateFromServerSnapshot();
-      }
-    }, 12_000);
-
-    // Same-tab instant registration / device listeners
-    const handleRegistered = (e: any) => {
-      if (e?.detail) {
-        const newUser = e.detail;
-        const newUserEmail = (newUser.email || "").toLowerCase().trim();
-        const emailSlug = newUserEmail.replace(/[@.]/g, "_");
-        const customUid = newUser.uid || `custom_user_${emailSlug}`;
-        localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(newUser));
-        hubUsersRef.current.set(customUid, { ...newUser, uid: customUid, id: customUid });
-      }
-      rebuildMergedUsers();
-    };
-
-    const handleLocalDeviceUpdate = (e: any) => {
-      if (e?.detail?.deviceId) {
-        hubDevicesRef.current.set(e.detail.deviceId, e.detail as DeviceRecord);
-        rebuildMergedDevices();
-      }
-    };
-
-    window.addEventListener("sisper_user_registered", handleRegistered);
-    window.addEventListener("sisper_device_updated", handleLocalDeviceUpdate);
+    try {
+      unsubDevices = onSnapshot(
+        collection(db, "devices"),
+        (snapshot) => {
+          if (!mounted) return;
+          const list: DeviceRecord[] = [];
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as DeviceRecord;
+            if (data && data.deviceId) list.push(data);
+          });
+          firestoreDevicesRef.current = list;
+          recomputeDevices();
+        },
+        (err) => {
+          console.warn("Firestore devices listener notice:", err);
+        }
+      );
+    } catch {}
 
     return () => {
-      unsubscribeUsers();
-      unsubscribeDevices();
-      if (eventSource) eventSource.close();
-      window.clearInterval(safetyPoll);
-      window.removeEventListener("sisper_user_registered", handleRegistered);
-      window.removeEventListener("sisper_device_updated", handleLocalDeviceUpdate);
+      mounted = false;
+      if (sse) sse.close();
+      if (unsubUsers) unsubUsers();
+      if (unsubDevices) unsubDevices();
     };
-  }, [refreshTrigger]);
+  }, [recomputeUsers, recomputeDevices]);
 
-  const isDeviceLiveOnline = (dev?: Partial<DeviceRecord> | null) => {
-    if (!dev || dev.isOnline === false || !dev.lastSeenAt) return false;
-    const seenMs = new Date(dev.lastSeenAt).getTime();
-    if (Number.isNaN(seenMs)) return false;
-    return nowTick - seenMs < 3 * 60 * 1000;
+  const todayIso = getTodayIsoLocal();
+
+  // Compute summary stats
+  const stats = useMemo(() => {
+    let menunggu = 0;
+    let aktif = 0;
+    let kedaluwarsa = 0;
+    let diblokir = 0;
+    users.forEach((u) => {
+      const cat = getEffectiveCategory(u, todayIso);
+      if (cat === "menunggu") menunggu++;
+      else if (cat === "aktif") aktif++;
+      else if (cat === "kedaluwarsa") kedaluwarsa++;
+      else if (cat === "diblokir") diblokir++;
+    });
+    return {
+      total: users.length,
+      menunggu,
+      aktif,
+      kedaluwarsa,
+      diblokir,
+    };
+  }, [users, todayIso]);
+
+  // Get draft values for a user (falling back to persisted user fields)
+  const getUserDraft = useCallback(
+    (u: any): UserDraft => {
+      const key = String(u.email || "").toLowerCase().trim();
+      if (drafts[key]) return drafts[key];
+      const defaultNote =
+        getEffectiveCategory(u, todayIso) === "menunggu" && !u.keterangan
+          ? DEFAULT_WAITING_NOTE
+          : String(u.keterangan ?? "");
+      return {
+        mulaiPada: typeof u.mulaiPada === "string" ? u.mulaiPada.trim() : "",
+        berakhirPada: typeof u.berakhirPada === "string" ? u.berakhirPada.trim() : "",
+        keterangan: defaultNote,
+      };
+    },
+    [drafts, todayIso]
+  );
+
+  const isDraftDirty = useCallback(
+    (u: any): boolean => {
+      const key = String(u.email || "").toLowerCase().trim();
+      const d = drafts[key];
+      if (!d) return false;
+      const origMulai = typeof u.mulaiPada === "string" ? u.mulaiPada.trim() : "";
+      const origBerakhir = typeof u.berakhirPada === "string" ? u.berakhirPada.trim() : "";
+      const origKet =
+        getEffectiveCategory(u, todayIso) === "menunggu" && !u.keterangan
+          ? DEFAULT_WAITING_NOTE
+          : String(u.keterangan ?? "");
+      return (
+        d.mulaiPada !== origMulai ||
+        d.berakhirPada !== origBerakhir ||
+        d.keterangan !== origKet
+      );
+    },
+    [drafts, todayIso]
+  );
+
+  const updateUserDraft = (u: any, patch: Partial<UserDraft>) => {
+    const key = String(u.email || "").toLowerCase().trim();
+    const current = getUserDraft(u);
+    setDrafts((prev) => ({
+      ...prev,
+      [key]: {
+        ...current,
+        ...patch,
+      },
+    }));
   };
 
-  const formatRelativeTime = (iso?: string | null) => {
-    if (!iso) return "-";
-    const ms = new Date(iso).getTime();
-    if (Number.isNaN(ms)) return "-";
-    const diffSec = Math.max(0, Math.floor((nowTick - ms) / 1000));
-    if (diffSec < 45) return "Baru saja";
-    if (diffSec < 3600) return `${Math.floor(diffSec / 60)} mnt lalu`;
-    if (diffSec < 86400) return `${Math.floor(diffSec / 3600)} jam lalu`;
-    return `${Math.floor(diffSec / 86400)} hari lalu`;
-  };
+  // Core persistence helper: saves user access changes simultaneously to Local, Real-Time Hub (+ auto Webhook), and Firestore
+  const persistUserAccessUpdate = async (
+    targetUser: any,
+    updates: {
+      statusPersetujuan?: "aktif" | "menunggu" | "diblokir";
+      mulaiPada?: string;
+      berakhirPada?: string;
+      keterangan?: string;
+    },
+    successMessage: string
+  ) => {
+    const email = String(targetUser.email || "").toLowerCase().trim();
+    if (!email) return;
 
-  const handleDeleteDeviceRecord = async (deviceId: string) => {
-    if (!deviceId) return;
+    setSavingEmail(email);
+    const nowIso = new Date().toISOString();
+    const docIds: string[] = Array.from(
+      new Set([targetUser.uid || targetUser.id, ...(targetUser._allIds || [])].filter(Boolean))
+    );
+
+    const nextMulai =
+      updates.mulaiPada !== undefined
+        ? updates.mulaiPada.trim()
+        : typeof targetUser.mulaiPada === "string"
+        ? targetUser.mulaiPada.trim()
+        : "";
+    const nextBerakhir =
+      updates.berakhirPada !== undefined
+        ? updates.berakhirPada.trim()
+        : typeof targetUser.berakhirPada === "string"
+        ? targetUser.berakhirPada.trim()
+        : "";
+    const nextStatus = updates.statusPersetujuan || targetUser.statusPersetujuan || "menunggu";
+    const nextKeterangan =
+      updates.keterangan !== undefined
+        ? updates.keterangan.trim()
+        : typeof targetUser.keterangan === "string"
+        ? targetUser.keterangan.trim()
+        : "";
+
+    const updatedRecord: Record<string, any> = {
+      ...targetUser,
+      uid: targetUser.uid || targetUser.id,
+      id: targetUser.uid || targetUser.id,
+      email,
+      statusPersetujuan: nextStatus,
+      mulaiPada: nextMulai,
+      berakhirPada: nextBerakhir,
+      keterangan: nextKeterangan,
+      updatedAt: nowIso,
+    };
+    delete updatedRecord._allIds;
+
     try {
-      hubDevicesRef.current.delete(deviceId);
-      setDevices((prev) => prev.filter((d) => d.deviceId !== deviceId));
+      // Optimistically update local refs & state so UI feels instantaneous
+      const applyToList = (list: any[]) => {
+        const filtered = list.filter(
+          (item) => String(item.email || "").toLowerCase().trim() !== email
+        );
+        return [updatedRecord, ...filtered];
+      };
+      hubUsersRef.current = applyToList(hubUsersRef.current);
+      firestoreUsersRef.current = applyToList(firestoreUsersRef.current);
+      try {
+        localStorage.setItem(`offline_user_${updatedRecord.uid}`, JSON.stringify(updatedRecord));
+      } catch {}
+      recomputeUsers();
+
+      // Clear draft so UI reflects authoritative saved state cleanly
+      setDrafts((prev) => {
+        const next = { ...prev };
+        delete next[email];
+        return next;
+      });
+
+      // Push to Express Real-Time Hub (instant SSE unlock + optional Apps Script Webhook) & Firestore
       await Promise.all([
-        fetch("/api/realtime/delete-device", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ deviceId }),
-        }).catch(() => {}),
-        fetchWithTimeout(deleteDoc(doc(db, "devices", deviceId)), 2500, null).catch((err) => {
-          reportFirestoreWriteResult(false, err);
-        }),
-      ]);
-    } catch (err) {
-      console.warn("Gagal menghapus catatan perangkat:", err);
-    }
-  };
-
-  const getDevicesForUser = (userItem: any): DeviceRecord[] => {
-    const emailLower = (userItem?.email || "").toLowerCase().trim();
-    const matched = devices.filter(
-      (d) =>
-        (d.userUid && (d.userUid === userItem.uid || d.userUid === userItem.id)) ||
-        (emailLower && d.userEmail && d.userEmail.toLowerCase().trim() === emailLower)
-    );
-    if (matched.length > 0) return matched;
-    if (userItem?.lastDevice?.deviceId) {
-      return [
-        {
-          deviceId: userItem.lastDevice.deviceId,
-          deviceType: userItem.lastDevice.deviceType || "Desktop / Laptop",
-          deviceModel: userItem.lastDevice.deviceModel || "Perangkat Web",
-          osName: userItem.lastDevice.osName || "-",
-          browserName: userItem.lastDevice.browserName || "-",
-          screenResolution: userItem.lastDevice.screenResolution || "-",
-          viewportSize: "-",
-          language: "id-ID",
-          timezone: userItem.lastDevice.timezone || "-",
-          ipAddress: userItem.lastDevice.ipAddress || "-",
-          userAgent: "",
-          sessionState: "active",
-          userUid: userItem.uid,
-          userEmail: userItem.email,
-          userName: userItem.namaLengkap,
-          namaSPPG: userItem.namaSPPG,
-          peran: userItem.peran,
-          statusPersetujuan: userItem.statusPersetujuan,
-          isOnline: Boolean(userItem.lastDevice.isOnline),
-          firstSeenAt: userItem.lastDevice.lastSeenAt || userItem.createdAt || "",
-          lastSeenAt: userItem.lastDevice.lastSeenAt || userItem.lastDeviceSeenAt || "",
-        },
-      ];
-    }
-    return [];
-  };
-
-  const renderDeviceIcon = (deviceType?: string, className = "w-3.5 h-3.5") => {
-    if (deviceType === "Mobile") return <Smartphone className={className} />;
-    if (deviceType === "Tablet") return <Tablet className={className} />;
-    return <Laptop className={className} />;
-  };
-
-  // Handle setting explicit approval status (ACC / Menunggu / Blokir)
-  const handleSetStatus = async (userId: string, newStatus: "aktif" | "menunggu" | "diblokir") => {
-    try {
-      const now = new Date();
-      const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-      const userObj = users.find(u => u.uid === userId || u.id === userId || (u.email && u.email.toLowerCase().trim() === userId.toLowerCase().trim()));
-
-      const userEmail = (userObj?.email || "").toLowerCase().trim();
-      const emailSlug = userEmail.replace(/[@.]/g, '_');
-      const legacyCustomUid = emailSlug ? `custom_user_${emailSlug}` : "";
-      const targetUid = userObj?.uid || userObj?.id || userId || legacyCustomUid;
-
-      const updates: any = {
-        statusPersetujuan: newStatus,
-        updatedAt: new Date().toISOString()
-      };
-
-      if (newStatus === "aktif") {
-        updates.activatedBy = "admin_acc";
-        if (!userObj?.berakhirPada || userObj.berakhirPada < todayStr) {
-          const nextYear = new Date();
-          nextYear.setFullYear(now.getFullYear() + 1);
-          const defaultExp = `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, '0')}-${String(nextYear.getDate()).padStart(2, '0')}`;
-          updates.berakhirPada = defaultExp;
-        }
-      }
-
-      const fullUserData = {
-        ...(userObj || {}),
-        ...updates,
-        uid: targetUid,
-        id: targetUid,
-        email: userEmail || userObj?.email || ""
-      };
-
-      // 1. Instant local state & live hub cache update (0ms UI latency)
-      hubUsersRef.current.set(targetUid, fullUserData);
-      setUsers(prev => prev.map(u => 
-        (u.uid === userId || u.id === userId || u.uid === targetUid || (userEmail && (u.email || "").toLowerCase().trim() === userEmail)) 
-          ? { ...u, ...fullUserData } 
-          : u
-      ));
-
-      // 2. Instant offline storage persistence
-      const keysToUpdate = Array.from(new Set([
-        `offline_user_${targetUid}`,
-        `offline_user_${userId}`,
-        legacyCustomUid && targetUid === legacyCustomUid ? `offline_user_${legacyCustomUid}` : ''
-      ].filter(Boolean)));
-
-      keysToUpdate.forEach((k) => {
-        const savedStr = localStorage.getItem(k);
-        const parsed = savedStr ? (JSON.parse(savedStr) || {}) : (userObj || {});
-        localStorage.setItem(k, JSON.stringify({ ...parsed, ...fullUserData }));
-      });
-
-      if (userEmail) {
-        try {
-          for (let i = 0; i < localStorage.length; i++) {
-            const key = localStorage.key(i);
-            if (key && key.startsWith("offline_user_")) {
-              const val = localStorage.getItem(key);
-              if (val) {
-                const parsed = JSON.parse(val);
-                if ((parsed.email || "").toLowerCase().trim() === userEmail) {
-                  localStorage.setItem(key, JSON.stringify({ ...parsed, ...fullUserData }));
-                }
-              }
-            }
-          }
-        } catch (e) {}
-      }
-
-      // 3. Real-time hub broadcast (instant tenant unlock on mobile/laptop) + Firestore persistence
-      syncUserToRealtimeHub(fullUserData).catch(() => {});
-      const docIdsToUpdate = Array.from(new Set([targetUid, userId, userObj?.uid, userObj?.id].filter(Boolean)));
-      for (const docId of docIdsToUpdate) {
-        try {
-          const userRef = doc(db, "users", docId);
-          await fetchWithTimeout(
-            setDoc(userRef, fullUserData, { merge: true }).then(() => reportFirestoreWriteResult(true)),
-            2500,
+        syncUserToRealtimeHub(updatedRecord),
+        ...docIds.map((docId) =>
+          fetchWithTimeout(
+            setDoc(
+              doc(db, "users", docId),
+              {
+                ...updatedRecord,
+                uid: docId,
+                id: docId,
+                updatedAt: serverTimestamp(),
+              },
+              { merge: true }
+            )
+              .then(() => reportFirestoreWriteResult(true))
+              .catch((err) => reportFirestoreWriteResult(false, err)),
+            3000,
             null
-          );
-        } catch (e) {
-          reportFirestoreWriteResult(false, e);
-          console.warn("Notice setDoc status:", e);
-        }
-      }
-    } catch (err) {
-      console.warn("Status persetujuan diperbarui secara lokal:", err);
-    }
-  };
+          )
+        ),
+      ]);
 
-  // Toggle role between USER and ADMIN (granting/revoking Panel Admin access), protecting Main Admin
-  const handleToggleRole = async (userId: string, currentRole: string) => {
-    const userObj = users.find(u => u.uid === userId || u.id === userId);
-    if (
-      userId === "admin_syukriyusuf82" ||
-      userId === "admin_sukriyusuf82" ||
-      isMainAdminEmail(userObj?.email)
-    ) {
-      return;
-    }
-
-    const nextRole = currentRole === "ADMIN" ? "USER" : "ADMIN";
-    const nowIso = new Date().toISOString();
-    const userEmail = (userObj?.email || "").toLowerCase().trim();
-    const targetUid = userObj?.uid || userObj?.id || userId;
-    const updatedUser = {
-      ...(userObj || {}),
-      uid: targetUid,
-      id: targetUid,
-      email: userEmail || userObj?.email || "",
-      peran: nextRole,
-      updatedAt: nowIso,
-    };
-
-    hubUsersRef.current.set(targetUid, updatedUser);
-    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId || u.uid === targetUid) ? { ...u, peran: nextRole, updatedAt: nowIso } : u));
-
-    const docIds = Array.from(new Set([targetUid, userId, userObj?.uid, userObj?.id].filter(Boolean)));
-
-    docIds.forEach((id) => {
-      const k = `offline_user_${id}`;
-      const saved = localStorage.getItem(k);
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved);
-          localStorage.setItem(k, JSON.stringify({ ...parsed, peran: nextRole, updatedAt: nowIso }));
-        } catch (e) {}
-      }
-    });
-
-    if (userObj) {
-      syncUserToRealtimeHub(updatedUser).catch(() => {});
-    }
-    for (const docId of docIds) {
-      try {
-        await fetchWithTimeout(
-          setDoc(doc(db, "users", docId), {
-            peran: nextRole,
-            updatedAt: nowIso
-          }, { merge: true }).then(() => reportFirestoreWriteResult(true)),
-          2500,
-          null
-        );
-      } catch (e) {
-        reportFirestoreWriteResult(false, e);
-        console.warn("Notice updating user role:", e);
-      }
-    }
-  };
-
-  // Handle update expiration date
-  const handleUpdateExpiration = async (userId: string, dateStr: string) => {
-    const userObj = users.find(u => u.uid === userId || u.id === userId);
-    const nowIso = new Date().toISOString();
-    const targetUid = userObj?.uid || userObj?.id || userId;
-    const updatedUser = {
-      ...(userObj || {}),
-      uid: targetUid,
-      id: targetUid,
-      berakhirPada: dateStr,
-      updatedAt: nowIso,
-    };
-
-    hubUsersRef.current.set(targetUid, updatedUser);
-    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId || u.uid === targetUid) ? { ...u, berakhirPada: dateStr, updatedAt: nowIso } : u));
-
-    const keysToUpdate = Array.from(new Set([
-      `offline_user_${targetUid}`,
-      `offline_user_${userId}`,
-      userObj?.uid ? `offline_user_${userObj.uid}` : ''
-    ].filter(Boolean)));
-
-    keysToUpdate.forEach((k) => {
-      const savedStr = localStorage.getItem(k);
-      if (savedStr) {
-        try {
-          const parsed = JSON.parse(savedStr);
-          localStorage.setItem(k, JSON.stringify({ ...parsed, berakhirPada: dateStr, updatedAt: nowIso }));
-        } catch (e) {}
-      }
-    });
-
-    if (userObj) {
-      syncUserToRealtimeHub(updatedUser).catch(() => {});
-    }
-    const docIdsToUpdate = Array.from(new Set([targetUid, userId, userObj?.uid].filter(Boolean)));
-    for (const docId of docIdsToUpdate) {
-      try {
-        const userRef = doc(db, "users", docId);
-        await fetchWithTimeout(setDoc(userRef, {
-          berakhirPada: dateStr,
-          updatedAt: nowIso
-        }, { merge: true }).then(() => reportFirestoreWriteResult(true)), 1500, null);
-      } catch (err) {
-        reportFirestoreWriteResult(false, err);
-        console.warn("Tanggal kedaluwarsa diperbarui lokal:", err);
-      }
-    }
-  };
-
-  // Quick preset helpers for expiration date
-  const handleAddDuration = async (userId: string, monthsToAdd: number) => {
-    const d = new Date();
-    d.setMonth(d.getMonth() + monthsToAdd);
-    const dateStr = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    await handleSetStatus(userId, "aktif");
-    await handleUpdateExpiration(userId, dateStr);
-  };
-
-  const handleRevokeAccessNow = async (userId: string) => {
-    const userObj = users.find(u => u.uid === userId || u.id === userId);
-    const yesterday = new Date();
-    yesterday.setDate(yesterday.getDate() - 1);
-    const pastStr = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, '0')}-${String(yesterday.getDate()).padStart(2, '0')}`;
-    const nowIso = new Date().toISOString();
-    const targetUid = userObj?.uid || userObj?.id || userId;
-    const updatedUser = {
-      ...(userObj || {}),
-      uid: targetUid,
-      id: targetUid,
-      berakhirPada: pastStr,
-      statusPersetujuan: "diblokir",
-      updatedAt: nowIso,
-    };
-
-    hubUsersRef.current.set(targetUid, updatedUser);
-    setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId || u.uid === targetUid) ? { ...u, berakhirPada: pastStr, statusPersetujuan: "diblokir", updatedAt: nowIso } : u));
-
-    const keysToUpdate = Array.from(new Set([
-      `offline_user_${targetUid}`,
-      `offline_user_${userId}`,
-      userObj?.uid ? `offline_user_${userObj.uid}` : ''
-    ].filter(Boolean)));
-
-    keysToUpdate.forEach((k) => {
-      const savedStr = localStorage.getItem(k);
-      if (savedStr) {
-        try {
-          const parsed = JSON.parse(savedStr);
-          localStorage.setItem(k, JSON.stringify({ ...parsed, berakhirPada: pastStr, statusPersetujuan: "diblokir", updatedAt: nowIso }));
-        } catch (e) {}
-      }
-    });
-
-    if (userObj) {
-      syncUserToRealtimeHub(updatedUser).catch(() => {});
-    }
-    const docIdsToUpdate = Array.from(new Set([targetUid, userId, userObj?.uid].filter(Boolean)));
-    for (const docId of docIdsToUpdate) {
-      try {
-        const userRef = doc(db, "users", docId);
-        await fetchWithTimeout(
-          setDoc(userRef, {
-            berakhirPada: pastStr,
-            statusPersetujuan: "diblokir",
-            updatedAt: serverTimestamp()
-          }, { merge: true }).then(() => reportFirestoreWriteResult(true)),
-          2500,
-          null
-        );
-      } catch (err) {
-        reportFirestoreWriteResult(false, err);
-        console.error("Gagal memutuskan akses:", err);
-      }
-    }
-  };
-
-  const handleAdminResetPassword = async (userId: string, email: string) => {
-    const userObj = users.find(u => u.uid === userId || u.id === userId);
-    const currentSandi = userObj?.sandi || "";
-    const promptMsg = currentSandi 
-      ? `Kata sandi saat ini untuk ${email} adalah: "${currentSandi}"\n\nMasukkan kata sandi baru (minimal 6 karakter):`
-      : `Masukkan kata sandi baru untuk ${email} (minimal 6 karakter):`;
-    const input = prompt(promptMsg, currentSandi);
-    if (!input) return;
-    if (input.trim().length < 6) {
-      alert("Kata sandi minimal 6 karakter demi keamanan.");
-      return;
-    }
-    const newSandi = input.trim();
-    try {
-      const updates = { sandi: newSandi, updatedAt: new Date().toISOString() };
-      setUsers(prev => prev.map(u => (u.uid === userId || u.id === userId) ? { ...u, ...updates } : u));
-      
-      const userEmail = (email || "").toLowerCase().trim();
-      const emailSlug = userEmail.replace(/[@.]/g, '_');
-      const customUid = `custom_user_${emailSlug}`;
-
-      const keysToUpdate = Array.from(new Set([
-        `offline_user_${userId}`,
-        `offline_user_${customUid}`,
-        userObj?.uid ? `offline_user_${userObj.uid}` : '',
-        emailSlug ? `offline_user_custom_user_${emailSlug}` : ''
-      ].filter(Boolean)));
-
-      keysToUpdate.forEach((k) => {
-        const savedStr = localStorage.getItem(k);
-        const parsed = savedStr ? (JSON.parse(savedStr) || {}) : (userObj || {});
-        localStorage.setItem(k, JSON.stringify({ ...parsed, ...updates }));
-      });
-
-      if (userObj) {
-        syncUserToRealtimeHub({ ...userObj, ...updates, uid: customUid }).catch(() => {});
-      }
-      const docIdsToUpdate = Array.from(new Set([userId, customUid, userObj?.uid].filter(Boolean)));
-      for (const docId of docIdsToUpdate) {
-        try {
-          const userRef = doc(db, "users", docId);
-          await fetchWithTimeout(setDoc(userRef, updates, { merge: true }), 2500, null);
-        } catch (e) {}
-      }
-      alert(`Kata sandi untuk ${email} berhasil diperbarui menjadi: "${newSandi}"`);
+      setRecentlySavedEmail(email);
+      window.setTimeout(() => {
+        setRecentlySavedEmail((prev) => (prev === email ? null : prev));
+      }, 2400);
+      showToast("success", successMessage);
     } catch (err: any) {
-      alert("Gagal memperbarui kata sandi: " + err.message);
+      showToast("error", err?.message || `Gagal menyimpan perubahan untuk ${email}.`);
+    } finally {
+      setSavingEmail(null);
     }
   };
 
-  // Handle delete user
-  const handleDeleteUser = async (userId: string, email: string) => {
-    const lowerEmail = (email || "").toLowerCase().trim();
-    if (userId === "admin_syukriyusuf82" || isMainAdminEmail(lowerEmail)) {
-      alert(`Admin Utama (${email}) tidak dapat dihapus!`);
-      return;
+  // Quick ACC action
+  const handleAccUser = (u: any) => {
+    const draft = getUserDraft(u);
+    let nextBerakhir = draft.berakhirPada;
+    // If user was expired and Admin clicked ACC without changing past expiration date, clear to Tanpa Batas
+    if (nextBerakhir && todayIso > nextBerakhir) {
+      nextBerakhir = "";
     }
+    const nextKet =
+      draft.keterangan === DEFAULT_WAITING_NOTE || !draft.keterangan.trim()
+        ? "Akses disetujui (ACC) oleh Admin Odhe Gizi"
+        : draft.keterangan;
 
-    if (confirm(`Apakah Anda yakin ingin menghapus data akun ${email}? Data pengguna akan terhapus permanen dari server.`)) {
-      const emailSlug = lowerEmail.replace(/[@.]/g, "_");
-      const customUid = `custom_user_${emailSlug}`;
-      const idsToDelete = Array.from(new Set([userId, customUid].filter(Boolean)));
+    persistUserAccessUpdate(
+      u,
+      {
+        statusPersetujuan: "aktif",
+        mulaiPada: draft.mulaiPada,
+        berakhirPada: nextBerakhir,
+        keterangan: nextKet,
+      },
+      `Pengguna ${u.email} berhasil di-ACC dan langsung aktif.`
+    );
+  };
 
-      // 1. Mark email as deleted & delete from Real-Time Hub + Firestore
-      addDeletedTenantEmail(lowerEmail);
-      hubUsersRef.current.delete(userId);
-      hubUsersRef.current.delete(customUid);
-      deleteUserFromRealtimeHub(userId, lowerEmail).catch(() => {});
-      for (const id of idsToDelete) {
+  // Return user to Daftar Tunggu
+  const handleReturnToWaiting = (u: any) => {
+    const draft = getUserDraft(u);
+    const nextKet =
+      !draft.keterangan.trim() ||
+      draft.keterangan === "Akses disetujui (ACC) oleh Admin Odhe Gizi"
+        ? DEFAULT_WAITING_NOTE
+        : draft.keterangan;
+
+    persistUserAccessUpdate(
+      u,
+      {
+        statusPersetujuan: "menunggu",
+        mulaiPada: draft.mulaiPada,
+        berakhirPada: draft.berakhirPada,
+        keterangan: nextKet,
+      },
+      `${u.email} dikembalikan ke Daftar Tunggu.`
+    );
+  };
+
+  // Block user
+  const handleBlockUser = (u: any) => {
+    const draft = getUserDraft(u);
+    const nextKet =
+      !draft.keterangan.trim() ||
+      draft.keterangan === DEFAULT_WAITING_NOTE ||
+      draft.keterangan === "Akses disetujui (ACC) oleh Admin Odhe Gizi"
+        ? "Akses diblokir oleh Admin Odhe Gizi"
+        : draft.keterangan;
+
+    persistUserAccessUpdate(
+      u,
+      {
+        statusPersetujuan: "diblokir",
+        mulaiPada: draft.mulaiPada,
+        berakhirPada: draft.berakhirPada,
+        keterangan: nextKet,
+      },
+      `Akses akun ${u.email} telah diblokir.`
+    );
+  };
+
+  // Save draft changes (dates + keterangan)
+  const handleSaveDraft = (u: any) => {
+    const draft = getUserDraft(u);
+    persistUserAccessUpdate(
+      u,
+      {
+        mulaiPada: draft.mulaiPada,
+        berakhirPada: draft.berakhirPada,
+        keterangan: draft.keterangan,
+      },
+      `Pengaturan tanggal & keterangan untuk ${u.email} berhasil disimpan.`
+    );
+  };
+
+  // Apply quick duration preset (+7 Hr, +30 Hr, +3 Bln, +1 Thn) or Tanpa Batas
+  const handleApplyExpirationPreset = (
+    u: any,
+    preset: "unlimited" | "7d" | "30d" | "3m" | "1y"
+  ) => {
+    const draft = getUserDraft(u);
+    const nextBerakhir =
+      preset === "unlimited"
+        ? ""
+        : preset === "7d"
+        ? addDurationToDateIso(draft.mulaiPada, { days: 7 })
+        : preset === "30d"
+        ? addDurationToDateIso(draft.mulaiPada, { days: 30 })
+        : preset === "3m"
+        ? addDurationToDateIso(draft.mulaiPada, { months: 3 })
+        : addDurationToDateIso(draft.mulaiPada, { years: 1 });
+
+    updateUserDraft(u, { berakhirPada: nextBerakhir });
+
+    // If user is already active, save immediately so Admin doesn't need an extra click
+    if (String(u.statusPersetujuan || "").toLowerCase() === "aktif") {
+      const label =
+        preset === "unlimited"
+          ? "Tanpa Batas"
+          : `berakhir ${nextBerakhir}`;
+      persistUserAccessUpdate(
+        u,
+        {
+          mulaiPada: draft.mulaiPada,
+          berakhirPada: nextBerakhir,
+          keterangan: draft.keterangan,
+        },
+        `Masa aktif ${u.email} diperbarui (${label}).`
+      );
+    }
+  };
+
+  // Delete user record permanently (confirmed via custom modal — no window.confirm)
+  const handleConfirmDeleteUser = async () => {
+    if (!deleteTargetUser) return;
+    const target = deleteTargetUser;
+    const email = String(target.email || "").toLowerCase().trim();
+    const docIds: string[] = Array.from(
+      new Set([target.uid || target.id, ...(target._allIds || [])].filter(Boolean))
+    );
+
+    setIsDeleting(true);
+    try {
+      addDeletedTenantEmail(email);
+      hubUsersRef.current = hubUsersRef.current.filter(
+        (u) => String(u.email || "").toLowerCase().trim() !== email
+      );
+      firestoreUsersRef.current = firestoreUsersRef.current.filter(
+        (u) => String(u.email || "").toLowerCase().trim() !== email
+      );
+      docIds.forEach((id) => {
         try {
-          await fetchWithTimeout(deleteDoc(doc(db, "users", id)), 2500, null);
-        } catch (err) {
-          console.warn(`Peringatan saat menghapus dokumen Firestore ${id}:`, err);
-        }
-      }
-
-      // 2. Purge local storage offline caches
-      try {
-        idsToDelete.forEach((id) => {
           localStorage.removeItem(`offline_user_${id}`);
-        });
-        localStorage.removeItem(`offline_user_custom_user_${emailSlug}`);
+        } catch {}
+      });
+      recomputeUsers();
 
-        const keysToRemove: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && (key.includes(userId) || key.includes(emailSlug) || key.includes(lowerEmail))) {
-            keysToRemove.push(key);
-          }
-        }
-        keysToRemove.forEach((k) => localStorage.removeItem(k));
-      } catch (e) {
-        console.warn("Notice clearing local storage for deleted user:", e);
-      }
+      await Promise.all([
+        deleteUserFromRealtimeHub(target.uid || target.id, email),
+        ...docIds.map((id) =>
+          fetchWithTimeout(
+            deleteDoc(doc(db, "users", id))
+              .then(() => reportFirestoreWriteResult(true))
+              .catch((err) => reportFirestoreWriteResult(false, err)),
+            3000,
+            null
+          )
+        ),
+      ]);
 
-      // 3. Purge active session if it was logged in
-      const currentUid = localStorage.getItem("custom_logged_in_uid");
-      if (currentUid && idsToDelete.includes(currentUid)) {
-        localStorage.removeItem("custom_logged_in_uid");
-        localStorage.removeItem("sisper_user_profile");
-      }
-
-      // 4. Update UI immediately
-      setUsers(prev => prev.filter(u => !idsToDelete.includes(u.uid) && !idsToDelete.includes(u.id) && (u.email || "").toLowerCase().trim() !== lowerEmail));
-      alert(`Data pengguna ${email} berhasil terhapus permanen dari server dan sistem.`);
+      setDeleteTargetUser(null);
+      showToast("success", `Catatan pengguna ${email} berhasil dihapus dari Panel Admin.`);
+    } catch (err: any) {
+      showToast("error", err?.message || `Gagal menghapus catatan ${email}.`);
+    } finally {
+      setIsDeleting(false);
     }
   };
 
-  // Handle clearing marked/selected users
-  const handleClearSelectedUsers = async () => {
-    if (selectedUserUids.length === 0) {
-      alert("Silakan tandai / centang pengguna yang ingin dibersihkan terlebih dahulu.");
+  // Handle "Cari Email untuk ACC" button / form submission
+  const handleSearchSubmit = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const q = searchInput.trim();
+    setAppliedSearch(q);
+
+    if (!q) {
+      setHighlightedEmail(null);
+      searchInputRef.current?.focus();
       return;
     }
 
-    const markedUsers = users.filter(u => selectedUserUids.includes(u.uid));
-    const confirmMsg = `Peringatan: Anda akan menghapus & mereset SELURUH data (${markedUsers.length} akun) pengguna yang ditandai secara permanen dari server.\n\nApakah Anda yakin ingin melanjutkan?`;
-    
-    if (confirm(confirmMsg)) {
-      setLoading(true);
-      
-      const deletePromises = markedUsers.map(async (u) => {
-        const lowerEmail = (u.email || "").toLowerCase().trim();
-        addDeletedTenantEmail(lowerEmail);
-        const emailSlug = lowerEmail.replace(/[@.]/g, "_");
-        const customUid = `custom_user_${emailSlug}`;
-        const idsToDelete = Array.from(new Set([u.uid, u.id, customUid].filter(Boolean)));
-        idsToDelete.forEach((id) => hubUsersRef.current.delete(id));
-        deleteUserFromRealtimeHub(u.uid || customUid, lowerEmail).catch(() => {});
+    const lower = q.toLowerCase();
+    const matched = users.find(
+      (u) =>
+        String(u.email || "").toLowerCase().includes(lower) ||
+        String(u.namaLengkap || "").toLowerCase().includes(lower) ||
+        String(u.namaSPPG || "").toLowerCase().includes(lower)
+    );
 
-        for (const id of idsToDelete) {
-          try {
-            await fetchWithTimeout(deleteDoc(doc(db, "users", id)), 3000, null);
-          } catch (err) {
-            console.warn(`Catatan penghapusan dokumen ${id}:`, err);
-          }
-          localStorage.removeItem(`offline_user_${id}`);
-        }
-        localStorage.removeItem(`offline_user_custom_user_${emailSlug}`);
-      });
-
-      await Promise.all(deletePromises);
-
-      // Clean local storage
-      const clearedUids = new Set(markedUsers.map(m => m.uid));
-      setUsers(prev => prev.filter(u => !clearedUids.has(u.uid)));
-      setSelectedUserUids([]);
-      setLoading(false);
-      alert(`Pembersihan Berhasil!\n\nData ${markedUsers.length} pengguna yang ditandai telah dihapus secara permanen dari server.`);
-    }
-  };
-
-  // Handle clearing all users with the "USER" role
-  const handleClearAllUsers = async () => {
-    // Exclude main admin
-    const usersWithUserRole = users.filter(u => {
-      const emailLower = (u.email || "").toLowerCase().trim();
-      const isAdmin = u.uid === "admin_syukriyusuf82" || isMainAdminEmail(emailLower) || u.peran === "ADMIN";
-      return !isAdmin;
-    });
-
-    if (usersWithUserRole.length === 0) {
-      alert("Tidak ada data pendaftar pengguna (role USER) yang perlu dibersihkan.");
-      return;
-    }
-
-    const confirmMsg = `Peringatan: Anda akan menghapus & mereset SELURUH data pendaftar (${usersWithUserRole.length} akun) secara permanen dari server.\n\nApakah Anda yakin ingin melanjutkan?`;
-    if (confirm(confirmMsg)) {
-      setLoading(true);
-
-      const deletePromises = usersWithUserRole.map(async (u) => {
-        const lowerEmail = (u.email || "").toLowerCase().trim();
-        addDeletedTenantEmail(lowerEmail);
-        const emailSlug = lowerEmail.replace(/[@.]/g, "_");
-        const customUid = `custom_user_${emailSlug}`;
-        const idsToDelete = Array.from(new Set([u.uid, u.id, customUid].filter(Boolean)));
-        idsToDelete.forEach((id) => hubUsersRef.current.delete(id));
-        deleteUserFromRealtimeHub(u.uid || customUid, lowerEmail).catch(() => {});
-
-        for (const id of idsToDelete) {
-          try {
-            await fetchWithTimeout(deleteDoc(doc(db, "users", id)), 3000, null);
-          } catch (err) {
-            console.warn(`Notice deleting document ${id}:`, err);
-          }
-          localStorage.removeItem(`offline_user_${id}`);
-        }
-        localStorage.removeItem(`offline_user_custom_user_${emailSlug}`);
-      });
-
-      await Promise.all(deletePromises);
-
-      // Clean all non-admin offline_user_ keys in localStorage
-      try {
-        const keysToRemove: string[] = [];
-        for (let i = 0; i < localStorage.length; i++) {
-          const key = localStorage.key(i);
-          if (key && key.startsWith("offline_user_") && !key.includes("syukriyusuf") && !key.includes("sukriyusuf")) {
-            keysToRemove.push(key);
-          }
-        }
-        keysToRemove.forEach(k => localStorage.removeItem(k));
-      } catch (e) {
-        console.warn("Notice clearing offline_user_ keys:", e);
+    if (matched) {
+      const cat = getEffectiveCategory(matched, todayIso);
+      if (statusFilter !== "semua" && statusFilter !== cat) {
+        setStatusFilter("semua");
       }
-
-      setUsers(prev => prev.filter(u => u.uid === "admin_syukriyusuf82" || isMainAdminEmail(u.email)));
-      setSelectedUserUids([]);
-      setLoading(false);
-      alert(`Pembersihan & Reset Data Berhasil!\n\nSeluruh data pendaftar (${usersWithUserRole.length} akun) telah terhapus permanen dari server.`);
+      setHighlightedEmail(String(matched.email).toLowerCase());
+      window.setTimeout(() => setHighlightedEmail(null), 3200);
+    } else {
+      setStatusFilter("semua");
+      showToast("info", `Email atau nama "${q}" belum terdeteksi di database pengguna.`);
     }
   };
 
-  const handleUsersImportedFromSheet = (importedUsers: any[]) => {
-    if (!Array.isArray(importedUsers) || importedUsers.length === 0) return;
-    importedUsers.forEach((u) => {
-      const uid = u?.uid || u?.id;
-      const em = (u?.email || "").toLowerCase().trim();
-      if (em) removeDeletedTenantEmail(em);
-      if (uid) hubUsersRef.current.set(uid, u);
-    });
-    setUsers((prev) => {
-      const byEmail = new Map<string, any>();
-      prev.forEach((u) => {
-        const em = (u.email || "").toLowerCase().trim();
-        if (em) byEmail.set(em, u);
-      });
+  // Merge imported users from Google Sheets directly into view
+  const handleUsersImportedFromSheet = useCallback(
+    (importedUsers: any[]) => {
+      if (!importedUsers.length) return;
       importedUsers.forEach((u) => {
-        const em = (u.email || "").toLowerCase().trim();
-        if (!em || isMainAdminEmail(em)) return;
-        const existing = byEmail.get(em);
-        if (existing) {
-          byEmail.set(em, {
-            ...existing,
-            ...u,
-            uid:
-              existing.uid && !existing.uid.startsWith("sheet_user_") && !existing.uid.startsWith("custom_user_")
-                ? existing.uid
-                : u.uid,
-            id:
-              existing.uid && !existing.uid.startsWith("sheet_user_") && !existing.uid.startsWith("custom_user_")
-                ? existing.uid
-                : u.uid,
-          });
-        } else {
-          byEmail.set(em, u);
-        }
+        if (u.email) removeDeletedTenantEmail(u.email);
       });
-      return Array.from(byEmail.values());
+      hubUsersRef.current = mergeDeduplicatedUsers([importedUsers, hubUsersRef.current]);
+      recomputeUsers();
+    },
+    [recomputeUsers]
+  );
+
+  // Filtered user list (live filter on typing + applied search)
+  const effectiveQuery = (searchInput || appliedSearch).trim().toLowerCase();
+  const filteredUsers = useMemo(() => {
+    return users.filter((u) => {
+      const cat = getEffectiveCategory(u, todayIso);
+      if (statusFilter !== "semua" && cat !== statusFilter) return false;
+      if (!effectiveQuery) return true;
+      return (
+        String(u.email || "").toLowerCase().includes(effectiveQuery) ||
+        String(u.namaLengkap || "").toLowerCase().includes(effectiveQuery) ||
+        String(u.namaSPPG || "").toLowerCase().includes(effectiveQuery) ||
+        String(u.profesi || "").toLowerCase().includes(effectiveQuery)
+      );
     });
+  }, [users, statusFilter, effectiveQuery, todayIso]);
+
+  const onlineDevicesCount = useMemo(
+    () => devices.filter((d) => isDeviceCurrentlyOnline(d)).length,
+    [devices]
+  );
+
+  const handleDeleteDevice = async (deviceId: string) => {
+    hubDevicesRef.current = hubDevicesRef.current.filter((d) => d.deviceId !== deviceId);
+    firestoreDevicesRef.current = firestoreDevicesRef.current.filter((d) => d.deviceId !== deviceId);
+    recomputeDevices();
+    await Promise.all([
+      deleteDeviceFromRealtimeHub(deviceId),
+      fetchWithTimeout(deleteDoc(doc(db, "devices", deviceId)).catch(() => null), 2500, null),
+    ]);
   };
 
-  // Filter users by search query
-  const filteredUsers = users.filter((u) => {
-    const q = searchQuery.toLowerCase();
-    return (
-      (u.email || "").toLowerCase().includes(q) ||
-      (u.namaLengkap || "").toLowerCase().includes(q) ||
-      (u.profesi || "").toLowerCase().includes(q) ||
-      (u.namaSPPG || "").toLowerCase().includes(q)
-    );
-  });
-
-  // Selection helpers
-  const selectableUsers = filteredUsers.filter(u => u.uid !== "admin_syukriyusuf82" && u.uid !== "admin_sukriyusuf82" && !isMainAdminEmail(u.email));
-  const isAllSelected = selectableUsers.length > 0 && selectableUsers.every(u => selectedUserUids.includes(u.uid));
-
-  const toggleSelectUser = (uid: string) => {
-    setSelectedUserUids(prev =>
-      prev.includes(uid) ? prev.filter(id => id !== uid) : [...prev, uid]
-    );
-  };
-
-  const toggleSelectAll = () => {
-    if (isAllSelected) {
-      setSelectedUserUids([]);
-    } else {
-      setSelectedUserUids(selectableUsers.map(u => u.uid));
-    }
-  };
-
-  // Calculate metrics based on actual non-admin tenants & live devices
-  const tenantUsers = users.filter(u => u.uid !== "admin_syukriyusuf82" && u.uid !== "admin_sukriyusuf82" && !isMainAdminEmail(u.email));
-  const totalUsersCount = tenantUsers.length;
-  const activeUsersCount = tenantUsers.filter(u => u.statusPersetujuan === "aktif").length;
-  const pendingUsersCount = tenantUsers.filter(u => u.statusPersetujuan === "menunggu" || u.statusPersetujuan === "pending").length;
-  const onlineDevicesCount = devices.filter(d => isDeviceLiveOnline(d)).length;
-
-  const filteredDevices = devices.filter((d) => {
-    if (deviceFilter === "online" && !isDeviceLiveOnline(d)) return false;
-    if (deviceFilter === "Desktop / Laptop" && d.deviceType !== "Desktop / Laptop") return false;
-    if (deviceFilter === "Mobile" && d.deviceType !== "Mobile") return false;
-    if (deviceFilter === "Tablet" && d.deviceType !== "Tablet") return false;
-    if (deviceFilter === "guest" && d.sessionState !== "guest" && d.sessionState !== "registering") return false;
-    if (deviceFilter === "demo" && d.sessionState !== "demo") return false;
-
-    const q = deviceSearchQuery.toLowerCase().trim();
-    if (!q) return true;
-    return (
-      (d.deviceModel || "").toLowerCase().includes(q) ||
-      (d.osName || "").toLowerCase().includes(q) ||
-      (d.browserName || "").toLowerCase().includes(q) ||
-      (d.deviceId || "").toLowerCase().includes(q) ||
-      (d.ipAddress || "").toLowerCase().includes(q) ||
-      (d.userEmail || "").toLowerCase().includes(q) ||
-      (d.userName || "").toLowerCase().includes(q) ||
-      (d.namaSPPG || "").toLowerCase().includes(q)
-    );
-  });
-  
-  // Calculate users logged in last 24h
-  const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
-  const login24hCount = tenantUsers.filter(u => {
-    if (!u.loginTerakhir) return false;
-    const loginTime = u.loginTerakhir?.seconds ? u.loginTerakhir.seconds * 1000 : new Date(u.loginTerakhir).getTime();
-    return loginTime > oneDayAgo;
-  }).length;
-
-  // Format date display
-  const formatTimestamp = (ts: any) => {
-    if (!ts) return "-";
-    let dateObj: Date;
-    if (ts.seconds) {
-      dateObj = new Date(ts.seconds * 1000);
-    } else {
-      dateObj = new Date(ts);
-    }
-    return dateObj.toLocaleString("id-ID", {
-      year: "numeric",
-      month: "numeric",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit"
-    });
-  };
+  const displayAdminEmail = adminEmail?.trim() || "Admin Utama";
 
   return (
-    <div className="bg-slate-50 rounded-2xl border border-slate-200 shadow-sm overflow-hidden p-6 space-y-6">
-      
-      {/* Title Header with Close */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-200 pb-4">
-        <div className="flex items-center gap-3">
-          <div className="p-2.5 bg-indigo-100 text-indigo-600 rounded-xl">
-            <Shield className="w-6 h-6" />
-          </div>
-          <div>
-            <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">Panel Administrasi SISPERMBG</h2>
-            <div className="flex flex-wrap items-center gap-2 mt-0.5">
-              <p className="text-xs text-slate-500">Multi-tenant Management Hub • Sinkronisasi Real-Time HP & Laptop</p>
-              <span
-                className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-extrabold border ${
-                  sseStatus === "connected"
-                    ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-                    : "bg-amber-50 text-amber-700 border-amber-200"
-                }`}
-              >
-                <span
-                  className={`w-1.5 h-1.5 rounded-full ${
-                    sseStatus === "connected" ? "bg-emerald-500 animate-pulse" : "bg-amber-500"
-                  }`}
-                ></span>
-                {sseStatus === "connected" ? "Sinkronisasi Real-Time Aktif" : "Menghubungkan Real-Time..."}
-              </span>
+    <div className="min-h-full bg-[#F8FAFC] -m-6 p-4 sm:p-6 lg:p-8">
+      <div className="max-w-[1380px] mx-auto space-y-5">
+        {/* TOP HEADER CARD — Matches Reference Layout */}
+        <header className="bg-white rounded-2xl border border-slate-200 px-5 py-5 sm:px-6 sm:py-6 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+              <span className="font-bold text-emerald-700">Panel Kontrol Admin Odhe Gizi</span>
+              <span className="text-slate-300">·</span>
+              <span className="font-medium text-slate-500">{displayAdminEmail}</span>
             </div>
-          </div>
-        </div>
-        <button
-          onClick={onClose}
-          className="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer self-start sm:self-auto"
-        >
-          Tutup Panel
-        </button>
-      </div>
-
-      {/* Honest Firestore Daily Write Quota Banner if Free Tier cap reached */}
-      {firestoreHealth.writeQuotaExceeded && (
-        <div className="bg-amber-50 border border-amber-300 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-            <div className="text-xs text-amber-950 space-y-1">
-              <div className="font-extrabold">
-                Kuota Harian Tulis Firestore (Free Tier) Sedang Penuh — Sinkronisasi Real-Time Tetap Berjalan via Server Relay
-              </div>
-              <p className="text-[11px] text-amber-800 leading-relaxed">
-                Aktivitas pendaftaran, login, dan deteksi perangkat seluler (HP) ke laptop tetap tampil <strong>secara real-time</strong> melalui jalur sinkronisasi server langsung. Kuota tulis Firestore akan otomatis reset keesokan hari, atau Anda dapat menaikkan paket database di Firebase Console.
-              </p>
-            </div>
-          </div>
-          <a
-            href={FIRESTORE_UPGRADE_URL}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white font-bold text-[11px] rounded-xl transition shrink-0 self-start sm:self-center"
-          >
-            <span>Buka Firebase Console</span>
-            <ExternalLink className="w-3.5 h-3.5" />
-          </a>
-        </div>
-      )}
-
-      {/* Global App Logo Card for Admin / Panel Admin holders */}
-      {onUploadGlobalLogo && (
-        <div className="bg-white p-4 rounded-2xl border border-indigo-200/80 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-center gap-3.5">
-            <div className="w-14 h-14 rounded-full border-2 border-emerald-400 overflow-hidden bg-white shrink-0 flex items-center justify-center shadow-xs">
-              <img
-                src={globalLogoUrl || "/assets/images/app_logo_sppg.png"}
-                alt="Logo Aplikasi Global"
-                className="w-full h-full object-cover"
-                referrerPolicy="no-referrer"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
-                }}
-              />
-            </div>
-            <div>
-              <h3 className="text-xs font-extrabold text-slate-900 uppercase tracking-wide">
-                Logo Aplikasi Global (Login, Header & Kop Surat)
-              </h3>
-              <p className="text-[11px] text-slate-500 max-w-xl">
-                Perubahan logo di sini otomatis diterapkan ke halaman masuk (login) dan seluruh akun pengguna aktif secara real-time.
-              </p>
-            </div>
-          </div>
-          <label className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs rounded-xl transition cursor-pointer inline-flex items-center gap-2 shrink-0 shadow-xs">
-            <Camera className="w-4 h-4" />
-            <span>Ubah Logo Aplikasi Global</span>
-            <input
-              type="file"
-              accept="image/*"
-              onChange={onUploadGlobalLogo}
-              className="hidden"
-            />
-          </label>
-        </div>
-      )}
-
-      {/* Bidirectional Google Sheets User Synchronization Hub */}
-      <SpreadsheetUserSyncCard
-        users={users}
-        onUsersImportedFromSheet={handleUsersImportedFromSheet}
-      />
-
-      {/* 4 Stats Cards matching Image 1 */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        {/* Total Pengguna */}
-        <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-xs flex items-center gap-4">
-          <div className="p-3.5 bg-blue-50 text-blue-600 rounded-xl">
-            <Users className="w-6 h-6" />
-          </div>
-          <div>
-            <p className="text-xs font-semibold text-slate-400">Total Pengguna</p>
-            <p className="text-2xl font-extrabold text-slate-900">{totalUsersCount}</p>
-          </div>
-        </div>
-
-        {/* Pengguna Aktif */}
-        <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-xs flex items-center gap-4">
-          <div className="p-3.5 bg-emerald-50 text-emerald-600 rounded-xl">
-            <CheckCircle className="w-6 h-6" />
-          </div>
-          <div>
-            <p className="text-xs font-semibold text-slate-400">Pengguna Aktif (ACC)</p>
-            <div className="flex items-baseline gap-2">
-              <p className="text-2xl font-extrabold text-slate-900 tabular-nums">{activeUsersCount}</p>
-              {pendingUsersCount > 0 && (
-                <span className="text-[10px] font-bold text-amber-800 bg-amber-100 px-1.5 py-0.5 rounded">
-                  {pendingUsersCount} Menunggu ACC
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* Login 24 Jam Terakhir */}
-        <div className="bg-white p-5 rounded-2xl border border-slate-100 shadow-xs flex items-center gap-4">
-          <div className="p-3.5 bg-purple-50 text-purple-600 rounded-xl">
-            <Clock className="w-6 h-6" />
-          </div>
-          <div>
-            <p className="text-xs font-semibold text-slate-400">Login 24 Jam Terakhir</p>
-            <p className="text-2xl font-extrabold text-slate-900">{login24hCount}</p>
-          </div>
-        </div>
-
-        {/* Perangkat Terdeteksi Otomatis */}
-        <button
-          type="button"
-          onClick={() => setActiveTab("perangkat")}
-          className="bg-white p-5 rounded-2xl border border-slate-100 hover:border-teal-300 shadow-xs flex items-center gap-4 text-left transition cursor-pointer"
-          title="Klik untuk melihat seluruh device yang terbaca otomatis"
-        >
-          <div className="p-3.5 bg-teal-50 text-teal-600 rounded-xl">
-            <Monitor className="w-6 h-6" />
-          </div>
-          <div>
-            <p className="text-xs font-semibold text-slate-400">Perangkat Terbaca</p>
-            <div className="flex items-center gap-2">
-              <p className="text-2xl font-extrabold text-slate-900">{devices.length}</p>
-              <span className="inline-flex items-center gap-1 text-[10px] font-extrabold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded-full">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                {onlineDevicesCount} Online
-              </span>
-            </div>
-          </div>
-        </button>
-      </div>
-
-      {/* Navigation Sub-Tabs */}
-      <div className="flex flex-wrap border-b border-slate-200">
-        <button
-          onClick={() => setActiveTab("manajemen")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
-            activeTab === "manajemen"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-900"
-          }`}
-        >
-          <Users className="w-4 h-4" />
-          Manajemen Pengguna
-        </button>
-        <button
-          onClick={() => setActiveTab("perangkat")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
-            activeTab === "perangkat"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-900"
-          }`}
-        >
-          <Monitor className="w-4 h-4" />
-          Perangkat (Device)
-          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black bg-emerald-100 text-emerald-800">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-            {devices.length}
-          </span>
-        </button>
-        <button
-          onClick={() => setActiveTab("riwayat")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
-            activeTab === "riwayat"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-900"
-          }`}
-        >
-          <History className="w-4 h-4" />
-          Riwayat Login
-        </button>
-        <button
-          onClick={() => setActiveTab("diagnostik")}
-          className={`flex items-center gap-2 px-5 py-3 text-xs font-extrabold border-b-2 transition cursor-pointer ${
-            activeTab === "diagnostik"
-              ? "border-indigo-600 text-indigo-600"
-              : "border-transparent text-slate-500 hover:text-slate-900"
-          }`}
-        >
-          <Cpu className="w-4 h-4" />
-          Sistem Diagnostik
-        </button>
-      </div>
-
-      {/* Active Tab Content Area */}
-      {activeTab === "manajemen" && (
-        <div className="space-y-4">
-          {/* Search bar & Refresh Button */}
-          <div className="flex flex-col sm:flex-row gap-3 items-center justify-between bg-white p-4 rounded-xl border border-slate-100 shadow-2xs">
-            <div className="relative w-full max-w-md">
-              <Search className="absolute left-3.5 top-3 w-4 h-4 text-slate-400" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Cari berdasarkan email, nama, atau instansi..."
-                className="w-full pl-10 pr-4 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:bg-white"
-              />
-            </div>
-            <div className="flex items-center gap-2 flex-wrap">
-              {selectedUserUids.length > 0 && (
-                <button
-                  onClick={handleClearSelectedUsers}
-                  className="flex items-center gap-1.5 px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-extrabold text-xs rounded-xl transition cursor-pointer shadow-sm animate-bounce"
-                  title="Bersihkan data pengguna yang ditandai saja"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                  Bersihkan Terpilih ({selectedUserUids.length})
-                </button>
-              )}
-              <button
-                onClick={handleClearAllUsers}
-                className="flex items-center gap-1.5 px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 font-bold text-xs rounded-xl transition cursor-pointer"
-                title="Bersihkan seluruh pengguna dengan peran 'USER' dari sistem secara permanen"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Bersihkan Semua USER
-              </button>
-              <button
-                onClick={() => setRefreshTrigger(prev => prev + 1)}
-                className="flex items-center gap-1.5 px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
-                Segarkan Data
-              </button>
-            </div>
-          </div>
-
-          {/* User List Table */}
-          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-2xs">
-            <div className="overflow-x-auto">
-              <table className="w-full border-collapse text-left text-xs font-sans">
-                <thead className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
-                  <tr>
-                    <th className="p-4 text-center w-10">
-                      <input
-                        type="checkbox"
-                        checked={isAllSelected}
-                        onChange={toggleSelectAll}
-                        className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer w-4 h-4"
-                        title="Tandai / Centang Semua Pengguna"
-                      />
-                    </th>
-                    <th className="p-4">Email / Tenant ID</th>
-                    <th className="p-4">Data Diri & SPPG</th>
-                    <th className="p-4">Perangkat (Device)</th>
-                    <th className="p-4 text-center">Peran</th>
-                    <th className="p-4 text-center">Status & Verifikasi</th>
-                    <th className="p-4 text-center">Berakhir Pada</th>
-                    <th className="p-4 text-center">Login Terakhir</th>
-                    <th className="p-4 text-center">Aksi</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {loading ? (
-                    <tr>
-                      <td colSpan={9} className="p-8 text-center text-slate-400">
-                        <RefreshCw className="w-6 h-6 animate-spin mx-auto mb-2 text-indigo-500" />
-                        Sedang menyinkronkan data dari Firestore...
-                      </td>
-                    </tr>
-                  ) : filteredUsers.length === 0 ? (
-                    <tr>
-                      <td colSpan={9} className="p-8 text-center text-slate-400">
-                        Tidak ada tenant atau pengguna ditemukan.
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredUsers.map((item) => (
-                      <tr key={item.uid} className={`hover:bg-slate-50/50 transition ${selectedUserUids.includes(item.uid) ? "bg-indigo-50/30" : ""}`}>
-                        {/* Checkbox Tandai Pengguna */}
-                        <td className="p-4 text-center">
-                          {item.uid !== "admin_syukriyusuf82" && !isMainAdminEmail(item.email) ? (
-                            <input
-                              type="checkbox"
-                              checked={selectedUserUids.includes(item.uid)}
-                              onChange={() => toggleSelectUser(item.uid)}
-                              className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer w-4 h-4"
-                            />
-                          ) : (
-                            <Shield className="w-4 h-4 text-purple-500 mx-auto" title="Admin Utama" />
-                          )}
-                        </td>
-                        {/* Email/Tenant UID */}
-                        <td className="p-4">
-                          <div className="font-semibold text-slate-900 flex items-center gap-1.5">
-                            <Mail className="w-3.5 h-3.5 text-slate-400" />
-                            {item.email}
-                          </div>
-                          <div className="text-[10px] text-slate-400 font-mono mt-0.5">{item.uid}</div>
-                        </td>
-
-                        {/* Data Diri & SPPG */}
-                        <td className="p-4 space-y-1">
-                          {item.namaLengkap ? (
-                            <>
-                              <div className="font-semibold text-slate-800 flex items-center gap-1">
-                                <User className="w-3 h-3 text-slate-400" />
-                                {item.namaLengkap}
-                              </div>
-                              <div className="text-[10px] text-slate-500 flex items-center gap-1">
-                                <Briefcase className="w-3 h-3 text-slate-400" />
-                                Profesi: {item.profesi}
-                              </div>
-                              <div className="text-[10px] text-indigo-600 font-bold flex items-center gap-1">
-                                <Building className="w-3 h-3 text-indigo-400" />
-                                {item.namaSPPG}
-                              </div>
-                              <div className="text-[10px] text-slate-400">WA: {item.noHp || "-"}</div>
-                            </>
-                          ) : (
-                            <span className="text-slate-400 italic">Belum mengisi pendaftaran</span>
-                          )}
-                        </td>
-
-                        {/* Perangkat (Device) Terdeteksi Otomatis */}
-                        <td className="p-4">
-                          {(() => {
-                            const userDevs = getDevicesForUser(item);
-                            if (userDevs.length === 0) {
-                              return <span className="text-[10.5px] text-slate-400 italic">Belum terdeteksi</span>;
-                            }
-                            return (
-                              <div className="space-y-1.5 max-w-[220px]">
-                                {userDevs.slice(0, 2).map((dev) => {
-                                  const live = isDeviceLiveOnline(dev);
-                                  return (
-                                    <div
-                                      key={dev.deviceId}
-                                      className="p-1.5 rounded-lg bg-slate-50 border border-slate-200/80 text-[10px] space-y-0.5"
-                                    >
-                                      <div className="flex items-center justify-between gap-1.5">
-                                        <span className="font-bold text-slate-800 flex items-center gap-1 truncate">
-                                          {renderDeviceIcon(dev.deviceType, "w-3 h-3 text-indigo-500 shrink-0")}
-                                          <span className="truncate">{dev.deviceModel || dev.osName}</span>
-                                        </span>
-                                        <span
-                                          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] font-extrabold shrink-0 ${
-                                            live
-                                              ? "bg-emerald-100 text-emerald-700"
-                                              : "bg-slate-200/80 text-slate-600"
-                                          }`}
-                                        >
-                                          <span
-                                            className={`w-1.5 h-1.5 rounded-full ${
-                                              live ? "bg-emerald-500 animate-pulse" : "bg-slate-400"
-                                            }`}
-                                          ></span>
-                                          {live ? "Online" : formatRelativeTime(dev.lastSeenAt)}
-                                        </span>
-                                      </div>
-                                      <div className="text-slate-500 truncate">
-                                        {dev.osName} · {dev.browserName}
-                                      </div>
-                                      {dev.ipAddress && dev.ipAddress !== "-" && (
-                                        <div className="text-[9.5px] font-mono text-slate-400 truncate">
-                                          IP: {dev.ipAddress}
-                                        </div>
-                                      )}
-                                    </div>
-                                  );
-                                })}
-                                {userDevs.length > 2 && (
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setDeviceSearchQuery(item.email || "");
-                                      setActiveTab("perangkat");
-                                    }}
-                                    className="text-[10px] font-bold text-indigo-600 hover:underline cursor-pointer"
-                                  >
-                                    +{userDevs.length - 2} perangkat lainnya
-                                  </button>
-                                )}
-                              </div>
-                            );
-                          })()}
-                        </td>
-
-                        {/* Peran / Role */}
-                        <td className="p-4 text-center">
-                          <button
-                            onClick={() => handleToggleRole(item.uid, item.peran)}
-                            className={`px-2.5 py-1 text-[10px] font-extrabold rounded-md uppercase transition cursor-pointer ${
-                              item.peran === "ADMIN"
-                                ? "bg-purple-100 text-purple-700 hover:bg-purple-200"
-                                : "bg-slate-100 text-slate-600 hover:bg-slate-200"
-                            }`}
-                          >
-                            {item.peran || "USER"}
-                          </button>
-                        </td>
-
-                        {/* Status Persetujuan (ACC Admin) */}
-                        <td className="p-4 text-center">
-                          <div className="flex flex-col items-center gap-1.5">
-                            {item.statusPersetujuan === "aktif" ? (
-                              <div className="flex flex-col items-center gap-1">
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-extrabold rounded-md bg-emerald-100 text-emerald-800 border border-emerald-300">
-                                  <CheckCircle className="w-3 h-3 text-emerald-600" />
-                                  Disetujui (ACC)
-                                </span>
-                                {item.authProvider === "google" && (
-                                  <span className="text-[9.5px] text-slate-500 font-semibold">
-                                    Akun Email Google
-                                  </span>
-                                )}
-                                {!isMainAdminEmail(item.email) && item.uid !== "admin_syukriyusuf82" && (
-                                  <div className="flex items-center gap-2 pt-0.5">
-                                    <button
-                                      type="button"
-                                      onClick={() => handleSetStatus(item.uid || item.id, "menunggu")}
-                                      className="text-[10px] text-amber-700 hover:text-amber-900 font-bold underline cursor-pointer"
-                                      title="Kembalikan status ke Menunggu ACC"
-                                    >
-                                      Tahan (Menunggu)
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleSetStatus(item.uid || item.id, "diblokir")}
-                                      className="text-[10px] text-rose-600 hover:text-rose-800 font-bold underline cursor-pointer"
-                                      title="Putuskan akses pengguna ini"
-                                    >
-                                      Putuskan
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            ) : item.statusPersetujuan === "menunggu" || item.statusPersetujuan === "pending" ? (
-                              <div className="flex flex-col items-center gap-1.5">
-                                <span className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-extrabold rounded-md bg-amber-100 text-amber-800 border border-amber-300">
-                                  <Clock className="w-3 h-3 text-amber-600" />
-                                  Menunggu ACC
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => handleSetStatus(item.uid || item.id, "aktif")}
-                                  className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-black rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white transition shadow-sm cursor-pointer"
-                                  title="Klik untuk menyetujui (ACC) dan membuka akses penuh dashboard pengguna ini"
-                                >
-                                  <CheckCircle className="w-3.5 h-3.5 text-white" />
-                                  ACC / Setujui
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleSetStatus(item.uid || item.id, "diblokir")}
-                                  className="text-[10px] text-rose-600 hover:text-rose-800 font-bold cursor-pointer"
-                                >
-                                  Tolak & Blokir
-                                </button>
-                              </div>
-                            ) : (
-                              <div className="flex flex-col items-center gap-1.5">
-                                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 text-[10.5px] font-extrabold rounded-md bg-rose-100 text-rose-800 border border-rose-300">
-                                  <XCircle className="w-3 h-3 text-rose-600" />
-                                  Diblokir
-                                </span>
-                                <button
-                                  type="button"
-                                  onClick={() => handleSetStatus(item.uid || item.id, "aktif")}
-                                  className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white font-extrabold text-[10px] rounded-md transition cursor-pointer shadow-xs"
-                                  title="Aktifkan kembali akses akun"
-                                >
-                                  Buka Akses (ACC)
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleSetStatus(item.uid || item.id, "menunggu")}
-                                  className="text-[10px] text-amber-700 hover:text-amber-900 font-bold underline cursor-pointer"
-                                >
-                                  Set Menunggu
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        </td>
-
-                        {/* Berakhir Pada */}
-                        <td className="p-4 text-center">
-                          <div className="flex flex-col items-center gap-1">
-                            <input
-                              type="date"
-                              value={item.berakhirPada || ""}
-                              onChange={(e) => handleUpdateExpiration(item.uid || item.id, e.target.value)}
-                              className="p-1 border border-slate-200 rounded text-xs bg-slate-50 focus:outline-none focus:ring-1 focus:ring-indigo-500 font-mono w-[130px] text-center"
-                            />
-                            
-                            {/* Status Expiration Check */}
-                            {(() => {
-                              const now = new Date();
-                              const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
-                              const isExpired = item.berakhirPada ? todayStr > item.berakhirPada : false;
-                              if (isExpired && item.statusPersetujuan === "aktif") {
-                                return <span className="text-[9.5px] font-bold text-rose-600 bg-rose-50 px-1.5 py-0.5 rounded border border-rose-200">⚠️ Kedaluwarsa</span>;
-                              }
-                              return null;
-                            })()}
-
-                            {/* Quick Presets */}
-                            <div className="flex items-center gap-1 text-[9px] font-bold text-slate-500 mt-0.5">
-                              <button
-                                onClick={() => handleAddDuration(item.uid || item.id, 1)}
-                                className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-100 hover:text-indigo-700 rounded transition cursor-pointer"
-                                title="+1 Bulan masa aktif"
-                              >
-                                +1Bln
-                              </button>
-                              <button
-                                onClick={() => handleAddDuration(item.uid || item.id, 6)}
-                                className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-100 hover:text-indigo-700 rounded transition cursor-pointer"
-                                title="+6 Bulan masa aktif"
-                              >
-                                +6Bln
-                              </button>
-                              <button
-                                onClick={() => handleAddDuration(item.uid || item.id, 12)}
-                                className="px-1.5 py-0.5 bg-slate-100 hover:bg-indigo-100 hover:text-indigo-700 rounded transition cursor-pointer"
-                                title="+1 Tahun masa aktif"
-                              >
-                                +1Thn
-                              </button>
-                              <button
-                                onClick={() => handleRevokeAccessNow(item.uid || item.id)}
-                                className="px-1.5 py-0.5 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded transition cursor-pointer"
-                                title="Set tanggal kedaluwarsa ke kemarin (Putuskan Akses Langsung)"
-                              >
-                                Putuskan
-                              </button>
-                            </div>
-                          </div>
-                        </td>
-
-                        {/* Login Terakhir */}
-                        <td className="p-4 text-center font-mono text-slate-500">
-                          {formatTimestamp(item.loginTerakhir)}
-                        </td>
-
-                        {/* Actions */}
-                        <td className="p-4 text-center">
-                          <div className="flex items-center justify-center gap-1.5">
-                            {item.sandi && item.authProvider !== "google" && (
-                              <button
-                                onClick={() => handleAdminResetPassword(item.uid || item.id, item.email)}
-                                className="p-1.5 bg-amber-50 hover:bg-amber-100 text-amber-700 rounded-lg transition cursor-pointer"
-                                title="Lihat / Reset Kata Sandi Legacy"
-                              >
-                                <Key className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-                            {!isMainAdminEmail(item.email) && item.uid !== "admin_syukriyusuf82" && (
-                              <button
-                                onClick={() => handleDeleteUser(item.uid, item.email)}
-                                className="p-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg transition cursor-pointer"
-                                title="Hapus Pengguna Permanen"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {activeTab === "perangkat" && (
-        <div className="space-y-4">
-          <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-2xs space-y-3">
-            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-extrabold text-slate-900 flex items-center gap-2">
-                  <Monitor className="w-4 h-4 text-indigo-600" />
-                  Monitoring Perangkat (Device) Otomatis Real-Time
-                </h3>
-                <p className="text-[11px] text-slate-500 mt-0.5">
-                  Setiap perangkat (HP, Tablet, Laptop/PC) yang mengakses, mendaftar, atau masuk ke aplikasi terbaca otomatis secara real-time.
-                </p>
-              </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <div className="relative w-full sm:w-64">
-                  <Search className="absolute left-3 top-2.5 w-3.5 h-3.5 text-slate-400" />
-                  <input
-                    type="text"
-                    value={deviceSearchQuery}
-                    onChange={(e) => setDeviceSearchQuery(e.target.value)}
-                    placeholder="Cari device, OS, browser, email, IP..."
-                    className="w-full pl-9 pr-3 py-2 text-xs border border-slate-200 rounded-xl bg-slate-50 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 focus:bg-white"
-                  />
-                </div>
-                <button
-                  onClick={() => setRefreshTrigger((prev) => prev + 1)}
-                  className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl transition cursor-pointer"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  Segarkan
-                </button>
-              </div>
-            </div>
-
-            {/* Device Category Filters */}
-            <div className="flex flex-wrap gap-1.5 pt-1">
-              {[
-                { id: "all", label: `Semua (${devices.length})` },
-                { id: "online", label: `Online (${onlineDevicesCount})` },
-                { id: "Desktop / Laptop", label: `Desktop / Laptop (${devices.filter((d) => d.deviceType === "Desktop / Laptop").length})` },
-                { id: "Mobile", label: `Mobile / HP (${devices.filter((d) => d.deviceType === "Mobile").length})` },
-                { id: "Tablet", label: `Tablet (${devices.filter((d) => d.deviceType === "Tablet").length})` },
-                { id: "guest", label: `Halaman Masuk / Daftar (${devices.filter((d) => d.sessionState === "guest" || d.sessionState === "registering").length})` },
-                { id: "demo", label: `Demo (${devices.filter((d) => d.sessionState === "demo").length})` },
-              ].map((f) => (
-                <button
-                  key={f.id}
-                  type="button"
-                  onClick={() => setDeviceFilter(f.id as any)}
-                  className={`px-3 py-1.5 rounded-lg text-[11px] font-bold transition cursor-pointer ${
-                    deviceFilter === f.id
-                      ? "bg-indigo-600 text-white shadow-2xs"
-                      : "bg-slate-100 text-slate-600 hover:bg-slate-200"
-                  }`}
-                >
-                  {f.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Real-Time Devices Table */}
-          <div className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-2xs">
-            <div className="overflow-x-auto">
-              <table className="w-full border-collapse text-left text-xs font-sans">
-                <thead className="bg-slate-50 text-slate-500 font-bold uppercase tracking-wider border-b border-slate-200">
-                  <tr>
-                    <th className="p-4">Perangkat & Sistem</th>
-                    <th className="p-4">Pengguna / Sesi</th>
-                    <th className="p-4 text-center">Status Koneksi</th>
-                    <th className="p-4">Jaringan & Layar</th>
-                    <th className="p-4">Terakhir Aktif</th>
-                    <th className="p-4 text-center">Aksi</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100 text-slate-700">
-                  {filteredDevices.length === 0 ? (
-                    <tr>
-                      <td colSpan={6} className="p-8 text-center text-slate-400">
-                        Belum ada perangkat yang sesuai dengan filter saat ini.
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredDevices.map((dev) => {
-                      const live = isDeviceLiveOnline(dev);
-                      return (
-                        <tr key={dev.deviceId} className="hover:bg-slate-50/60 transition">
-                          <td className="p-4">
-                            <div className="flex items-start gap-2.5">
-                              <div
-                                className={`p-2 rounded-xl shrink-0 ${
-                                  live ? "bg-indigo-50 text-indigo-600" : "bg-slate-100 text-slate-500"
-                                }`}
-                              >
-                                {renderDeviceIcon(dev.deviceType, "w-4 h-4")}
-                              </div>
-                              <div className="space-y-0.5">
-                                <div className="font-extrabold text-slate-900 flex items-center gap-1.5">
-                                  <span>{dev.deviceModel || dev.deviceType}</span>
-                                  <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">
-                                    {dev.deviceType}
-                                  </span>
-                                </div>
-                                <div className="text-[11px] text-slate-600 font-medium">
-                                  {dev.osName} · {dev.browserName}
-                                </div>
-                                <div className="text-[10px] font-mono text-slate-400">
-                                  ID: {dev.deviceId}
-                                </div>
-                              </div>
-                            </div>
-                          </td>
-
-                          <td className="p-4 space-y-0.5">
-                            {dev.userEmail ? (
-                              <>
-                                <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                                  <User className="w-3 h-3 text-slate-400" />
-                                  <span>{dev.userName || dev.userEmail}</span>
-                                </div>
-                                <div className="text-[11px] text-indigo-700 font-semibold">{dev.userEmail}</div>
-                                {dev.namaSPPG && (
-                                  <div className="text-[10px] text-slate-500 flex items-center gap-1">
-                                    <Building className="w-3 h-3 text-slate-400" />
-                                    {dev.namaSPPG}
-                                  </div>
-                                )}
-                                <div className="flex items-center gap-1.5 pt-0.5">
-                                  <span className="text-[9.5px] font-extrabold uppercase px-1.5 py-0.5 rounded bg-purple-50 text-purple-700">
-                                    {dev.peran || "USER"}
-                                  </span>
-                                  {dev.sessionState === "registering" && (
-                                    <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">
-                                      Verifikasi OTP
-                                    </span>
-                                  )}
-                                  {dev.sessionState === "demo" && (
-                                    <span className="text-[9.5px] font-bold px-1.5 py-0.5 rounded bg-teal-100 text-teal-800">
-                                      Demo 5 Menit
-                                    </span>
-                                  )}
-                                </div>
-                              </>
-                            ) : (
-                              <div className="space-y-1">
-                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-100 text-slate-600 font-bold text-[10px]">
-                                  Halaman Masuk / Tamu
-                                </span>
-                                <div className="text-[10px] text-slate-400">Belum masuk ke akun</div>
-                              </div>
-                            )}
-                          </td>
-
-                          <td className="p-4 text-center">
-                            {live ? (
-                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 font-extrabold text-[10.5px]">
-                                <Wifi className="w-3 h-3 text-emerald-600" />
-                                Online
-                              </span>
-                            ) : (
-                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-bold text-[10.5px]">
-                                <WifiOff className="w-3 h-3 text-slate-400" />
-                                Offline
-                              </span>
-                            )}
-                          </td>
-
-                          <td className="p-4 space-y-0.5 text-[11px]">
-                            <div className="font-mono font-bold text-slate-700 flex items-center gap-1">
-                              <Globe className="w-3 h-3 text-slate-400" />
-                              {dev.ipAddress || "-"}
-                            </div>
-                            <div className="text-[10px] text-slate-500">
-                              Layar: {dev.screenResolution || "-"} · {dev.timezone || "-"}
-                            </div>
-                          </td>
-
-                          <td className="p-4 space-y-0.5">
-                            <div className="font-bold text-slate-800 text-[11px]">
-                              {formatRelativeTime(dev.lastSeenAt)}
-                            </div>
-                            <div className="text-[10px] font-mono text-slate-500">
-                              {formatTimestamp(dev.lastSeenAt)}
-                            </div>
-                            {dev.firstSeenAt && (
-                              <div className="text-[9.5px] text-slate-400">
-                                Pertama: {formatTimestamp(dev.firstSeenAt)}
-                              </div>
-                            )}
-                          </td>
-
-                          <td className="p-4 text-center">
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteDeviceRecord(dev.deviceId)}
-                              className="p-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg transition cursor-pointer"
-                              title="Hapus catatan perangkat ini"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {activeTab === "riwayat" && (
-        <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
-          <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
-            <History className="w-4 h-4 text-indigo-500" />
-            Riwayat Aktivitas Login Tenant
-          </h3>
-          <p className="text-xs text-slate-500">Aktivitas autentikasi masuk terbaru beserta perangkat yang tercatat secara real-time di Firestore.</p>
-          
-          <div className="overflow-x-auto border border-slate-100 rounded-lg">
-            <table className="w-full text-left text-xs">
-              <thead className="bg-slate-50 text-slate-500 font-bold border-b border-slate-100">
-                <tr>
-                  <th className="p-3">Email Pengguna</th>
-                  <th className="p-3">SPPG / Instansi</th>
-                  <th className="p-3">Perangkat & IP</th>
-                  <th className="p-3">Peran</th>
-                  <th className="p-3">Waktu Login</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-50 font-mono text-slate-600">
-                {users.filter(u => u.loginTerakhir).map((user, idx) => {
-                  const userDevs = getDevicesForUser(user);
-                  const latestDev = userDevs[0];
-                  return (
-                    <tr key={idx} className="hover:bg-slate-50/50">
-                      <td className="p-3 font-sans font-medium text-slate-800">{user.email}</td>
-                      <td className="p-3 font-sans text-xs">{user.namaSPPG || "SPPG Pusat"}</td>
-                      <td className="p-3 font-sans text-[11px] text-slate-600">
-                        {latestDev ? (
-                          <div className="flex items-center gap-1.5">
-                            {renderDeviceIcon(latestDev.deviceType, "w-3.5 h-3.5 text-indigo-500 shrink-0")}
-                            <span>
-                              {formatDeviceShortLabel(latestDev)}
-                              {latestDev.ipAddress && latestDev.ipAddress !== "-" ? ` (${latestDev.ipAddress})` : ""}
-                            </span>
-                          </div>
-                        ) : (
-                          user.lastDeviceLabel || "-"
-                        )}
-                      </td>
-                      <td className="p-3"><span className="bg-purple-50 text-purple-700 px-1.5 py-0.5 rounded text-[10px]">{user.peran || "USER"}</span></td>
-                      <td className="p-3">{formatTimestamp(user.loginTerakhir)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        </div>
-      )}
-
-      {activeTab === "diagnostik" && (
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          {/* Firestore Connection Diagnostic */}
-          <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
-                <Database className="w-4 h-4 text-emerald-500" />
-                Koneksi Database Firestore & Real-Time
-              </h3>
-              <button
-                type="button"
-                disabled={testingDb}
-                onClick={async () => {
-                  setTestingDb(true);
-                  await testFirestoreConnection();
-                  setRefreshTrigger((prev) => prev + 1);
-                  setTestingDb(false);
-                }}
-                className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-[11px] rounded-lg inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3 h-3 ${testingDb ? "animate-spin" : ""}`} />
-                Uji Koneksi
-              </button>
-            </div>
-            <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-2 text-slate-700">
-              <div className="flex items-center justify-between gap-2">
-                <span>Project ID:</span>
-                <span className="font-mono text-[11px] font-bold text-slate-700">{FIREBASE_PROJECT_ID}</span>
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <span>Database ID Aktif:</span>
-                <span className="font-mono text-[10.5px] font-bold text-indigo-700 break-all text-right">
-                  {FIRESTORE_DATABASE_ID}
-                </span>
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <span>Status Firestore (Cloud):</span>
-                {firestoreHealth.writeQuotaExceeded ? (
-                  <span className="font-bold text-amber-700 flex items-center gap-1">
-                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600" />
-                    Baca Aktif · Kuota Tulis Harian Penuh
-                  </span>
-                ) : firestoreHealth.status === "connected" ? (
-                  <span className="font-bold text-emerald-600 flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    Terhubung Penuh (Baca & Tulis)
-                  </span>
-                ) : firestoreHealth.status === "checking" ? (
-                  <span className="font-bold text-slate-500">Memeriksa koneksi...</span>
-                ) : (
-                  <span className="font-bold text-rose-600">
-                    {firestoreHealth.status === "offline" ? "Offline" : "Perlu Pemeriksaan"}
-                  </span>
-                )}
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <span>Jalur Real-Time HP ↔ Laptop (SSE):</span>
-                <span
-                  className={`font-bold flex items-center gap-1 ${
-                    sseStatus === "connected" ? "text-emerald-600" : "text-amber-600"
-                  }`}
-                >
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      sseStatus === "connected" ? "bg-emerald-500 animate-pulse" : "bg-amber-500"
-                    }`}
-                  ></span>
-                  {sseStatus === "connected" ? "Terhubung Real-Time (<1 dtk)" : "Menyambung Ulang..."}
-                </span>
-              </div>
-              {lastLiveEventAt && (
-                <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-200/80">
-                  <span>Sinkronisasi Terakhir:</span>
-                  <span className="font-mono text-[11px] text-slate-500">{formatTimestamp(lastLiveEventAt)}</span>
-                </div>
-              )}
-            </div>
-            {firestoreHealth.writeQuotaExceeded && (
-              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900 space-y-1.5">
-                <p className="font-bold">Info Kuota Harian Firestore (Free Tier):</p>
-                <p>
-                  Batas harian unit tulis gratis pada proyek Firebase sedang tercapai dan akan reset otomatis keesokan hari.
-                  Aplikasi telah dioptimalkan untuk menghemat &gt;95% kuota tulis, dan sinkronisasi langsung antar HP dan Laptop tetap berjalan melalui Server Real-Time Relay.
-                </p>
-                <a
-                  href={FIRESTORE_UPGRADE_URL}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 font-bold text-amber-800 underline hover:text-amber-950"
-                >
-                  Lihat Database & Opsi Upgrade di Firebase Console
-                  <ExternalLink className="w-3 h-3" />
-                </a>
-              </div>
-            )}
-          </div>
-
-          {/* Tenant Isolation & Multi-Device Diagnostic */}
-          <div className="bg-white p-5 rounded-xl border border-slate-200 space-y-4">
-            <h3 className="text-sm font-extrabold text-slate-800 flex items-center gap-2">
-              <Cpu className="w-4 h-4 text-indigo-500" />
-              Sistem Multi-Tenancy & Multi-Device
-            </h3>
-            <div className="p-3 bg-indigo-50/50 border border-indigo-100 rounded-lg text-xs space-y-2 text-slate-700">
-              <div className="flex items-center justify-between">
-                <span>Sistem Isolasi:</span>
-                <span className="font-bold text-indigo-600">Subkoleksi States Berbasis UID</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span>Jumlah Tenant Terdaftar:</span>
-                <span className="font-bold">{totalUsersCount} Tenant</span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span>Perangkat Terdeteksi (HP & Laptop):</span>
-                <span className="font-bold text-teal-700">
-                  {devices.length} Perangkat ({onlineDevicesCount} Online)
-                </span>
-              </div>
-              <div className="flex items-center justify-between">
-                <span>TKPI Rujukan Bersama:</span>
-                <span className="font-bold text-emerald-600 flex items-center gap-1">
-                  <CheckCircle className="w-3.5 h-3.5" />
-                  Aktif (Delta Hemat Kuota)
-                </span>
-              </div>
-            </div>
-            <p className="text-[11px] text-slate-500 leading-relaxed">
-              Setiap aktivitas pendaftaran, verifikasi kode email, dan login dari perangkat seluler (Android/iPhone) maupun komputer langsung dikirim melalui jalur sinkronisasi ganda (Firestore Cloud + Real-Time Server Stream) agar langsung terlihat di Panel Admin.
+            <h1 className="text-xl sm:text-2xl font-extrabold text-slate-900 tracking-tight mt-1">
+              Manajemen Akses Pengguna &amp; Database Spreadsheet
+            </h1>
+            <p className="text-sm text-slate-600 mt-1.5 max-w-3xl leading-relaxed">
+              Setiap pengguna yang mencoba masuk dengan email pribadi Google otomatis terdeteksi di Daftar Tunggu. Cari email untuk melakukan ACC, atur tanggal login &amp; tanggal berakhir login, serta sinkronkan jumlah pengguna ke Google Spreadsheet.
             </p>
           </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => downloadUsersCsv(users)}
+              className="inline-flex items-center gap-2 px-4 py-2.5 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl text-xs font-bold whitespace-nowrap transition cursor-pointer"
+            >
+              <Download className="w-4 h-4 text-emerald-600" />
+              <span className="tabular-nums">Unduh Database CSV ({stats.total})</span>
+            </button>
+
+            {onUploadGlobalLogo && (
+              <button
+                type="button"
+                onClick={() => setIsLogoModalOpen(true)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl text-xs font-bold whitespace-nowrap transition cursor-pointer"
+              >
+                <Camera className="w-3.5 h-3.5 text-slate-500" />
+                <span>Logo Global</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              onClick={onClose}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold whitespace-nowrap transition cursor-pointer"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>Dashboard</span>
+            </button>
+          </div>
+        </header>
+
+        {/* INLINE TOAST NOTIFICATION */}
+        {toast && (
+          <div
+            className={`rounded-xl px-4 py-3 text-xs font-medium flex items-center justify-between gap-3 border ${
+              toast.type === "success"
+                ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                : toast.type === "error"
+                ? "bg-rose-50 border-rose-200 text-rose-900"
+                : "bg-slate-100 border-slate-200 text-slate-800"
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              {toast.type === "success" ? (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              ) : (
+                <AlertCircle className="w-4 h-4 shrink-0" />
+              )}
+              <span>{toast.text}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setToast(null)}
+              className="opacity-60 hover:opacity-100 cursor-pointer shrink-0"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* 4 CLICKABLE KPI SUMMARY CARDS — Exact Reference Structure */}
+        <section className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+          <button
+            type="button"
+            onClick={() => setStatusFilter("semua")}
+            className={`text-left bg-white rounded-2xl p-5 border transition cursor-pointer ${
+              statusFilter === "semua"
+                ? "border-emerald-500 ring-1 ring-emerald-500/20"
+                : "border-slate-200 hover:border-slate-300"
+            }`}
+          >
+            <div className="text-xs font-semibold text-slate-600">Total Pengguna Terdeteksi</div>
+            <div className="text-3xl font-extrabold text-slate-900 tabular-nums mt-2 leading-none">
+              {stats.total}
+            </div>
+            <div className="text-xs text-slate-500 mt-2.5">Semua email pribadi masuk</div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setStatusFilter("menunggu")}
+            className={`text-left bg-white rounded-2xl p-5 border transition cursor-pointer ${
+              statusFilter === "menunggu"
+                ? "border-amber-500 ring-1 ring-amber-500/20"
+                : "border-slate-200 hover:border-slate-300"
+            }`}
+          >
+            <div className="text-xs font-semibold text-amber-700">Daftar Tunggu (Perlu ACC)</div>
+            <div className="text-3xl font-extrabold text-amber-700 tabular-nums mt-2 leading-none">
+              {stats.menunggu}
+            </div>
+            <div className="text-xs text-slate-500 mt-2.5">Menunggu persetujuan Odhe Gizi</div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setStatusFilter("aktif")}
+            className={`text-left bg-white rounded-2xl p-5 border transition cursor-pointer ${
+              statusFilter === "aktif"
+                ? "border-emerald-500 ring-1 ring-emerald-500/20"
+                : "border-slate-200 hover:border-slate-300"
+            }`}
+          >
+            <div className="text-xs font-semibold text-emerald-700">Pengguna Aktif (ACC)</div>
+            <div className="text-3xl font-extrabold text-emerald-700 tabular-nums mt-2 leading-none">
+              {stats.aktif}
+            </div>
+            <div className="text-xs text-slate-500 mt-2.5">Bisa akses semua menu non-admin</div>
+          </button>
+
+          <button
+            type="button"
+            onClick={() =>
+              setStatusFilter(stats.kedaluwarsa > 0 ? "kedaluwarsa" : "diblokir")
+            }
+            className={`text-left bg-white rounded-2xl p-5 border transition cursor-pointer ${
+              statusFilter === "kedaluwarsa" || statusFilter === "diblokir"
+                ? "border-rose-500 ring-1 ring-rose-500/20"
+                : "border-slate-200 hover:border-slate-300"
+            }`}
+          >
+            <div className="text-xs font-semibold text-rose-700">Kedaluwarsa / Diblokir</div>
+            <div className="text-3xl font-extrabold text-rose-700 tabular-nums mt-2 leading-none">
+              {stats.kedaluwarsa + stats.diblokir}
+            </div>
+            <div className="text-xs text-slate-500 mt-2.5 tabular-nums">
+              {stats.kedaluwarsa} habis masa · {stats.diblokir} diblokir
+            </div>
+          </button>
+        </section>
+
+        {/* MAIN USER ACCESS CONTROL WORKSPACE CARD */}
+        <section className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 space-y-4">
+          {/* Search Bar + Cari Email untuk ACC + Segmented Status Filter Tabs */}
+          <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-3">
+            <form onSubmit={handleSearchSubmit} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 flex-1 max-w-2xl">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  ref={searchInputRef}
+                  type="text"
+                  value={searchInput}
+                  onChange={(e) => setSearchInput(e.target.value)}
+                  placeholder="Ketik email atau nama pengguna yang ingin di-ACC..."
+                  className="w-full pl-10 pr-8 py-2.5 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600"
+                />
+                {searchInput && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchInput("");
+                      setAppliedSearch("");
+                    }}
+                    aria-label="Hapus pencarian"
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
+              <button
+                type="submit"
+                className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs sm:text-sm rounded-xl whitespace-nowrap transition cursor-pointer shrink-0"
+              >
+                <Search className="w-4 h-4" />
+                <span>Cari Email untuk ACC</span>
+              </button>
+            </form>
+
+            {/* Segmented Status Tabs */}
+            <div className="bg-slate-100 p-1 rounded-xl flex items-center gap-0.5 overflow-x-auto shrink-0">
+              {(
+                [
+                  { id: "semua", label: "Semua", count: stats.total },
+                  { id: "menunggu", label: "Daftar Tunggu", count: stats.menunggu },
+                  { id: "aktif", label: "Aktif", count: stats.aktif },
+                  { id: "kedaluwarsa", label: "Kedaluwarsa", count: stats.kedaluwarsa },
+                  { id: "diblokir", label: "Diblokir", count: stats.diblokir },
+                ] as const
+              ).map((tab) => {
+                const isActive = statusFilter === tab.id;
+                return (
+                  <button
+                    key={tab.id}
+                    type="button"
+                    onClick={() => setStatusFilter(tab.id)}
+                    className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap tabular-nums transition cursor-pointer ${
+                      isActive
+                        ? "bg-white text-slate-900 shadow-2xs"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    {tab.label} ({tab.count})
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* USER ACCESS CONTROL CARDS */}
+          {loading && users.length === 0 ? (
+            <div className="space-y-3 py-2">
+              {[1, 2, 3].map((idx) => (
+                <div
+                  key={idx}
+                  className="border border-slate-200 rounded-2xl p-5 animate-pulse space-y-4"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="space-y-2">
+                      <div className="h-4 w-64 bg-slate-200 rounded" />
+                      <div className="h-3 w-96 bg-slate-100 rounded" />
+                    </div>
+                    <div className="h-9 w-36 bg-slate-200 rounded-xl" />
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3 border-t border-slate-100">
+                    <div className="h-10 bg-slate-100 rounded-xl" />
+                    <div className="h-10 bg-slate-100 rounded-xl" />
+                    <div className="h-10 bg-slate-100 rounded-xl" />
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : filteredUsers.length === 0 ? (
+            <div className="border border-dashed border-slate-200 rounded-2xl py-12 px-6 text-center space-y-3">
+              <p className="text-sm font-bold text-slate-800">
+                {effectiveQuery
+                  ? `Tidak ditemukan pengguna dengan kata kunci "${effectiveQuery}".`
+                  : "Belum ada pengguna pada kategori filter ini."}
+              </p>
+              <p className="text-xs text-slate-500 max-w-md mx-auto">
+                Setiap pengguna baru yang mencoba masuk dengan email Google akan otomatis muncul di Daftar Tunggu secara real-time.
+              </p>
+              {(effectiveQuery || statusFilter !== "semua") && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchInput("");
+                    setAppliedSearch("");
+                    setStatusFilter("semua");
+                  }}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl cursor-pointer transition"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Tampilkan Semua Pengguna</span>
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {filteredUsers.map((u) => {
+                const email = String(u.email || "").toLowerCase().trim();
+                const cat = getEffectiveCategory(u, todayIso);
+                const futureScheduled = isScheduledInFuture(u, todayIso);
+                const isProtectedMainAdmin = isMainAdminEmail(email);
+                const draft = getUserDraft(u);
+                const dirty = isDraftDirty(u);
+                const isSavingThis = savingEmail === email;
+                const justSaved = recentlySavedEmail === email;
+                const isHighlighted = highlightedEmail === email;
+
+                const statusLabel =
+                  cat === "menunggu"
+                    ? "Daftar Tunggu (Menunggu ACC)"
+                    : cat === "diblokir"
+                    ? "Diblokir"
+                    : cat === "kedaluwarsa"
+                    ? "Kedaluwarsa"
+                    : futureScheduled
+                    ? "Aktif (Jadwal Belum Mulai)"
+                    : "Aktif (ACC)";
+
+                const statusColorClass =
+                  cat === "menunggu"
+                    ? "text-amber-700"
+                    : cat === "diblokir" || cat === "kedaluwarsa"
+                    ? "text-rose-700"
+                    : futureScheduled
+                    ? "text-indigo-700"
+                    : "text-emerald-700";
+
+                const loginCount = Math.max(1, Number(u.loginCount) || 1);
+
+                return (
+                  <article
+                    key={email}
+                    className={`rounded-2xl border p-4 sm:p-5 space-y-4 transition ${
+                      isHighlighted
+                        ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50/20"
+                        : "border-slate-200 bg-white hover:border-slate-300"
+                    }`}
+                  >
+                    {/* Top Row: Email · Status + Action Buttons */}
+                    <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+                          <span className="text-sm sm:text-[15px] font-extrabold text-slate-900 break-all">
+                            {email}
+                          </span>
+                          <span className="text-slate-300">·</span>
+                          <span className={`text-xs font-bold ${statusColorClass}`}>
+                            {statusLabel}
+                          </span>
+                          {u.peran === "ADMIN" && (
+                            <>
+                              <span className="text-slate-300">·</span>
+                              <span className="text-xs font-bold text-slate-600">Admin</span>
+                            </>
+                          )}
+                        </div>
+
+                        <p className="text-xs text-slate-500 mt-1 tabular-nums leading-relaxed">
+                          <span className="font-medium text-slate-700">
+                            {u.namaLengkap || email.split("@")[0]}
+                          </span>
+                          {u.namaSPPG ? (
+                            <>
+                              {" · "}
+                              <span>{u.namaSPPG}</span>
+                            </>
+                          ) : null}
+                          {" · "}
+                          <span>Login Pertama: {formatDateTimeId(u.loginPertama || u.createdAt)}</span>
+                          {" · "}
+                          <span>
+                            Login Terakhir: {formatDateTimeId(u.loginTerakhir)} ({loginCount}x)
+                          </span>
+                        </p>
+                      </div>
+
+                      {/* Row Action Controls */}
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        {(cat === "menunggu" || cat === "kedaluwarsa" || cat === "diblokir") && (
+                          <button
+                            type="button"
+                            disabled={isSavingThis}
+                            onClick={() => handleAccUser(u)}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl whitespace-nowrap transition cursor-pointer disabled:opacity-60"
+                          >
+                            {isSavingThis ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <UserCheck className="w-3.5 h-3.5" />
+                            )}
+                            <span>ACC Pengguna</span>
+                          </button>
+                        )}
+
+                        {dirty && (
+                          <button
+                            type="button"
+                            disabled={isSavingThis}
+                            onClick={() => handleSaveDraft(u)}
+                            className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl whitespace-nowrap transition cursor-pointer disabled:opacity-60"
+                          >
+                            {isSavingThis ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <Save className="w-3.5 h-3.5" />
+                            )}
+                            <span>Simpan</span>
+                          </button>
+                        )}
+
+                        {!isProtectedMainAdmin && cat !== "menunggu" && (
+                          <button
+                            type="button"
+                            disabled={isSavingThis}
+                            onClick={() => handleReturnToWaiting(u)}
+                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 font-bold text-xs rounded-xl whitespace-nowrap transition cursor-pointer disabled:opacity-60"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Daftar Tunggu</span>
+                          </button>
+                        )}
+
+                        {!isProtectedMainAdmin && cat !== "diblokir" && (
+                          <button
+                            type="button"
+                            disabled={isSavingThis}
+                            onClick={() => handleBlockUser(u)}
+                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-white hover:bg-rose-50 text-rose-600 border border-rose-200 font-bold text-xs rounded-xl whitespace-nowrap transition cursor-pointer disabled:opacity-60"
+                          >
+                            <Ban className="w-3.5 h-3.5" />
+                            <span>Blokir</span>
+                          </button>
+                        )}
+
+                        {!isProtectedMainAdmin && (
+                          <button
+                            type="button"
+                            disabled={isSavingThis}
+                            onClick={() => setDeleteTargetUser(u)}
+                            title="Hapus catatan pengguna"
+                            aria-label={`Hapus ${email}`}
+                            className="inline-flex items-center justify-center p-2 bg-white hover:bg-rose-50 text-slate-500 hover:text-rose-600 border border-slate-200 hover:border-rose-200 rounded-xl transition cursor-pointer disabled:opacity-60"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* 3-Column Inline Access Controls — Exact Screenshot Grid */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-3 border-t border-slate-100">
+                      {/* Col 1: Tanggal Mulai Login */}
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <label
+                            htmlFor={`start-date-${email}`}
+                            className="text-xs font-semibold text-slate-700"
+                          >
+                            Tanggal Mulai Login
+                          </label>
+                          {draft.mulaiPada ? (
+                            <button
+                              type="button"
+                              onClick={() => updateUserDraft(u, { mulaiPada: "" })}
+                              className="text-[11px] font-semibold text-slate-400 hover:text-slate-700 cursor-pointer"
+                            >
+                              Hapus
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => updateUserDraft(u, { mulaiPada: todayIso })}
+                              className="text-[11px] font-semibold text-slate-400 hover:text-emerald-700 cursor-pointer"
+                            >
+                              Hari Ini
+                            </button>
+                          )}
+                        </div>
+                        <input
+                          id={`start-date-${email}`}
+                          type="date"
+                          value={draft.mulaiPada}
+                          onChange={(e) => updateUserDraft(u, { mulaiPada: e.target.value })}
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm text-slate-800 tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600"
+                        />
+                      </div>
+
+                      {/* Col 2: Tanggal Berakhir Login (Atur Admin) + Tanpa Batas + Quick Presets */}
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <label
+                            htmlFor={`end-date-${email}`}
+                            className="text-xs font-semibold text-slate-700"
+                          >
+                            Tanggal Berakhir Login (Atur Admin)
+                          </label>
+                          <button
+                            type="button"
+                            onClick={() => handleApplyExpirationPreset(u, "unlimited")}
+                            className={`text-xs font-semibold cursor-pointer transition ${
+                              draft.berakhirPada === ""
+                                ? "text-emerald-700"
+                                : "text-slate-400 hover:text-emerald-700"
+                            }`}
+                          >
+                            Tanpa Batas
+                          </button>
+                        </div>
+                        <input
+                          id={`end-date-${email}`}
+                          type="date"
+                          value={draft.berakhirPada}
+                          onChange={(e) => updateUserDraft(u, { berakhirPada: e.target.value })}
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm text-slate-800 tabular-nums focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600"
+                        />
+                        <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                          {(
+                            [
+                              { id: "7d", label: "+7 Hr" },
+                              { id: "30d", label: "+30 Hr" },
+                              { id: "3m", label: "+3 Bln" },
+                              { id: "1y", label: "+1 Thn" },
+                            ] as const
+                          ).map((preset) => (
+                            <button
+                              key={preset.id}
+                              type="button"
+                              disabled={isSavingThis}
+                              onClick={() => handleApplyExpirationPreset(u, preset.id)}
+                              className="px-2.5 py-1 bg-slate-50 hover:bg-emerald-50 text-slate-600 hover:text-emerald-800 border border-slate-200 hover:border-emerald-300 rounded-lg text-[11px] font-semibold tabular-nums transition cursor-pointer disabled:opacity-50"
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Col 3: Keterangan (Ditampilkan ke Pengguna) */}
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <label
+                            htmlFor={`note-${email}`}
+                            className="text-xs font-semibold text-slate-700"
+                          >
+                            Keterangan (Ditampilkan ke Pengguna)
+                          </label>
+                          {justSaved ? (
+                            <span className="text-[11px] font-semibold text-emerald-700">
+                              Tersimpan
+                            </span>
+                          ) : dirty ? (
+                            <span className="text-[11px] font-semibold text-amber-700">
+                              Belum disimpan
+                            </span>
+                          ) : null}
+                        </div>
+                        <input
+                          id={`note-${email}`}
+                          type="text"
+                          value={draft.keterangan}
+                          onChange={(e) => updateUserDraft(u, { keterangan: e.target.value })}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              handleSaveDraft(u);
+                            }
+                          }}
+                          placeholder="Daftar Tunggu - Menunggu ACC Admin Odhe Gizi"
+                          className="w-full px-3 py-2 bg-white border border-slate-300 rounded-xl text-xs sm:text-sm text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600"
+                        />
+                      </div>
+                    </div>
+                  </article>
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {/* DATABASE SPREADSHEET ADMIN (CSV + Google Sheets Sync + Apps Script Webhook) */}
+        <SpreadsheetUserSyncCard
+          users={users}
+          onUsersImportedFromSheet={handleUsersImportedFromSheet}
+        />
+
+        {/* COMPACT COLLAPSIBLE REAL-TIME DEVICE REGISTRY */}
+        <section className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setShowDevicesDrawer((prev) => !prev)}
+            className="w-full px-5 py-4 flex items-center justify-between gap-3 hover:bg-slate-50/70 transition cursor-pointer text-left"
+          >
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span className="text-sm font-bold text-slate-900">Perangkat Terdeteksi Otomatis</span>
+              <span className="text-slate-300">·</span>
+              <span className="text-xs font-semibold text-emerald-700 tabular-nums">
+                {onlineDevicesCount} online
+              </span>
+              <span className="text-slate-300">·</span>
+              <span className="text-xs text-slate-500 tabular-nums">
+                {devices.length} total perangkat (Seluler &amp; Laptop)
+              </span>
+            </div>
+            {showDevicesDrawer ? (
+              <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" />
+            ) : (
+              <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
+            )}
+          </button>
+
+          {showDevicesDrawer && (
+            <div className="border-t border-slate-100 divide-y divide-slate-100">
+              {devices.length === 0 ? (
+                <div className="px-5 py-6 text-xs text-slate-500 text-center">
+                  Belum ada perangkat yang tercatat pada sesi saat ini.
+                </div>
+              ) : (
+                devices.slice(0, 30).map((d) => {
+                  const online = isDeviceCurrentlyOnline(d);
+                  const DevIcon =
+                    d.deviceType === "Mobile"
+                      ? Smartphone
+                      : d.deviceType === "Tablet"
+                      ? Tablet
+                      : Monitor;
+                  return (
+                    <div
+                      key={d.deviceId}
+                      className="px-5 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs"
+                    >
+                      <div className="flex items-start gap-3 min-w-0">
+                        <DevIcon className="w-4 h-4 text-slate-500 shrink-0 mt-0.5" />
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-x-1.5">
+                            <span className="font-bold text-slate-900">
+                              {d.userEmail || "Pengunjung Login"}
+                            </span>
+                            <span className="text-slate-300">·</span>
+                            <span
+                              className={`font-semibold ${
+                                online ? "text-emerald-700" : "text-slate-500"
+                              }`}
+                            >
+                              {online ? "Online" : "Offline"}
+                            </span>
+                          </div>
+                          <div className="text-slate-500 mt-0.5 tabular-nums">
+                            {d.deviceModel || d.deviceType} · {d.osName} · {d.browserName} · IP:{" "}
+                            {d.ipAddress || "-"} · Terakhir: {formatDateTimeId(d.lastSeenAt)}
+                          </div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteDevice(d.deviceId)}
+                        title="Hapus log perangkat"
+                        className="self-end sm:self-center p-1.5 text-slate-400 hover:text-rose-600 rounded-lg cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          )}
+        </section>
+      </div>
+
+      {/* CUSTOM DELETE CONFIRMATION MODAL (No window.confirm) */}
+      {deleteTargetUser && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-[9999] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden">
+            <div className="px-5 py-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+              <h4 className="text-sm font-extrabold text-slate-900">Hapus Catatan Pengguna</h4>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => setDeleteTargetUser(null)}
+                className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-2 text-xs text-slate-600 leading-relaxed">
+              <p>
+                Apakah Anda yakin ingin menghapus catatan akses untuk{" "}
+                <strong className="text-slate-900">{deleteTargetUser.email}</strong>?
+              </p>
+              <p>
+                Pengguna akan otomatis dikeluarkan dari aplikasi dan perlu masuk ulang ke Daftar Tunggu jika ingin meminta ACC kembali.
+              </p>
+            </div>
+
+            <div className="px-5 py-3.5 bg-slate-50 border-t border-slate-200 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={() => setDeleteTargetUser(null)}
+                className="px-4 py-2 bg-white hover:bg-slate-100 border border-slate-300 text-slate-700 font-bold text-xs rounded-xl cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                disabled={isDeleting}
+                onClick={handleConfirmDeleteUser}
+                className="inline-flex items-center gap-1.5 px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs rounded-xl cursor-pointer disabled:opacity-60"
+              >
+                {isDeleting ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>{isDeleting ? "Menghapus..." : "Ya, Hapus Catatan"}</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
+      {/* GLOBAL LOGO UPLOAD MODAL */}
+      {isLogoModalOpen && onUploadGlobalLogo && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs z-[9999] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl max-w-md w-full shadow-2xl border border-slate-200 overflow-hidden">
+            <div className="px-5 py-4 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
+              <h4 className="text-sm font-extrabold text-slate-900">Logo Global Aplikasi &amp; Halaman Login</h4>
+              <button
+                type="button"
+                onClick={() => setIsLogoModalOpen(false)}
+                className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 text-center">
+              <div className="w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-500 mx-auto bg-slate-50">
+                <img
+                  src={globalLogoUrl || "/assets/aistudio/image_fd878a6e.png"}
+                  alt="Logo Global SISPERMBG"
+                  className="w-full h-full object-cover"
+                  referrerPolicy="no-referrer"
+                />
+              </div>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Logo yang diunggah di sini otomatis diterapkan ke halaman depan Login dan seluruh akun pengguna SISPERMBG.
+              </p>
+              <label className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl cursor-pointer transition">
+                <Camera className="w-4 h-4" />
+                <span>Pilih Gambar Logo Baru</span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={(e) => {
+                    onUploadGlobalLogo(e);
+                    setIsLogoModalOpen(false);
+                    showToast("success", "Logo global aplikasi diperbarui.");
+                  }}
+                  className="hidden"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -23,8 +23,12 @@ export const CANONICAL_SHEET_HEADERS = [
   "No HP",
   "Peran",
   "Status ACC",
-  "Berakhir Pada",
+  "Tanggal Mulai Login",
+  "Tanggal Berakhir Login",
+  "Keterangan",
+  "Login Pertama",
   "Login Terakhir",
+  "Jumlah Login",
   "Sumber",
 ] as const;
 
@@ -34,6 +38,10 @@ export interface SheetSyncConfig {
   gid: string;
   sheetTitle: string;
   spreadsheetTitle: string;
+  webhookUrl?: string;
+  autoWebhookEnabled?: boolean;
+  lastWebhookPushAt?: string;
+  lastWebhookStatus?: string;
   updatedAt: string;
   updatedBy?: string;
 }
@@ -66,8 +74,12 @@ export interface ParsedSheetUserRow {
   noHp: string;
   peran: "USER" | "ADMIN";
   statusPersetujuan: "aktif" | "menunggu" | "diblokir";
+  mulaiPada: string;
   berakhirPada: string;
+  keterangan: string;
+  loginPertama: string;
   loginTerakhir: string;
+  loginCount: number;
   sumber: string;
 }
 
@@ -153,12 +165,31 @@ const isValidEmail = (email: string): boolean => {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && email.length <= 256;
 };
 
-const getDefaultExpirationDate = (): string => {
-  const nextYear = new Date();
-  nextYear.setFullYear(nextYear.getFullYear() + 1);
-  return `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, "0")}-${String(
-    nextYear.getDate()
-  ).padStart(2, "0")}`;
+export const normalizeSheetDateValue = (raw: unknown): string => {
+  const val = String(raw ?? "").trim();
+  if (!val) return "";
+  const lower = val.toLowerCase();
+  if (
+    lower === "tanpa batas" ||
+    lower === "unlimited" ||
+    lower === "selamanya" ||
+    lower === "-" ||
+    lower === "none" ||
+    lower === "tidak ada"
+  ) {
+    return "";
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(val)) return val;
+  const slashMatch = val.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slashMatch) {
+    const [, a, b, y] = slashMatch;
+    const first = Number(a);
+    const second = Number(b);
+    const month = first > 12 ? second : first;
+    const day = first > 12 ? first : second;
+    return `${y}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  }
+  return val.slice(0, 32);
 };
 
 export const normalizeSheetStatus = (raw: unknown): "aktif" | "menunggu" | "diblokir" => {
@@ -356,8 +387,12 @@ interface DetectedColumns {
   hpIdx: number;
   peranIdx: number;
   statusIdx: number;
+  mulaiIdx: number;
   berakhirIdx: number;
+  keteranganIdx: number;
+  loginPertamaIdx: number;
   loginIdx: number;
+  loginCountIdx: number;
   sumberIdx: number;
 }
 
@@ -372,9 +407,13 @@ export function detectSheetColumns(rows: string[][]): DetectedColumns {
       hpIdx: 4,
       peranIdx: 5,
       statusIdx: 6,
-      berakhirIdx: 7,
-      loginIdx: 8,
-      sumberIdx: 9,
+      mulaiIdx: 7,
+      berakhirIdx: 8,
+      keteranganIdx: 9,
+      loginPertamaIdx: 10,
+      loginIdx: 11,
+      loginCountIdx: 12,
+      sumberIdx: 13,
     };
   }
 
@@ -398,8 +437,12 @@ export function detectSheetColumns(rows: string[][]): DetectedColumns {
     const hpIdx = findHeader([/no\.?\s*hp/, /^hp$/, /whatsapp/, /\bwa\b/, /telepon/, /phone/, /kontak/]);
     const peranIdx = findHeader([/^peran$/, /^role$/, /hak\s*akses/, /level/]);
     const statusIdx = findHeader([/status/, /\bacc\b/, /persetujuan/, /approval/]);
-    const berakhirIdx = findHeader([/berakhir/, /masa\s*aktif/, /expir/, /kadaluarsa/, /berlaku/]);
+    const mulaiIdx = findHeader([/mulai/, /start\s*date/, /tanggal\s*mulai/]);
+    const berakhirIdx = findHeader([/berakhir/, /masa\s*aktif/, /expir/, /kadaluarsa/, /kedaluwarsa/, /berlaku/]);
+    const keteranganIdx = findHeader([/keterangan/, /catatan/, /note/, /alasan/]);
+    const loginPertamaIdx = findHeader([/login\s*pertama/, /first\s*login/]);
     const loginIdx = findHeader([/login\s*terakhir/, /last\s*login/, /terakhir\s*masuk/]);
+    const loginCountIdx = findHeader([/jumlah\s*login/, /login\s*count/, /total\s*login/]);
     const sumberIdx = findHeader([/sumber/, /source/]);
 
     if (emailIdx >= 0 || namaIdx >= 0 || statusIdx >= 0) {
@@ -412,14 +455,17 @@ export function detectSheetColumns(rows: string[][]): DetectedColumns {
         hpIdx,
         peranIdx,
         statusIdx,
+        mulaiIdx,
         berakhirIdx,
+        keteranganIdx,
+        loginPertamaIdx,
         loginIdx,
+        loginCountIdx,
         sumberIdx,
       };
     }
   }
 
-  // Fallback: detect which column contains email addresses across sample rows
   let detectedEmailCol = 0;
   for (let r = 0; r < Math.min(rows.length, 15); r++) {
     const row = rows[r] || [];
@@ -439,9 +485,13 @@ export function detectSheetColumns(rows: string[][]): DetectedColumns {
     hpIdx: 4,
     peranIdx: 5,
     statusIdx: 6,
-    berakhirIdx: 7,
-    loginIdx: 8,
-    sumberIdx: 9,
+    mulaiIdx: 7,
+    berakhirIdx: 8,
+    keteranganIdx: 9,
+    loginPertamaIdx: 10,
+    loginIdx: 11,
+    loginCountIdx: 12,
+    sumberIdx: 13,
   };
 }
 
@@ -458,7 +508,6 @@ export function parseRowsToUsers(rows: string[][]): {
     const row = rows[i] || [];
     let rawEmail = normalizeEmail(row[columns.emailIdx]);
     if (!isValidEmail(rawEmail)) {
-      // Fallback scan row cells for a valid email address
       const foundCell = row.find((cell) => isValidEmail(normalizeEmail(cell)));
       rawEmail = normalizeEmail(foundCell);
     }
@@ -470,9 +519,10 @@ export function parseRowsToUsers(rows: string[][]): {
       rawName && normalizeEmail(rawName) !== rawEmail
         ? rawName
         : rawEmail.split("@")[0] || "Pengguna SISPERMBG";
+    const parsedCount = Number(getCol(columns.loginCountIdx));
 
     const parsed: ParsedSheetUserRow = {
-      rowNumber: i + 1, // 1-indexed spreadsheet row
+      rowNumber: i + 1,
       email: rawEmail,
       namaLengkap: safeName,
       profesi: getCol(columns.profesiIdx) || "Ahli Gizi / Pengelola SPPG",
@@ -480,8 +530,12 @@ export function parseRowsToUsers(rows: string[][]): {
       noHp: getCol(columns.hpIdx),
       peran: normalizeSheetRole(getCol(columns.peranIdx)),
       statusPersetujuan: normalizeSheetStatus(getCol(columns.statusIdx)),
-      berakhirPada: getCol(columns.berakhirIdx) || getDefaultExpirationDate(),
+      mulaiPada: normalizeSheetDateValue(getCol(columns.mulaiIdx)),
+      berakhirPada: normalizeSheetDateValue(getCol(columns.berakhirIdx)),
+      keterangan: getCol(columns.keteranganIdx),
+      loginPertama: getCol(columns.loginPertamaIdx),
       loginTerakhir: getCol(columns.loginIdx),
+      loginCount: Number.isFinite(parsedCount) && parsedCount > 0 ? Math.floor(parsedCount) : 1,
       sumber: getCol(columns.sumberIdx) || "Spreadsheet",
     };
 
@@ -536,6 +590,7 @@ export async function readUsersFromGoogleSheet(
 
 const buildCanonicalRowValues = (u: Record<string, any>): string[] => {
   const email = normalizeEmail(u.email);
+  const berakhir = typeof u.berakhirPada === "string" ? u.berakhirPada.trim() : "";
   return [
     email,
     String(u.namaLengkap || email.split("@")[0] || "Pengguna SISPERMBG").trim(),
@@ -548,8 +603,12 @@ const buildCanonicalRowValues = (u: Record<string, any>): string[] => {
       : u.statusPersetujuan === "aktif"
       ? "aktif"
       : "menunggu",
-    String(u.berakhirPada || getDefaultExpirationDate()).trim(),
+    String(u.mulaiPada || "").trim(),
+    berakhir || "Tanpa Batas",
+    String(u.keterangan || "").trim(),
+    formatDateValueForSheet(u.loginPertama || u.createdAt),
     formatDateValueForSheet(u.loginTerakhir),
+    String(Number(u.loginCount) > 0 ? Math.floor(Number(u.loginCount)) : 1),
     String(u.sumber || (u.registeredViaSpreadsheet ? "Spreadsheet" : "Login Google")).trim(),
   ];
 };
@@ -571,8 +630,12 @@ const mergeRowIntoExistingColumns = (
     columns.hpIdx,
     columns.peranIdx,
     columns.statusIdx,
+    columns.mulaiIdx,
     columns.berakhirIdx,
+    columns.keteranganIdx,
+    columns.loginPertamaIdx,
     columns.loginIdx,
+    columns.loginCountIdx,
     columns.sumberIdx,
     0
   );
@@ -584,9 +647,13 @@ const mergeRowIntoExistingColumns = (
   if (columns.hpIdx >= 0) out[columns.hpIdx] = canonical[4];
   if (columns.peranIdx >= 0) out[columns.peranIdx] = canonical[5];
   if (columns.statusIdx >= 0) out[columns.statusIdx] = canonical[6];
-  if (columns.berakhirIdx >= 0) out[columns.berakhirIdx] = canonical[7];
-  if (columns.loginIdx >= 0) out[columns.loginIdx] = canonical[8];
-  if (columns.sumberIdx >= 0) out[columns.sumberIdx] = canonical[9];
+  if (columns.mulaiIdx >= 0) out[columns.mulaiIdx] = canonical[7];
+  if (columns.berakhirIdx >= 0) out[columns.berakhirIdx] = canonical[8];
+  if (columns.keteranganIdx >= 0) out[columns.keteranganIdx] = canonical[9];
+  if (columns.loginPertamaIdx >= 0) out[columns.loginPertamaIdx] = canonical[10];
+  if (columns.loginIdx >= 0) out[columns.loginIdx] = canonical[11];
+  if (columns.loginCountIdx >= 0) out[columns.loginCountIdx] = canonical[12];
+  if (columns.sumberIdx >= 0) out[columns.sumberIdx] = canonical[13];
   return out;
 };
 
@@ -625,11 +692,16 @@ export async function prepareSheetSyncPlan(
     if (!existing) {
       toAppend.push({ email, namaLengkap: nextName, statusPersetujuan: nextStatus });
     } else {
+      const nextMulai = String(u.mulaiPada || "").trim();
+      const nextBerakhir = String(u.berakhirPada || "").trim();
+      const nextKet = String(u.keterangan || "").trim();
       const hasDiff =
         existing.statusPersetujuan !== nextStatus ||
         existing.peran !== (u.peran === "ADMIN" ? "ADMIN" : "USER") ||
         (u.namaSPPG && existing.namaSPPG !== String(u.namaSPPG).trim()) ||
-        (u.berakhirPada && existing.berakhirPada !== String(u.berakhirPada).trim()) ||
+        existing.mulaiPada !== nextMulai ||
+        existing.berakhirPada !== nextBerakhir ||
+        existing.keterangan !== nextKet ||
         (u.namaLengkap && existing.namaLengkap !== nextName);
 
       if (hasDiff) {
@@ -680,7 +752,7 @@ export async function syncUsersToGoogleSheet(
     const headerRes = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
         spreadsheetId
-      )}/values/${encodeURIComponent(`${quotedTab}!A1:J1`)}?valueInputOption=USER_ENTERED`,
+      )}/values/${encodeURIComponent(`${quotedTab}!A1:N1`)}?valueInputOption=USER_ENTERED`,
       {
         method: "PUT",
         headers: {
@@ -700,9 +772,13 @@ export async function syncUsersToGoogleSheet(
       hpIdx: 4,
       peranIdx: 5,
       statusIdx: 6,
-      berakhirIdx: 7,
-      loginIdx: 8,
-      sumberIdx: 9,
+      mulaiIdx: 7,
+      berakhirIdx: 8,
+      keteranganIdx: 9,
+      loginPertamaIdx: 10,
+      loginIdx: 11,
+      loginCountIdx: 12,
+      sumberIdx: 13,
     };
   }
 
@@ -798,7 +874,7 @@ export async function loadGlobalSheetSyncConfig(): Promise<SheetSyncConfig | nul
     clearTimeout(timer);
     if (res.ok) {
       const data = await res.json();
-      if (data?.config?.spreadsheetId) {
+      if (data?.config && (data.config.spreadsheetId || data.config.webhookUrl)) {
         try {
           localStorage.setItem(SHEET_CONFIG_LOCAL_KEY, JSON.stringify(data.config));
         } catch {}
@@ -812,11 +888,10 @@ export async function loadGlobalSheetSyncConfig(): Promise<SheetSyncConfig | nul
     const snap = await getDoc(doc(db, "configs", "user_sheet_sync"));
     if (snap.exists()) {
       const fsCfg = snap.data() as SheetSyncConfig;
-      if (fsCfg?.spreadsheetId) {
+      if (fsCfg && (fsCfg.spreadsheetId || fsCfg.webhookUrl)) {
         try {
           localStorage.setItem(SHEET_CONFIG_LOCAL_KEY, JSON.stringify(fsCfg));
         } catch {}
-        // Hydrate server relay too so future tenant logins know the spreadsheet link immediately
         fetch("/api/realtime/sheet-config", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -832,7 +907,7 @@ export async function loadGlobalSheetSyncConfig(): Promise<SheetSyncConfig | nul
     const raw = localStorage.getItem(SHEET_CONFIG_LOCAL_KEY);
     if (raw) {
       const parsed = JSON.parse(raw) as SheetSyncConfig;
-      if (parsed?.spreadsheetId) return parsed;
+      if (parsed && (parsed.spreadsheetId || parsed.webhookUrl)) return parsed;
     }
   } catch {}
 
@@ -840,7 +915,7 @@ export async function loadGlobalSheetSyncConfig(): Promise<SheetSyncConfig | nul
 }
 
 /**
- * Saves Spreadsheet Sync Config globally across Express Real-Time Hub, Firestore, and local cache.
+ * Saves Spreadsheet Sync & Apps Script Webhook Config globally across Express Real-Time Hub, Firestore, and local cache.
  */
 export async function saveGlobalSheetSyncConfig(config: SheetSyncConfig): Promise<void> {
   const payload: SheetSyncConfig = {
@@ -920,3 +995,120 @@ export async function readPublicSpreadsheetViaServer(params: {
     error: data?.error,
   };
 }
+
+/**
+ * Sends user access database & live status summary to Admin's Google Sheet via server-side Apps Script Webhook proxy.
+ */
+export async function pushUsersToAppsScriptWebhook(params: {
+  webhookUrl: string;
+  users: Record<string, any>[];
+}): Promise<{
+  ok: boolean;
+  pushedCount: number;
+  syncedAt: string;
+  message: string;
+}> {
+  const res = await fetch("/api/sheets/webhook-push", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      webhookUrl: params.webhookUrl.trim(),
+      users: params.users,
+    }),
+  });
+  const data = await res.json().catch(() => ({
+    ok: false,
+    pushedCount: 0,
+    syncedAt: new Date().toISOString(),
+    message: "Gagal membaca respons server webhook.",
+  }));
+  return {
+    ok: Boolean(data?.ok),
+    pushedCount: Number(data?.pushedCount) || 0,
+    syncedAt: data?.syncedAt || new Date().toISOString(),
+    message: data?.message || data?.error || "Gagal mengirim ke Apps Script Webhook.",
+  };
+}
+
+const escapeCsvCell = (value: unknown): string => {
+  const str = String(value ?? "");
+  if (/[",\r\n]/.test(str)) {
+    return `"${str.replace(/"/g, '""')}"`;
+  }
+  return str;
+};
+
+/**
+ * Generates an RFC-4180 UTF-8 BOM CSV export of the Admin User Access Database.
+ */
+export function buildUsersCsvContent(users: Record<string, any>[]): string {
+  const headerLine = CANONICAL_SHEET_HEADERS.map(escapeCsvCell).join(",");
+  const dataLines = users.map((u) => buildCanonicalRowValues(u).map(escapeCsvCell).join(","));
+  return `\uFEFF${[headerLine, ...dataLines].join("\r\n")}`;
+}
+
+export function downloadUsersCsv(users: Record<string, any>[]): void {
+  const csv = buildUsersCsvContent(users);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const today = new Date().toISOString().slice(0, 10);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `Database_Pengguna_SISPERMBG_${today}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/**
+ * Copy-ready Google Apps Script code for Admin's personal Google Spreadsheet.
+ * Paste into Extensions -> Apps Script -> Deploy -> New deployment -> Web app (Execute as: Me, Who has access: Anyone).
+ */
+export const GOOGLE_APPS_SCRIPT_TEMPLATE = `function doPost(e) {
+  try {
+    var payload = JSON.parse(e.postData.contents);
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+
+    // 1. Update Ringkasan Jumlah Pengguna
+    var summarySheet = ss.getSheetByName("Ringkasan_Pengguna") || ss.insertSheet("Ringkasan_Pengguna");
+    summarySheet.clear();
+    summarySheet.appendRow(["Metrik", "Jumlah", "Sinkron Terakhir"]);
+    var s = payload.summary || {};
+    var ts = payload.syncedAt || new Date().toISOString();
+    summarySheet.appendRow(["Total Pengguna Terdeteksi", s.total || 0, ts]);
+    summarySheet.appendRow(["Daftar Tunggu (Perlu ACC)", s.menunggu || 0, ts]);
+    summarySheet.appendRow(["Pengguna Aktif (ACC)", s.aktif || 0, ts]);
+    summarySheet.appendRow(["Kedaluwarsa", s.kedaluwarsa || 0, ts]);
+    summarySheet.appendRow(["Diblokir", s.diblokir || 0, ts]);
+
+    // 2. Update Database Lengkap Pengguna
+    var dbSheet = ss.getSheetByName("Database_Pengguna") || ss.insertSheet("Database_Pengguna");
+    dbSheet.clear();
+    dbSheet.appendRow([
+      "Email", "Nama Lengkap", "Profesi", "Nama SPPG", "No HP", "Peran",
+      "Status ACC", "Tanggal Mulai Login", "Tanggal Berakhir Login",
+      "Keterangan", "Login Pertama", "Login Terakhir", "Jumlah Login", "Sumber"
+    ]);
+    var users = payload.users || [];
+    if (users.length > 0) {
+      var rows = users.map(function(u) {
+        return [
+          u.email || "", u.namaLengkap || "", u.profesi || "", u.namaSPPG || "",
+          u.noHp || "", u.peran || "USER", u.statusLabel || u.statusPersetujuan || "",
+          u.mulaiPada || "", u.berakhirPada || "Tanpa Batas", u.keterangan || "",
+          u.loginPertama || "", u.loginTerakhir || "", u.loginCount || 1, u.sumber || ""
+        ];
+      });
+      dbSheet.getRange(2, 1, rows.length, 14).setValues(rows);
+    }
+
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: true, count: users.length }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService
+      .createTextOutput(JSON.stringify({ ok: false, error: String(err) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}`;

@@ -6,11 +6,11 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // 2. Global Helper Primitives
+    // 2. Global Auth & Validation Helpers
     function isSignedIn() {
       return request.auth != null;
     }
-    
+
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
@@ -27,23 +27,84 @@ service cloud.firestore {
       return resource.data;
     }
 
+    function authEmailLower() {
+      return isSignedIn() && request.auth.token.email is string
+        ? request.auth.token.email.lower()
+        : '';
+    }
+
+    function isMainAdminToken() {
+      return isSignedIn()
+        && request.auth.token.email_verified == true
+        && authEmailLower() in [
+          'syukriyusuf82@gmail.com',
+          'sukriyusuf82@gmail.com',
+          'syukriyusuf00@gmail.com'
+        ];
+    }
+
     function isAdmin() {
-      return request.auth != null && 
-        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
-        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.peran == 'ADMIN';
+      return isMainAdminToken()
+        || (
+          isSignedIn()
+          && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.peran == 'ADMIN'
+        );
     }
 
-    // 3. User Profile Validation Helper
-    function isValidUserProfile(userId, data) {
-      return data.uid == userId
-        && data.email is string
-        && data.email.size() <= 256;
+    // Allows first-time Google login migration ONLY if Admin already pre-approved an active sheet_user_* record for the exact same verified email
+    function hasApprovedSheetMigration(data) {
+      return ('migratedFromDocId' in data)
+        && data.migratedFromDocId is string
+        && data.migratedFromDocId.matches('^sheet_user_[a-z0-9_]+$')
+        && exists(/databases/$(database)/documents/users/$(data.migratedFromDocId))
+        && get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data.email is string
+        && get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data.email.lower() == authEmailLower()
+        && get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data.statusPersetujuan == 'aktif';
     }
 
-    function isCustomUser(userId) {
-      return userId == 'admin_sukriyusuf82' || userId == 'admin_syukriyusuf82' || userId == 'syukriyusuf82_simulated_uid' || userId.matches('^custom_user_.*') || userId.matches('^admin_.*');
+    // 3. Strict User Self-Create & Self-Update Validators (Prevents RBAC Escalation & Tampering with Admin Access Controls)
+    function isValidUserFieldBounds(data) {
+      return data.email is string && data.email.size() <= 256
+        && (!('namaLengkap' in data) || (data.namaLengkap is string && data.namaLengkap.size() <= 160))
+        && (!('profesi' in data) || (data.profesi is string && data.profesi.size() <= 120))
+        && (!('namaSPPG' in data) || (data.namaSPPG is string && data.namaSPPG.size() <= 160))
+        && (!('noHp' in data) || (data.noHp is string && data.noHp.size() <= 40))
+        && (!('mulaiPada' in data) || (data.mulaiPada is string && data.mulaiPada.size() <= 32))
+        && (!('berakhirPada' in data) || (data.berakhirPada is string && data.berakhirPada.size() <= 32))
+        && (!('keterangan' in data) || (data.keterangan is string && data.keterangan.size() <= 300))
+        && (!('loginCount' in data) || (data.loginCount is int && data.loginCount >= 0 && data.loginCount <= 1000000));
     }
 
+    function isValidUserSelfCreate(userId, data) {
+      return isValidUserFieldBounds(data)
+        && data.uid == userId
+        && data.email.lower() == authEmailLower()
+        && data.peran == 'USER'
+        && (
+          data.statusPersetujuan == 'menunggu'
+          || (data.statusPersetujuan == 'aktif' && hasApprovedSheetMigration(data))
+        );
+    }
+
+    function isAdminFieldUnchanged(field, next, prev, allowedInitial) {
+      return (!(field in next) && !(field in prev))
+        || ((field in prev) && (field in next) && next[field] == prev[field])
+        || (!(field in prev) && (field in next) && next[field] in allowedInitial);
+    }
+
+    function isValidUserSelfUpdate(userId, next, prev) {
+      return isValidUserFieldBounds(next)
+        && next.uid == userId
+        && next.email.lower() == prev.email.lower()
+        && next.peran == prev.peran
+        && next.statusPersetujuan == prev.statusPersetujuan
+        && isAdminFieldUnchanged('mulaiPada', next, prev, [''])
+        && isAdminFieldUnchanged('berakhirPada', next, prev, [''])
+        && isAdminFieldUnchanged('keterangan', next, prev, ['', 'Daftar Tunggu - Menunggu ACC Admin Odhe Gizi']);
+    }
+
+    // 4. Device Telemetry Payload Validator
     function isValidDevicePayload(deviceId, data) {
       return isValidId(deviceId)
         && data.keys().hasAll(['deviceId', 'deviceType', 'osName', 'browserName', 'sessionState', 'lastSeenAt'])
@@ -78,33 +139,54 @@ service cloud.firestore {
         && (!('firstSeenAt' in data) || (data.firstSeenAt is string && data.firstSeenAt.size() <= 64));
     }
 
-    // 4. Global configurations and settings collection (e.g. global logo, global TKPI)
+    // 5. Connectivity Probe
     match /test/connection {
       allow get: if true;
     }
 
+    // 6. Admin Settings & Global Configuration Collections
+    match /configs/app_logo {
+      // Publicly readable so the global app logo appears automatically on the login screen
+      allow get: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
     match /configs/{configId} {
-      allow read, write: if true;
+      // Signed-in users can read sync config doc; only Admin can list or modify admin settings
+      allow get: if isSignedIn();
+      allow list, create, update, delete: if isAdmin();
     }
 
     match /global_settings/{settingId} {
-      allow read, write: if true;
+      // Shared nutrition reference settings (e.g. TKPI) readable by app sessions; writable only by Admin
+      allow get: if true;
+      allow list: if isSignedIn();
+      allow create, update, delete: if isAdmin();
     }
 
-    // 5. Real-time device registry read automatically by Panel Admin
+    // 7. Real-Time Device Registry (Write heartbeat validated; listing & deletion restricted to Admin)
     match /devices/{deviceId} {
-      allow get: if isValidId(deviceId);
-      allow list: if true;
+      allow get, list, delete: if isAdmin();
       allow create, update: if isValidId(deviceId) && isValidDevicePayload(deviceId, incoming());
-      allow delete: if isValidId(deviceId);
     }
 
-    // 6. User accounts and state slices
+    // 8. User Access Control Records & Isolated Tenant Workspaces
     match /users/{userId} {
-      allow read, write: if true;
+      // Listing all users is strictly Admin-only (prevents PII harvesting)
+      allow list: if isAdmin();
+      allow get: if isAdmin()
+        || isOwner(userId)
+        || (isSignedIn() && resource != null && resource.data.email is string && resource.data.email.lower() == authEmailLower());
+      allow create: if isAdmin() || (isOwner(userId) && isValidUserSelfCreate(userId, incoming()));
+      allow update: if isAdmin() || (isOwner(userId) && isValidUserSelfUpdate(userId, incoming(), existing()));
+      allow delete: if isAdmin();
 
-      match /{document=**} {
-        allow read, write: if true;
+      match /states/{stateKey} {
+        allow read, write: if isAdmin() || isOwner(userId);
+      }
+
+      match /devices/{deviceId} {
+        allow read, write: if isAdmin() || isOwner(userId);
       }
     }
   }

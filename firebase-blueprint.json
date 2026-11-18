@@ -2,16 +2,16 @@
   "entities": {
     "UserProfile": {
       "title": "UserProfile",
-      "description": "Stores user profile, profession, SPPG name, and role approval status.",
+      "description": "Stores user access control profile, login schedule (start/end dates), admin notes, login counts, and RBAC status.",
       "type": "object",
       "properties": {
         "uid": {
           "type": "string",
-          "description": "Firebase Auth UID of the user."
+          "description": "Firebase Auth UID or pre-registered user document ID."
         },
         "email": {
           "type": "string",
-          "description": "Verified email of the user."
+          "description": "Verified lowercase email address of the user."
         },
         "namaLengkap": {
           "type": "string",
@@ -19,7 +19,7 @@
         },
         "profesi": {
           "type": "string",
-          "description": "User's profession (e.g. Ahli Gizi)."
+          "description": "User's profession (e.g. Ahli Gizi / Pengelola SPPG)."
         },
         "namaSPPG": {
           "type": "string",
@@ -27,7 +27,7 @@
         },
         "noHp": {
           "type": "string",
-          "description": "User's Whatsapp / Phone number."
+          "description": "User's WhatsApp / Phone number."
         },
         "peran": {
           "type": "string",
@@ -39,9 +39,43 @@
           "enum": ["menunggu", "aktif", "diblokir"],
           "description": "Admin approval status."
         },
+        "mulaiPada": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Optional start login date (YYYY-MM-DD) controlled by Admin."
+        },
         "berakhirPada": {
           "type": "string",
-          "description": "Expiration date of user access."
+          "maxLength": 32,
+          "description": "Optional expiration date (YYYY-MM-DD) controlled by Admin. Empty string means Tanpa Batas (unlimited)."
+        },
+        "keterangan": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "Custom admin note displayed to the user on waiting, scheduled, expired, or blocked screens."
+        },
+        "loginPertama": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of the user's first detected login."
+        },
+        "loginTerakhir": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp of the user's most recent login."
+        },
+        "loginCount": {
+          "type": "integer",
+          "description": "Total number of times the user has signed in."
+        },
+        "sumber": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Registration source (Login Google or Spreadsheet)."
+        },
+        "registeredViaSpreadsheet": {
+          "type": "boolean",
+          "description": "Whether the user was registered or synchronized via Google Sheets."
         },
         "createdAt": {
           "type": "string",
@@ -53,28 +87,9 @@
           "format": "date-time",
           "description": "Last update timestamp."
         },
-        "loginTerakhir": {
-          "type": "string",
-          "format": "date-time",
-          "description": "Timestamp of the user's last login."
-        },
         "emailVerified": {
           "type": "boolean",
-          "description": "Whether the user verified their email address via 6-digit OTP code."
-        },
-        "verificationStatus": {
-          "type": "string",
-          "enum": ["pending_otp", "verified"],
-          "description": "Email OTP verification status."
-        },
-        "emailVerifiedAt": {
-          "type": "string",
-          "format": "date-time",
-          "description": "Timestamp when email verification succeeded."
-        },
-        "activatedBy": {
-          "type": "string",
-          "description": "Activation method (email_otp or admin_manual)."
+          "description": "Whether the user's email address is verified."
         },
         "lastDeviceId": {
           "type": "string",
@@ -87,7 +102,57 @@
           "description": "Human-readable label of the user's last active device."
         }
       },
-      "required": ["uid", "email"]
+      "required": ["uid", "email", "peran", "statusPersetujuan"]
+    },
+    "AdminConfig": {
+      "title": "AdminConfig",
+      "description": "Stores global admin settings including application logo, Google Spreadsheet link, and Apps Script Webhook URL.",
+      "type": "object",
+      "properties": {
+        "sheetUrl": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Linked Google Spreadsheet URL."
+        },
+        "spreadsheetId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Extracted Google Spreadsheet ID."
+        },
+        "gid": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Active tab gid."
+        },
+        "sheetTitle": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Selected sheet tab name."
+        },
+        "spreadsheetTitle": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Title of the linked spreadsheet."
+        },
+        "webhookUrl": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Google Apps Script Web App webhook URL for automatic summary and database push."
+        },
+        "autoWebhookEnabled": {
+          "type": "boolean",
+          "description": "Whether automatic webhook pushes run on login and Admin status updates."
+        },
+        "logoUrl": {
+          "type": "string",
+          "description": "Global application logo URL propagated to login screen and tenant dashboards."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Last configuration update timestamp."
+        }
+      }
     },
     "DeviceSession": {
       "title": "DeviceSession",
@@ -204,7 +269,7 @@
     },
     "AppState": {
       "title": "AppState",
-      "description": "Stores a specific slice of the user's application state.",
+      "description": "Stores a specific slice of the user's isolated application workspace state.",
       "type": "object",
       "properties": {
         "userId": {
@@ -231,19 +296,27 @@
   "firestore": {
     "/users/{userId}": {
       "schema": "UserProfile",
-      "description": "Main user account record."
+      "description": "User access control and approval record managed by Admin Panel."
     },
     "/users/{userId}/states/{stateKey}": {
       "schema": "AppState",
-      "description": "Sub-collection storing serialized application states to prevent cache clear losses."
+      "description": "Isolated per-tenant application workspace state slices."
     },
     "/users/{userId}/devices/{deviceId}": {
       "schema": "DeviceSession",
-      "description": "Sub-collection tracking all devices linked to a specific user."
+      "description": "Sub-collection tracking devices linked to a specific user."
     },
     "/devices/{deviceId}": {
       "schema": "DeviceSession",
-      "description": "Top-level real-time device registry read automatically by Admin Panel."
+      "description": "Top-level real-time device registry readable by Admin Panel."
+    },
+    "/configs/{configId}": {
+      "schema": "AdminConfig",
+      "description": "Admin global configuration documents (app_logo, user_sheet_sync, admin_settings)."
+    },
+    "/global_settings/{settingId}": {
+      "schema": "AdminConfig",
+      "description": "Shared reference configuration documents managed by Admin (e.g. tkpi)."
     }
   }
 }

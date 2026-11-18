@@ -1992,22 +1992,31 @@ export default function App() {
     );
   }
 
-  // Check if active period has expired (Main Admin never expires)
+  // Check active login window: Tanggal Mulai Login (mulaiPada) & Tanggal Berakhir Login (berakhirPada; "" = Tanpa Batas)
+  const localTodayStr = (() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(
+      now.getDate()
+    ).padStart(2, "0")}`;
+  })();
+
+  const isNotYetStarted = (() => {
+    if (isAdminUser || isDemoUser) return false;
+    if (userProfile?.statusPersetujuan !== "aktif") return false;
+    const mulai = typeof userProfile?.mulaiPada === "string" ? userProfile.mulaiPada.trim() : "";
+    if (!mulai) return false;
+    return localTodayStr < mulai;
+  })();
+
   const isExpired = (() => {
     if (isAdminUser || isDemoUser) return false;
-    if (!userProfile?.berakhirPada) return false;
-    try {
-      const now = new Date();
-      const localYear = now.getFullYear();
-      const localMonth = String(now.getMonth() + 1).padStart(2, '0');
-      const localDay = String(now.getDate()).padStart(2, '0');
-      const todayStr = `${localYear}-${localMonth}-${localDay}`;
-      return todayStr > userProfile.berakhirPada;
-    } catch (e) {
-      console.error(e);
-      return false;
-    }
+    const berakhir = typeof userProfile?.berakhirPada === "string" ? userProfile.berakhirPada.trim() : "";
+    if (!berakhir) return false; // Empty string = Tanpa Batas (never expires)
+    return localTodayStr > berakhir;
   })();
+
+  const adminNoteText =
+    typeof userProfile?.keterangan === "string" ? userProfile.keterangan.trim() : "";
 
   // If non-admin tenant is waiting for Admin ACC -> Direct immediately to Hubungi Odhe Gizi Untuk ACC Akses Anda
   if (
@@ -2069,6 +2078,12 @@ export default function App() {
                 <p className="text-xs text-slate-700 leading-relaxed">
                   Akun email <strong className="text-slate-900">{user.email}</strong> telah tercatat otomatis di Panel Admin SISPERMBG. Silakan hubungi <strong className="text-slate-900">Odhe Gizi</strong> melalui WhatsApp di bawah ini agar akses penuh dashboard pribadi Anda segera disetujui (ACC).
                 </p>
+                {adminNoteText && (
+                  <div className="mt-2 px-3 py-2 bg-white/90 border border-amber-200 rounded-xl text-xs text-slate-700">
+                    <span className="font-bold text-amber-800">Keterangan Admin: </span>
+                    <span>{adminNoteText}</span>
+                  </div>
+                )}
               </div>
 
               <a
@@ -2243,6 +2258,12 @@ export default function App() {
             <p className="text-xs text-slate-600 leading-relaxed">
               Akses dashboard Anda saat ini sedang dinonaktifkan atau ditangguhkan oleh Administrator melalui Panel Admin. Silakan hubungi <strong className="text-slate-900">Odhe Gizi</strong> untuk membuka kembali akses akun Anda.
             </p>
+            {adminNoteText && (
+              <div className="px-3.5 py-2.5 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-900 text-left">
+                <span className="font-bold">Keterangan Admin: </span>
+                <span>{adminNoteText}</span>
+              </div>
+            )}
 
             <a
               href={waBlockedUrl}
@@ -2304,6 +2325,12 @@ export default function App() {
             <p className="text-xs text-slate-600 leading-relaxed">
               Masa aktif akun Anda berakhir pada <strong className="text-rose-600 font-mono">{userProfile?.berakhirPada}</strong>. Hubungi <strong className="text-slate-900">Odhe Gizi</strong> agar masa aktif dashboard Anda diperpanjang di Panel Admin.
             </p>
+            {adminNoteText && (
+              <div className="px-3.5 py-2.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 text-left">
+                <span className="font-bold">Keterangan Admin: </span>
+                <span>{adminNoteText}</span>
+              </div>
+            )}
 
             <a
               href={waExpiredUrl}
@@ -2313,6 +2340,83 @@ export default function App() {
             >
               <MessageCircle className="w-4 h-4" />
               <span>Hubungi Odhe Gizi Untuk Perpanjangan</span>
+            </a>
+
+            <div className="flex gap-2.5 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={signOutUser}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl transition cursor-pointer text-xs"
+              >
+                Keluar &amp; Ganti Email
+              </button>
+              <button
+                type="button"
+                onClick={handleManualStatusCheck}
+                disabled={isCheckingStatus}
+                className="flex-1 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-xl transition cursor-pointer text-xs flex items-center justify-center gap-1.5"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isCheckingStatus ? "animate-spin" : ""}`} />
+                <span>Cek Status</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // If user is approved (ACC) but Tanggal Mulai Login is scheduled in the future
+  if (isNotYetStarted) {
+    const waScheduleUrl = buildOdheGiziWhatsAppUrl({
+      nama: userProfile?.namaLengkap || user.displayName || "",
+      email: user.email || userProfile?.email || "",
+      namaSPPG: userProfile?.namaSPPG || "",
+      keperluan: `konfirmasi jadwal Tanggal Mulai Login SISPERMBG (${userProfile?.mulaiPada || ""})`,
+    });
+
+    return (
+      <div className="min-h-screen bg-[#F1F3F9] text-slate-800 flex items-center justify-center p-4 md:p-8 font-sans">
+        <div className="w-full max-w-md bg-white border border-slate-200 rounded-3xl shadow-xl overflow-hidden text-center">
+          <div className="bg-indigo-700 text-white px-6 py-6 flex flex-col items-center gap-3">
+            <div className="w-14 h-14 rounded-2xl bg-white/15 flex items-center justify-center">
+              <Calendar className="w-7 h-7 text-white" />
+            </div>
+            <div>
+              <h2 className="text-lg font-extrabold">Jadwal Akses Belum Dimulai</h2>
+              <p className="text-xs text-indigo-100 font-mono mt-0.5">{user.email}</p>
+            </div>
+          </div>
+
+          <div className="p-6 space-y-5">
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Akun Anda telah disetujui (ACC) oleh Admin dengan jadwal mulai login pada{" "}
+              <strong className="text-indigo-700 font-mono">{userProfile?.mulaiPada}</strong>
+              {userProfile?.berakhirPada ? (
+                <>
+                  {" "}sampai{" "}
+                  <strong className="text-slate-900 font-mono">{userProfile.berakhirPada}</strong>
+                </>
+              ) : (
+                <> (Tanpa Batas)</>
+              )}
+              .
+            </p>
+            {adminNoteText && (
+              <div className="px-3.5 py-2.5 bg-indigo-50 border border-indigo-200 rounded-xl text-xs text-indigo-900 text-left">
+                <span className="font-bold">Keterangan Admin: </span>
+                <span>{adminNoteText}</span>
+              </div>
+            )}
+
+            <a
+              href={waScheduleUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="w-full py-3 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-extrabold rounded-xl text-xs transition flex items-center justify-center gap-2 shadow-sm"
+            >
+              <MessageCircle className="w-4 h-4" />
+              <span>Hubungi Odhe Gizi (WA: 082271095251)</span>
             </a>
 
             <div className="flex gap-2.5 pt-2 border-t border-slate-100">
@@ -2546,6 +2650,7 @@ export default function App() {
             onClose={() => setIsAdminPanelOpen(false)}
             globalLogoUrl={globalAppLogo || customLogo}
             onUploadGlobalLogo={handleLogoUpload}
+            adminEmail={user?.email || userProfile?.email || ""}
           />
         ) : (
           <>
