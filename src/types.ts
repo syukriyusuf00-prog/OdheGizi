@@ -4,12 +4,14 @@
  */
 
 export type KopDocKey =
+  | "profil"
   | "dashboard"
   | "penerima"
   | "menu"
   | "foodcost"
   | "nota"
   | "ikss"
+  | "sop"
   | "cekgizi"
   | "arsip";
 
@@ -28,12 +30,14 @@ export const DEFAULT_UNIFIED_KOP_CONFIG: UnifiedKopConfig = {
   linkLeftLogo: true,
   linkRightLogo: true,
   linkedDocs: {
+    profil: true,
     dashboard: true,
     penerima: true,
     menu: true,
     foodcost: true,
     nota: true,
     ikss: true,
+    sop: true,
     cekgizi: true,
     arsip: true,
   },
@@ -42,6 +46,7 @@ export const DEFAULT_UNIFIED_KOP_CONFIG: UnifiedKopConfig = {
 
 export interface SPPGSignatureConfig {
   kotaTTD: string;
+  showIdSppgFooter?: boolean;
   showKepala: boolean;
   showAhliGizi: boolean;
   showAkuntan: boolean;
@@ -50,11 +55,16 @@ export interface SPPGSignatureConfig {
   jabatanAhliGizi: string;
   jabatanAkuntan: string;
   jabatanYayasan: string;
+  ttdImageKepala?: string;
+  ttdImageAhliGizi?: string;
+  ttdImageAkuntan?: string;
+  ttdImageYayasan?: string;
   enabledDocs: Record<KopDocKey, boolean>;
 }
 
 export const DEFAULT_SIGNATURE_CONFIG: SPPGSignatureConfig = {
   kotaTTD: "",
+  showIdSppgFooter: true,
   showKepala: true,
   showAhliGizi: true,
   showAkuntan: false,
@@ -63,17 +73,96 @@ export const DEFAULT_SIGNATURE_CONFIG: SPPGSignatureConfig = {
   jabatanAhliGizi: "Ahli Gizi / SPPI",
   jabatanAkuntan: "Akuntan SPPG",
   jabatanYayasan: "Ketua Yayasan",
+  ttdImageKepala: "",
+  ttdImageAhliGizi: "",
+  ttdImageAkuntan: "",
+  ttdImageYayasan: "",
   enabledDocs: {
+    profil: true,
     dashboard: true,
     penerima: true,
     menu: true,
     foodcost: true,
     nota: true,
     ikss: true,
+    sop: true,
     cekgizi: false,
     arsip: false,
   },
 };
+
+export interface SopOrganoleptikDishRow {
+  id: string;
+  namaHidangan: string;
+  rasa: string;
+  warna: string;
+  aroma: string;
+  tekstur: string;
+  waktuUji: string;
+  ket: string;
+}
+
+export interface SopOrganoleptikDayRecord {
+  namaPemeriksa?: string;
+  tempatPemeriksaan?: string;
+  namaTempatPemeriksa?: string;
+  waktuJam?: string;
+  zonaWaktu?: "WIB" | "WITA" | "WIT";
+  rows?: SopOrganoleptikDishRow[];
+  kesimpulan?: "aman" | "tidak_aman" | "belum";
+}
+
+export interface SopSampelOfficerTeam {
+  id: string;
+  label: string;
+  members: string[];
+}
+
+export interface SopSampelRowRecord {
+  pengantaran?: string;
+  namaPetugas?: string;
+  namaMakanan?: string;
+  parafChecked?: boolean;
+}
+
+export interface SopPenyimpananRowRecord {
+  kodeIdentitas?: string;
+  jumlahSampel?: string;
+  kondisi?: "OK" | "NOK" | "";
+  namaPenanggungJawab?: string;
+  masukTanggal?: string;
+  masukJam?: string;
+  keluarTanggal?: string;
+  keluarJam?: string;
+}
+
+export interface SopDataState {
+  activeSubTab?: "organoleptik" | "sampel" | "penyimpanan";
+  activeMonth?: string; // YYYY-MM
+  dateMode?: "bulan_aktif" | "siklus";
+  workDaysPerWeek?: 5 | 6 | 7;
+  selectedPlanId?: string;
+  showKop?: boolean;
+  showDigitalTtd?: boolean;
+  organoleptikSignatureMode?: "petugas" | "ttd_profil";
+  organoleptikMeta?: {
+    namaPemeriksa?: string;
+    tempatPemeriksaan?: string;
+    namaTempatPemeriksa?: string;
+    waktuDefault?: string;
+    zonaWaktu?: "WIB" | "WITA" | "WIT";
+  };
+  organoleptikByDate?: Record<string, SopOrganoleptikDayRecord>;
+  sampelNomorPrefix?: string;
+  sampelTeams?: SopSampelOfficerTeam[];
+  sampelByDate?: Record<string, SopSampelRowRecord>;
+  penyimpananDefaultJumlah?: string;
+  penyimpananDefaultJamMasuk?: string;
+  penyimpananDefaultJamKeluar?: string;
+  penyimpananRetentionDays?: number;
+  penyimpananSignatureMode?: "kotak_verifikasi" | "ttd_profil";
+  penyimpananByDate?: Record<string, SopPenyimpananRowRecord>;
+}
 
 export interface IkssAkgOverride {
   label?: string;

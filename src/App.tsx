@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG, IkssDataState } from "./types";
+import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG, IkssDataState, SopDataState } from "./types";
 import { 
   INITIAL_SPPG_PROFILE, 
   INITIAL_SEKOLAH_PM, 
@@ -36,6 +36,7 @@ import RujukanJuknisTab from "./components/RujukanJuknisTab";
 import HandbookTab from "./components/HandbookTab";
 import ArsipTab from "./components/ArsipTab";
 import IkssMenuTab from "./components/IkssMenuTab";
+import FormSopTab from "./components/FormSopTab";
 import AdminPanel from "./components/AdminPanel";
 
 // Icons & Animation
@@ -88,7 +89,8 @@ import {
   Building2,
   Copy,
   Check,
-  ClipboardList
+  ClipboardList,
+  ClipboardCheck
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import {
@@ -355,6 +357,38 @@ export default function App() {
     return DEFAULT_IKSS_STATE;
   });
 
+  const DEFAULT_SOP_STATE: SopDataState = {
+    activeSubTab: "organoleptik",
+    dateMode: "bulan_aktif",
+    showKop: true,
+    showDigitalTtd: true,
+    organoleptikSignatureMode: "petugas",
+    penyimpananSignatureMode: "kotak_verifikasi",
+    penyimpananDefaultJumlah: "1 Porsi",
+    penyimpananDefaultJamMasuk: "07:30",
+    penyimpananDefaultJamKeluar: "07:30",
+    penyimpananRetentionDays: 2,
+    organoleptikByDate: {},
+    sampelByDate: {},
+    penyimpananByDate: {},
+  };
+
+  const [sopData, setSopData] = useState<SopDataState>(() => {
+    try {
+      const saved = localStorage.getItem("sisper_sop_data");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === "object") {
+          return {
+            ...DEFAULT_SOP_STATE,
+            ...parsed,
+          };
+        }
+      }
+    } catch {}
+    return DEFAULT_SOP_STATE;
+  });
+
   const userHasCustomLeftLogoRef = React.useRef<boolean>(false);
   const userHasCustomRightLogoRef = React.useRef<boolean>(false);
 
@@ -598,6 +632,7 @@ export default function App() {
             cloudKopRightLogo,
             cloudBumbuPct,
             cloudIkssData,
+            cloudSopData,
             globalLogoSnap
           ] = await Promise.all([
             loadStateFromCloud("profile"),
@@ -619,6 +654,7 @@ export default function App() {
             loadStateFromCloud("kopRightLogo"),
             loadStateFromCloud("bumbuPct"),
             loadStateFromCloud("ikssData"),
+            loadStateFromCloud("sopData"),
             getDoc(doc(db, "configs", "app_logo")).catch(() => null)
           ]);
 
@@ -691,6 +727,19 @@ export default function App() {
             } catch {}
           } else {
             setIkssData(DEFAULT_IKSS_STATE);
+          }
+
+          if (cloudSopData && typeof cloudSopData === "object") {
+            const mergedSop: SopDataState = {
+              ...DEFAULT_SOP_STATE,
+              ...cloudSopData,
+            };
+            setSopData(mergedSop);
+            try {
+              localStorage.setItem("sisper_sop_data", JSON.stringify(mergedSop));
+            } catch {}
+          } else {
+            setSopData(DEFAULT_SOP_STATE);
           }
 
           if (!hasCurrentLogoSchema && isAdminUser) {
@@ -869,6 +918,8 @@ export default function App() {
       setBumbuPct(10);
       setIkssData(DEFAULT_IKSS_STATE);
       localStorage.removeItem("sisper_ikss_data");
+      setSopData(DEFAULT_SOP_STATE);
+      localStorage.removeItem("sisper_sop_data");
       setCekGiziItems([]);
       setSavedPeriods([]);
       setPmSettings({
@@ -924,6 +975,7 @@ export default function App() {
         kopConfig: JSON.stringify(kopConfig),
         bumbuPct: JSON.stringify(bumbuPct),
         ikssData: JSON.stringify(ikssData),
+        sopData: JSON.stringify(sopData),
       };
     }
   }, [canAutoSyncCloud, user?.uid]);
@@ -1096,6 +1148,18 @@ export default function App() {
       }
     } catch {}
   }, [user, ikssData, canAutoSyncCloud]);
+
+  useEffect(() => {
+    if (!user) return;
+    try {
+      const serialized = JSON.stringify(sopData);
+      localStorage.setItem("sisper_sop_data", serialized);
+      if (serialized.length < 900000) {
+        const timer = scheduleCloudSaveIfChanged("sopData", sopData);
+        return () => { if (timer) clearTimeout(timer); };
+      }
+    } catch {}
+  }, [user, sopData, canAutoSyncCloud]);
 
   // Recipient totals (using Day 1 as default baseline display)
   const defaultDayCounts = getCountsForDay(harianPM, 1);
@@ -2890,6 +2954,7 @@ export default function App() {
               { id: "menu", label: "Master Menu", icon: Utensils, color: "text-emerald-500" },
               { id: "foodcost", label: "Food Cost", icon: DollarSign, color: "text-amber-500" },
               { id: "ikss", label: "Menu IKSS", icon: ClipboardList, color: "text-emerald-600" },
+              { id: "sop", label: "Form SOP", icon: ClipboardCheck, color: "text-teal-600" },
               { id: "notalogistik", label: "Gabungan Semua Food Cost", icon: FileText, color: "text-orange-500" },
               { id: "arsip", label: "Arsip Dokumen", icon: Archive, color: "text-indigo-600" },
               { id: "cekgizi", label: "Sandbox Gizi", icon: Search, color: "text-purple-500" },
@@ -2946,7 +3011,7 @@ export default function App() {
       </section>
 
       {/* ACTIVE SCREEN CONTENT */}
-      <main key={user?.uid || "guest"} className={`flex-grow p-6 ${isAdminPanelOpen && isAdminUser ? "max-w-full" : activeTab === "notalogistik" || activeTab === "ikss" ? "max-w-full px-4 md:px-8" : activeTab === "foodcost" ? "max-w-[1600px]" : "max-w-7xl"} w-full mx-auto overflow-y-auto`}>
+      <main key={user?.uid || "guest"} className={`flex-grow p-6 ${isAdminPanelOpen && isAdminUser ? "max-w-full" : activeTab === "notalogistik" || activeTab === "ikss" || activeTab === "sop" ? "max-w-full px-4 md:px-8" : activeTab === "foodcost" ? "max-w-[1600px]" : "max-w-7xl"} w-full mx-auto overflow-y-auto`}>
         {isAdminPanelOpen && isAdminUser ? (
           <AdminPanel
             onClose={() => setIsAdminPanelOpen(false)}
@@ -3116,6 +3181,26 @@ export default function App() {
             kopConfig={kopConfig}
             paperSize={paperSize}
             bumbuPct={bumbuPct}
+          />
+        )}
+
+        {activeTab === "sop" && (
+          <FormSopTab
+            profile={profile}
+            masterMenu={masterMenu}
+            foodCostDays={foodCostDays}
+            sopData={sopData}
+            setSopData={setSopData}
+            kopLine1={kopLine1}
+            kopLine2={kopLine2}
+            kopLine3={kopLine3}
+            kopLine4={kopLine4}
+            leftLogo={kopLeftLogo}
+            rightLogo={kopRightLogo}
+            leftLogoCrop={leftLogoCrop}
+            rightLogoCrop={rightLogoCrop}
+            kopConfig={kopConfig}
+            paperSize={paperSize}
           />
         )}
 

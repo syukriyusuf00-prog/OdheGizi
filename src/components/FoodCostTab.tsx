@@ -4666,6 +4666,17 @@ export default function FoodCostTab({
               );
             })}
           </div>
+
+          {/* Automatic TTD & ID SPPG Footer from Profil SPPG */}
+          {profile && (
+            <div className="bg-white rounded-2xl border border-slate-200 px-6 py-4 shadow-xs">
+              <AutoSignatureBlock
+                profile={profile}
+                docKey="foodcost"
+                dateText={currentCalendarDate || undefined}
+              />
+            </div>
+          )}
         </div>
       )}
 

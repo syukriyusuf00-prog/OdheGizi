@@ -1889,12 +1889,11 @@ export default function NotaPesananLogistikTab({
             </table>
           </div>
 
-          {/* Centralized Auto Signature Block from Profil SPPG */}
+          {/* Centralized Auto Signature & ID SPPG Block from Profil SPPG */}
           <AutoSignatureBlock
             profile={profile}
             docKey="nota"
             dateText={effectiveTanggal}
-            forceShow
           />
         </div>
       </div>

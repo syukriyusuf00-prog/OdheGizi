@@ -278,7 +278,7 @@
         },
         "stateKey": {
           "type": "string",
-          "description": "The key identifier of the state slice (e.g., profile, sekolah, tigab, menu, foodCost, tkpi, customLogo)."
+          "description": "The key identifier of the state slice (e.g., profile, sekolah, tigab, menu, foodCost, tkpi, kopConfig, ikssData, sopData)."
         },
         "data": {
           "type": "string",

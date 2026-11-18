@@ -16,6 +16,7 @@ export function resolveSignatureConfig(profile?: SPPGProfile): SPPGSignatureConf
   return {
     ...DEFAULT_SIGNATURE_CONFIG,
     ...(cfg || {}),
+    showIdSppgFooter: cfg?.showIdSppgFooter ?? true,
     kotaTTD: (cfg?.kotaTTD ?? profile?.kabKota ?? "").trim(),
     enabledDocs: {
       ...DEFAULT_SIGNATURE_CONFIG.enabledDocs,
@@ -29,6 +30,7 @@ export interface SignerEntry {
   prefix: string;
   jabatan: string;
   nama: string;
+  ttdImage?: string;
 }
 
 export function getActiveSigners(profile: SPPGProfile): SignerEntry[] {
@@ -41,6 +43,7 @@ export function getActiveSigners(profile: SPPGProfile): SignerEntry[] {
       prefix: "Menyetujui,",
       jabatan: cfg.jabatanYayasan || "Ketua Yayasan",
       nama: profile.ketuaYayasan || "........................................",
+      ttdImage: cfg.ttdImageYayasan || "",
     });
   }
   if (cfg.showAkuntan) {
@@ -49,6 +52,7 @@ export function getActiveSigners(profile: SPPGProfile): SignerEntry[] {
       prefix: "Diperiksa oleh,",
       jabatan: cfg.jabatanAkuntan || "Akuntan SPPG",
       nama: profile.namaAkuntan || "........................................",
+      ttdImage: cfg.ttdImageAkuntan || "",
     });
   }
   if (cfg.showAhliGizi) {
@@ -57,6 +61,7 @@ export function getActiveSigners(profile: SPPGProfile): SignerEntry[] {
       prefix: "Disusun oleh,",
       jabatan: cfg.jabatanAhliGizi || "Ahli Gizi / SPPI",
       nama: profile.namaAhliGizi || "........................................",
+      ttdImage: cfg.ttdImageAhliGizi || "",
     });
   }
   if (cfg.showKepala) {
@@ -65,10 +70,56 @@ export function getActiveSigners(profile: SPPGProfile): SignerEntry[] {
       prefix: "Mengetahui,",
       jabatan: cfg.jabatanKepala || "Kepala Satuan Pelayanan Pemenuhan Gizi",
       nama: profile.namaKepala || "........................................",
+      ttdImage: cfg.ttdImageKepala || "",
     });
   }
 
   return signers;
+}
+
+export function IdSppgFooterStrip({
+  profile,
+  forceShow = false,
+  className = "",
+}: {
+  profile: SPPGProfile;
+  forceShow?: boolean;
+  className?: string;
+}) {
+  const cfg = resolveSignatureConfig(profile);
+  if (!forceShow && cfg.showIdSppgFooter === false) return null;
+
+  const idSppg = (profile.idSPPG || "").trim();
+  const lembaga = (profile.namaLembaga || "").trim();
+  const wilayah = [profile.kabKota, profile.provinsi]
+    .map((s) => (s || "").trim())
+    .filter(Boolean)
+    .join(", ");
+  const tahun = (profile.tahunAnggaran || "").trim();
+
+  return (
+    <div
+      className={`mt-5 pt-2 border-t border-slate-300 flex flex-wrap items-center justify-between gap-x-4 gap-y-1 text-[10px] text-slate-700 print:text-black ${className}`}
+      style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
+    >
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+        <span className="font-bold text-slate-900 print:text-black tabular-nums">
+          ID SPPG: {idSppg || "Belum Diisi"}
+        </span>
+        {lembaga && (
+          <>
+            <span aria-hidden="true">·</span>
+            <span className="font-semibold">{lembaga}</span>
+          </>
+        )}
+      </div>
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 tabular-nums">
+        {wilayah && <span>{wilayah}</span>}
+        {wilayah && tahun && <span aria-hidden="true">·</span>}
+        {tahun && <span>TA {tahun}</span>}
+      </div>
+    </div>
+  );
 }
 
 interface AutoSignatureBlockProps {
@@ -76,6 +127,8 @@ interface AutoSignatureBlockProps {
   docKey: KopDocKey;
   dateText?: string;
   forceShow?: boolean;
+  showDigitalTtd?: boolean;
+  hideIdSppgFooter?: boolean;
   className?: string;
 }
 
@@ -84,14 +137,16 @@ export default function AutoSignatureBlock({
   docKey,
   dateText,
   forceShow = false,
+  showDigitalTtd = true,
+  hideIdSppgFooter = false,
   className = "",
 }: AutoSignatureBlockProps) {
   const cfg = resolveSignatureConfig(profile);
-  const isEnabled = forceShow || cfg.enabledDocs?.[docKey] !== false;
-  if (!isEnabled) return null;
+  const isTtdEnabled = forceShow || cfg.enabledDocs?.[docKey] !== false;
+  const showFooter = !hideIdSppgFooter && cfg.showIdSppgFooter !== false;
 
-  const signers = getActiveSigners(profile);
-  if (signers.length === 0) return null;
+  const signers = isTtdEnabled ? getActiveSigners(profile) : [];
+  if (signers.length === 0 && !showFooter) return null;
 
   const formattedDate =
     dateText ||
@@ -119,31 +174,44 @@ export default function AutoSignatureBlock({
       className={`mt-6 pt-3 print:break-inside-avoid break-inside-avoid text-black ${className}`}
       style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
     >
-      <div className={gridColsClass}>
-        {signers.map((signer, idx) => {
-          const isLast = idx === signers.length - 1;
-          return (
-            <div
-              key={signer.key}
-              className={`text-center text-[11px] leading-snug ${
-                signers.length === 1 ? "w-72" : "w-full"
-              }`}
-            >
-              <p className="min-h-[16px] text-slate-800">
-                {isLast ? locationLine : "\u00A0"}
-              </p>
-              <p className="mt-0.5">{signer.prefix}</p>
-              <p className="font-semibold min-h-[28px] flex items-start justify-center">
-                {signer.jabatan}
-              </p>
-              <div className="h-16" />
-              <p className="font-bold underline uppercase tracking-wide text-slate-950">
-                {signer.nama}
-              </p>
-            </div>
-          );
-        })}
-      </div>
+      {signers.length > 0 && (
+        <div className={gridColsClass}>
+          {signers.map((signer, idx) => {
+            const isLast = idx === signers.length - 1;
+            return (
+              <div
+                key={signer.key}
+                className={`text-center text-[11px] leading-snug ${
+                  signers.length === 1 ? "w-72" : "w-full"
+                }`}
+              >
+                <p className="min-h-[16px] text-slate-800">
+                  {isLast ? locationLine : "\u00A0"}
+                </p>
+                <p className="mt-0.5">{signer.prefix}</p>
+                <p className="font-semibold min-h-[28px] flex items-start justify-center">
+                  {signer.jabatan}
+                </p>
+                <div className="h-16 flex items-center justify-center my-0.5">
+                  {showDigitalTtd && signer.ttdImage ? (
+                    <img
+                      src={signer.ttdImage}
+                      alt={`TTD ${signer.nama}`}
+                      className="max-h-14 max-w-[150px] object-contain"
+                      referrerPolicy="no-referrer"
+                    />
+                  ) : null}
+                </div>
+                <p className="font-bold underline uppercase tracking-wide text-slate-950">
+                  {signer.nama}
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {showFooter && <IdSppgFooterStrip profile={profile} />}
     </div>
   );
 }
