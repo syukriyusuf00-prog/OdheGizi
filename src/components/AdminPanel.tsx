@@ -2,17 +2,19 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import {
   collection,
   onSnapshot,
+  getDocs,
   doc,
   setDoc,
   deleteDoc,
   serverTimestamp,
 } from "firebase/firestore";
-import { db, reportFirestoreWriteResult } from "../lib/firebase.ts";
+import { db, reportFirestoreWriteResult, stripUndefinedDeep } from "../lib/firebase.ts";
 import {
   DEFAULT_WAITING_NOTE,
   isMainAdminEmail,
   syncUserToRealtimeHub,
   deleteUserFromRealtimeHub,
+  useAuth,
 } from "../context/AuthContext.tsx";
 import {
   Search,
@@ -21,6 +23,7 @@ import {
   Ban,
   Trash2,
   RotateCcw,
+  RefreshCw,
   Save,
   X,
   CheckCircle2,
@@ -34,7 +37,7 @@ import {
   ChevronUp,
   ArrowLeft,
 } from "lucide-react";
-import { DeviceRecord } from "../lib/deviceTracker.ts";
+import { DeviceRecord, formatDeviceShortLabel } from "../lib/deviceTracker.ts";
 import { downloadUsersCsv } from "../lib/googleSheetsSync.ts";
 import SpreadsheetUserSyncCard from "./SpreadsheetUserSyncCard.tsx";
 
@@ -77,29 +80,62 @@ const fetchWithTimeout = <T,>(promise: Promise<T>, timeoutMs: number, defaultVal
   ]);
 };
 
-export const getDeletedTenantEmails = (): Set<string> => {
+const DELETED_EMAIL_TTL_MS = 10 * 60 * 1000; // 10 menit — mencegah cache lokal menyembunyikan email yang login ulang
+
+const getDeletedTenantEmailMap = (): Record<string, number> => {
   try {
     const raw = localStorage.getItem("deleted_tenant_emails");
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) return new Set(parsed.map((e: string) => e.toLowerCase().trim()));
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    const now = Date.now();
+    // Migrate legacy permanent string[] format by expiring it so re-logging emails are never permanently hidden
+    if (Array.isArray(parsed)) {
+      localStorage.removeItem("deleted_tenant_emails");
+      return {};
+    }
+    if (parsed && typeof parsed === "object") {
+      const cleaned: Record<string, number> = {};
+      let mutated = false;
+      for (const [k, v] of Object.entries(parsed)) {
+        const em = String(k).toLowerCase().trim();
+        const ts = Number(v);
+        if (em && Number.isFinite(ts) && now - ts < DELETED_EMAIL_TTL_MS) {
+          cleaned[em] = ts;
+        } else {
+          mutated = true;
+        }
+      }
+      if (mutated) {
+        localStorage.setItem("deleted_tenant_emails", JSON.stringify(cleaned));
+      }
+      return cleaned;
     }
   } catch {}
-  return new Set();
+  return {};
+};
+
+export const getDeletedTenantEmails = (): Set<string> => {
+  return new Set(Object.keys(getDeletedTenantEmailMap()));
 };
 
 export const addDeletedTenantEmail = (email: string) => {
   if (!email) return;
-  const set = getDeletedTenantEmails();
-  set.add(email.toLowerCase().trim());
-  localStorage.setItem("deleted_tenant_emails", JSON.stringify(Array.from(set)));
+  const map = getDeletedTenantEmailMap();
+  map[email.toLowerCase().trim()] = Date.now();
+  try {
+    localStorage.setItem("deleted_tenant_emails", JSON.stringify(map));
+  } catch {}
 };
 
 export const removeDeletedTenantEmail = (email: string) => {
   if (!email) return;
-  const set = getDeletedTenantEmails();
-  if (set.delete(email.toLowerCase().trim())) {
-    localStorage.setItem("deleted_tenant_emails", JSON.stringify(Array.from(set)));
+  const clean = email.toLowerCase().trim();
+  const map = getDeletedTenantEmailMap();
+  if (clean in map) {
+    delete map[clean];
+    try {
+      localStorage.setItem("deleted_tenant_emails", JSON.stringify(map));
+    } catch {}
   }
 };
 
@@ -208,17 +244,78 @@ const readLocalCachedUsers = (): any[] => {
   return localUsers;
 };
 
+const synthesizeUsersFromDevices = (devicesList: DeviceRecord[]): any[] => {
+  const byEmail = new Map<string, any>();
+  devicesList.forEach((d) => {
+    const em = String(d?.userEmail || "").toLowerCase().trim();
+    if (!em || em === "demo@sispermbg.id" || !em.includes("@")) return;
+    const seenMs = getTimestampMs(d.lastSeenAt);
+    const prev = byEmail.get(em);
+    if (prev && getTimestampMs(prev.loginTerakhir) >= seenMs) return;
+
+    const uid =
+      (d.userUid && d.userUid !== "demo_user_5min" ? d.userUid : "") ||
+      `device_user_${em.replace(/[^a-z0-9]/g, "_")}`;
+    byEmail.set(em, {
+      id: uid,
+      uid,
+      email: em,
+      namaLengkap: d.userName || em.split("@")[0] || "Pengguna Baru",
+      profesi: "Ahli Gizi / Pengelola SPPG",
+      namaSPPG: d.namaSPPG || "",
+      noHp: "",
+      peran: d.peran === "ADMIN" ? "ADMIN" : "USER",
+      statusPersetujuan:
+        d.statusPersetujuan === "aktif" || d.statusPersetujuan === "diblokir"
+          ? d.statusPersetujuan
+          : "menunggu",
+      mulaiPada: "",
+      berakhirPada: "",
+      keterangan: d.statusPersetujuan === "aktif" ? "" : DEFAULT_WAITING_NOTE,
+      loginPertama: d.firstSeenAt || d.lastSeenAt || new Date().toISOString(),
+      loginTerakhir: d.lastSeenAt || new Date().toISOString(),
+      updatedAt: d.lastSeenAt || new Date().toISOString(),
+      createdAt: d.firstSeenAt || d.lastSeenAt || new Date().toISOString(),
+      loginCount: 1,
+      sumber: "Login Google",
+      lastDeviceId: d.deviceId,
+      lastDeviceLabel: formatDeviceShortLabel(d),
+      _fromDeviceFallback: true,
+    });
+  });
+  return Array.from(byEmail.values());
+};
+
 const mergeDeduplicatedUsers = (sources: any[][]): any[] => {
-  const deletedEmails = getDeletedTenantEmails();
+  const deletedMap = getDeletedTenantEmailMap();
   const byEmail = new Map<string, any>();
 
   const isPlaceholderId = (id: string) =>
-    id.startsWith("custom_user_") || id.startsWith("sheet_user_") || id.startsWith("admin_");
+    id.startsWith("custom_user_") ||
+    id.startsWith("sheet_user_") ||
+    id.startsWith("device_user_") ||
+    id.startsWith("admin_");
 
   sources.flat().forEach((raw) => {
     if (!raw || !raw.email) return;
     const em = String(raw.email).toLowerCase().trim();
-    if (!em || em === "demo@sispermbg.id" || deletedEmails.has(em)) return;
+    if (!em || em === "demo@sispermbg.id") return;
+
+    const deletedAtMs = deletedMap[em];
+    if (deletedAtMs) {
+      const recordActivityMs = Math.max(
+        getTimestampMs(raw.loginTerakhir),
+        getTimestampMs(raw.updatedAt),
+        getTimestampMs(raw.createdAt)
+      );
+      // If this user logged in AGAIN after Admin deleted them, automatically un-hide them!
+      if (recordActivityMs > deletedAtMs + 1500) {
+        removeDeletedTenantEmail(em);
+        delete deletedMap[em];
+      } else {
+        return;
+      }
+    }
 
     const uid = String(raw.uid || raw.id || `user_${em.replace(/[^a-z0-9]/g, "_")}`);
     const normalized = {
@@ -234,6 +331,18 @@ const mergeDeduplicatedUsers = (sources: any[][]): any[] => {
         ...normalized,
         _allIds: [uid],
       });
+      return;
+    }
+
+    // Real user records always take precedence over synthesized device fallback records
+    if (existing._fromDeviceFallback && !normalized._fromDeviceFallback) {
+      byEmail.set(em, {
+        ...normalized,
+        _allIds: Array.from(new Set([...(existing._allIds || [existing.id]), uid])),
+      });
+      return;
+    }
+    if (!existing._fromDeviceFallback && normalized._fromDeviceFallback) {
       return;
     }
 
@@ -317,6 +426,7 @@ export default function AdminPanel({
   onUploadGlobalLogo,
   adminEmail,
 }: AdminPanelProps) {
+  const { user: authUser } = useAuth();
   const firestoreUsersRef = useRef<any[]>([]);
   const hubUsersRef = useRef<any[]>([]);
   const firestoreDevicesRef = useRef<DeviceRecord[]>([]);
@@ -325,6 +435,8 @@ export default function AdminPanel({
   const [users, setUsers] = useState<any[]>(() => mergeDeduplicatedUsers([readLocalCachedUsers()]));
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [firestoreSyncError, setFirestoreSyncError] = useState<string | null>(null);
 
   const [searchInput, setSearchInput] = useState("");
   const [appliedSearch, setAppliedSearch] = useState("");
@@ -355,9 +467,14 @@ export default function AdminPanel({
   }, [toast]);
 
   const recomputeUsers = useCallback(() => {
+    const deviceFallbackUsers = synthesizeUsersFromDevices([
+      ...firestoreDevicesRef.current,
+      ...hubDevicesRef.current,
+    ]);
     const merged = mergeDeduplicatedUsers([
       firestoreUsersRef.current,
       hubUsersRef.current,
+      deviceFallbackUsers,
       readLocalCachedUsers(),
     ]);
     setUsers(merged);
@@ -376,7 +493,73 @@ export default function AdminPanel({
       (a, b) => getTimestampMs(b.lastSeenAt) - getTimestampMs(a.lastSeenAt)
     );
     setDevices(sorted);
-  }, []);
+    // Also reconcile any signed-in email reported via device heartbeat into the user list
+    recomputeUsers();
+  }, [recomputeUsers]);
+
+  // Manual / on-demand refresh across BOTH Firestore collections and Real-Time Hub
+  const handleManualRefresh = useCallback(
+    async (silent = false) => {
+      if (!silent) setIsRefreshing(true);
+      try {
+        const [hubSnap, fsUsersSnap, fsDevicesSnap] = await Promise.all([
+          fetch("/api/realtime/snapshot", { cache: "no-store" })
+            .then((r) => (r.ok ? r.json() : null))
+            .catch(() => null),
+          authUser?.uid
+            ? getDocs(collection(db, "users")).catch((err) => {
+                setFirestoreSyncError(
+                  `Sinkronisasi Firestore sementara terganggu (${err?.code || err?.message || "offline"}). Klik Segarkan untuk mencoba lagi.`
+                );
+                return null;
+              })
+            : Promise.resolve(null),
+          authUser?.uid
+            ? getDocs(collection(db, "devices")).catch(() => null)
+            : Promise.resolve(null),
+        ]);
+
+        if (hubSnap) {
+          if (Array.isArray(hubSnap.users)) hubUsersRef.current = hubSnap.users;
+          if (Array.isArray(hubSnap.devices)) hubDevicesRef.current = hubSnap.devices;
+        }
+        if (fsUsersSnap) {
+          setFirestoreSyncError(null);
+          const list: any[] = [];
+          fsUsersSnap.forEach((docSnap) => {
+            const data = docSnap.data();
+            if (data && data.email) {
+              list.push({ id: docSnap.id, uid: data.uid || docSnap.id, ...data });
+            }
+          });
+          firestoreUsersRef.current = list;
+        }
+        if (fsDevicesSnap) {
+          const list: DeviceRecord[] = [];
+          fsDevicesSnap.forEach((docSnap) => {
+            const data = docSnap.data() as DeviceRecord;
+            if (data && data.deviceId) list.push(data);
+          });
+          firestoreDevicesRef.current = list;
+        }
+        recomputeDevices();
+        recomputeUsers();
+        if (!silent) {
+          const totalCount = mergeDeduplicatedUsers([
+            firestoreUsersRef.current,
+            hubUsersRef.current,
+            synthesizeUsersFromDevices([...firestoreDevicesRef.current, ...hubDevicesRef.current]),
+            readLocalCachedUsers(),
+          ]).length;
+          showToast("success", `Daftar pengguna berhasil disegarkan (${totalCount} akun terdeteksi).`);
+        }
+      } finally {
+        if (!silent) setIsRefreshing(false);
+        setLoading(false);
+      }
+    },
+    [authUser?.uid, recomputeDevices, recomputeUsers, showToast]
+  );
 
   // Dual-Channel Real-Time Sync: Firestore onSnapshot + Express SSE Real-Time Hub
   useEffect(() => {
@@ -476,53 +659,61 @@ export default function AdminPanel({
       });
     } catch {}
 
-    // 2. Firestore real-time collection listeners
+    // 2. Firestore real-time collection listeners (attached once Auth session is ready)
     let unsubUsers: (() => void) | null = null;
     let unsubDevices: (() => void) | null = null;
 
-    try {
-      unsubUsers = onSnapshot(
-        collection(db, "users"),
-        (snapshot) => {
-          if (!mounted) return;
-          const list: any[] = [];
-          snapshot.forEach((docSnap) => {
-            const data = docSnap.data();
-            if (data && data.email) {
-              list.push({ id: docSnap.id, uid: data.uid || docSnap.id, ...data });
+    if (authUser?.uid) {
+      try {
+        unsubUsers = onSnapshot(
+          collection(db, "users"),
+          (snapshot) => {
+            if (!mounted) return;
+            setFirestoreSyncError(null);
+            const list: any[] = [];
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data();
+              if (data && data.email) {
+                list.push({ id: docSnap.id, uid: data.uid || docSnap.id, ...data });
+              }
+            });
+            firestoreUsersRef.current = list;
+            recomputeUsers();
+            setLoading(false);
+          },
+          (err) => {
+            console.warn("Firestore users listener notice:", err);
+            if (mounted) {
+              setFirestoreSyncError(
+                `Koneksi real-time Firestore mengalami kendala (${err?.code || "terputus"}). Data lokal/server relay tetap ditampilkan — klik Segarkan untuk memuat ulang.`
+              );
+              setLoading(false);
             }
-          });
-          firestoreUsersRef.current = list;
-          recomputeUsers();
-          setLoading(false);
-        },
-        (err) => {
-          console.warn("Firestore users listener notice:", err);
-          if (mounted) setLoading(false);
-        }
-      );
-    } catch {
-      if (mounted) setLoading(false);
-    }
+          }
+        );
+      } catch {
+        if (mounted) setLoading(false);
+      }
 
-    try {
-      unsubDevices = onSnapshot(
-        collection(db, "devices"),
-        (snapshot) => {
-          if (!mounted) return;
-          const list: DeviceRecord[] = [];
-          snapshot.forEach((docSnap) => {
-            const data = docSnap.data() as DeviceRecord;
-            if (data && data.deviceId) list.push(data);
-          });
-          firestoreDevicesRef.current = list;
-          recomputeDevices();
-        },
-        (err) => {
-          console.warn("Firestore devices listener notice:", err);
-        }
-      );
-    } catch {}
+      try {
+        unsubDevices = onSnapshot(
+          collection(db, "devices"),
+          (snapshot) => {
+            if (!mounted) return;
+            const list: DeviceRecord[] = [];
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data() as DeviceRecord;
+              if (data && data.deviceId) list.push(data);
+            });
+            firestoreDevicesRef.current = list;
+            recomputeDevices();
+          },
+          (err) => {
+            console.warn("Firestore devices listener notice:", err);
+          }
+        );
+      } catch {}
+    }
 
     return () => {
       mounted = false;
@@ -530,7 +721,7 @@ export default function AdminPanel({
       if (unsubUsers) unsubUsers();
       if (unsubDevices) unsubDevices();
     };
-  }, [recomputeUsers, recomputeDevices]);
+  }, [authUser?.uid, recomputeUsers, recomputeDevices]);
 
   const todayIso = getTodayIsoLocal();
 
@@ -658,6 +849,8 @@ export default function AdminPanel({
       updatedAt: nowIso,
     };
     delete updatedRecord._allIds;
+    delete updatedRecord._fromDeviceFallback;
+    removeDeletedTenantEmail(email);
 
     try {
       // Optimistically update local refs & state so UI feels instantaneous
@@ -688,17 +881,17 @@ export default function AdminPanel({
           fetchWithTimeout(
             setDoc(
               doc(db, "users", docId),
-              {
+              stripUndefinedDeep({
                 ...updatedRecord,
                 uid: docId,
                 id: docId,
                 updatedAt: serverTimestamp(),
-              },
+              }),
               { merge: true }
             )
               .then(() => reportFirestoreWriteResult(true))
               .catch((err) => reportFirestoreWriteResult(false, err)),
-            3000,
+            4500,
             null
           )
         ),
@@ -983,6 +1176,16 @@ export default function AdminPanel({
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
+              disabled={isRefreshing}
+              onClick={() => handleManualRefresh(false)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-2.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl text-xs font-bold whitespace-nowrap transition cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 text-emerald-600 ${isRefreshing ? "animate-spin" : ""}`} />
+              <span>{isRefreshing ? "Menyegarkan..." : "Segarkan"}</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => downloadUsersCsv(users)}
               className="inline-flex items-center gap-2 px-4 py-2.5 bg-white hover:bg-slate-50 text-slate-800 border border-slate-300 rounded-xl text-xs font-bold whitespace-nowrap transition cursor-pointer"
             >
@@ -1011,6 +1214,25 @@ export default function AdminPanel({
             </button>
           </div>
         </header>
+
+        {/* FIRESTORE SYNC WARNING BANNER (Only shown if cloud listener reports an issue) */}
+        {firestoreSyncError && (
+          <div className="rounded-xl px-4 py-3 text-xs font-medium flex flex-wrap items-center justify-between gap-3 border bg-amber-50 border-amber-200 text-amber-900">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>{firestoreSyncError}</span>
+            </div>
+            <button
+              type="button"
+              disabled={isRefreshing}
+              onClick={() => handleManualRefresh(false)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg text-[11px] cursor-pointer disabled:opacity-60"
+            >
+              <RefreshCw className={`w-3 h-3 ${isRefreshing ? "animate-spin" : ""}`} />
+              <span>Muat Ulang Cloud</span>
+            </button>
+          </div>
+        )}
 
         {/* INLINE TOAST NOTIFICATION */}
         {toast && (

@@ -11,12 +11,18 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isVerifiedAuth() {
+      return isSignedIn()
+        && request.auth.token.email is string
+        && request.auth.token.email_verified == true;
+    }
+
     function isOwner(userId) {
       return isSignedIn() && request.auth.uid == userId;
     }
 
     function isValidId(id) {
-      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
     function incoming() {
@@ -34,8 +40,7 @@ service cloud.firestore {
     }
 
     function isMainAdminToken() {
-      return isSignedIn()
-        && request.auth.token.email_verified == true
+      return isVerifiedAuth()
         && authEmailLower() in [
           'syukriyusuf82@gmail.com',
           'sukriyusuf82@gmail.com',
@@ -46,7 +51,7 @@ service cloud.firestore {
     function isAdmin() {
       return isMainAdminToken()
         || (
-          isSignedIn()
+          isVerifiedAuth()
           && exists(/databases/$(database)/documents/users/$(request.auth.uid))
           && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.peran == 'ADMIN'
         );
@@ -64,41 +69,72 @@ service cloud.firestore {
     }
 
     // 3. Strict User Self-Create & Self-Update Validators (Prevents RBAC Escalation & Tampering with Admin Access Controls)
+    function isOptionalBoundedString(data, field, maxLen) {
+      return !(field in data)
+        || data[field] == null
+        || (data[field] is string && data[field].size() <= maxLen);
+    }
+
     function isValidUserFieldBounds(data) {
-      return data.email is string && data.email.size() <= 256
-        && (!('namaLengkap' in data) || (data.namaLengkap is string && data.namaLengkap.size() <= 160))
-        && (!('profesi' in data) || (data.profesi is string && data.profesi.size() <= 120))
-        && (!('namaSPPG' in data) || (data.namaSPPG is string && data.namaSPPG.size() <= 160))
-        && (!('noHp' in data) || (data.noHp is string && data.noHp.size() <= 40))
-        && (!('mulaiPada' in data) || (data.mulaiPada is string && data.mulaiPada.size() <= 32))
-        && (!('berakhirPada' in data) || (data.berakhirPada is string && data.berakhirPada.size() <= 32))
-        && (!('keterangan' in data) || (data.keterangan is string && data.keterangan.size() <= 300))
-        && (!('loginCount' in data) || (data.loginCount is int && data.loginCount >= 0 && data.loginCount <= 1000000));
+      return data.email is string && data.email.size() > 0 && data.email.size() <= 256
+        && isOptionalBoundedString(data, 'namaLengkap', 160)
+        && isOptionalBoundedString(data, 'profesi', 120)
+        && isOptionalBoundedString(data, 'namaSPPG', 160)
+        && isOptionalBoundedString(data, 'noHp', 40)
+        && isOptionalBoundedString(data, 'mulaiPada', 32)
+        && isOptionalBoundedString(data, 'berakhirPada', 32)
+        && isOptionalBoundedString(data, 'keterangan', 300)
+        && isOptionalBoundedString(data, 'sumber', 64)
+        && isOptionalBoundedString(data, 'lastDeviceId', 64)
+        && isOptionalBoundedString(data, 'lastDeviceLabel', 160)
+        && (!('loginCount' in data) || (data.loginCount is number && data.loginCount >= 0 && data.loginCount <= 1000000));
     }
 
     function isValidUserSelfCreate(userId, data) {
-      return isValidUserFieldBounds(data)
+      return isVerifiedAuth()
+        && isValidId(userId)
+        && isValidUserFieldBounds(data)
         && data.uid == userId
         && data.email.lower() == authEmailLower()
         && data.peran == 'USER'
         && (
-          data.statusPersetujuan == 'menunggu'
+          (
+            data.statusPersetujuan == 'menunggu'
+            && (!('mulaiPada' in data) || data.mulaiPada == null || data.mulaiPada == '')
+            && (!('berakhirPada' in data) || data.berakhirPada == null || data.berakhirPada == '')
+            && (!('keterangan' in data) || data.keterangan == null || data.keterangan in ['', 'Daftar Tunggu - Menunggu ACC Admin Odhe Gizi'])
+          )
           || (data.statusPersetujuan == 'aktif' && hasApprovedSheetMigration(data))
         );
     }
 
+    function isSafeSelfRoleTransition(next, prev) {
+      return (!('peran' in prev) || prev.peran == null || prev.peran == '')
+        ? next.peran == 'USER'
+        : next.peran == prev.peran;
+    }
+
+    function isSafeSelfStatusTransition(next, prev) {
+      return (!('statusPersetujuan' in prev) || prev.statusPersetujuan == null || prev.statusPersetujuan == '' || prev.statusPersetujuan == 'pending')
+        ? next.statusPersetujuan == 'menunggu'
+        : next.statusPersetujuan == prev.statusPersetujuan;
+    }
+
     function isAdminFieldUnchanged(field, next, prev, allowedInitial) {
-      return (!(field in next) && !(field in prev))
-        || ((field in prev) && (field in next) && next[field] == prev[field])
-        || (!(field in prev) && (field in next) && next[field] in allowedInitial);
+      return (!(field in next) && (!(field in prev) || prev[field] == null || prev[field] == ''))
+        || ((field in prev) && prev[field] != null && prev[field] != '' && (field in next) && next[field] == prev[field])
+        || ((!(field in prev) || prev[field] == null || prev[field] == '') && (field in next) && (next[field] == null || next[field] in allowedInitial));
     }
 
     function isValidUserSelfUpdate(userId, next, prev) {
-      return isValidUserFieldBounds(next)
+      return isVerifiedAuth()
+        && isValidId(userId)
+        && isValidUserFieldBounds(next)
         && next.uid == userId
-        && next.email.lower() == prev.email.lower()
-        && next.peran == prev.peran
-        && next.statusPersetujuan == prev.statusPersetujuan
+        && next.email.lower() == authEmailLower()
+        && (!('email' in prev) || prev.email == null || prev.email == '' || next.email.lower() == prev.email.lower())
+        && isSafeSelfRoleTransition(next, prev)
+        && isSafeSelfStatusTransition(next, prev)
         && isAdminFieldUnchanged('mulaiPada', next, prev, [''])
         && isAdminFieldUnchanged('berakhirPada', next, prev, [''])
         && isAdminFieldUnchanged('keterangan', next, prev, ['', 'Daftar Tunggu - Menunggu ACC Admin Odhe Gizi']);
@@ -153,20 +189,22 @@ service cloud.firestore {
 
     match /configs/{configId} {
       // Signed-in users can read sync config doc; only Admin can list or modify admin settings
-      allow get: if isSignedIn();
-      allow list, create, update, delete: if isAdmin();
+      allow get: if isSignedIn() && isValidId(configId);
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin() && isValidId(configId);
     }
 
     match /global_settings/{settingId} {
       // Shared nutrition reference settings (e.g. TKPI) readable by app sessions; writable only by Admin
-      allow get: if true;
+      allow get: if isValidId(settingId);
       allow list: if isSignedIn();
-      allow create, update, delete: if isAdmin();
+      allow create, update, delete: if isAdmin() && isValidId(settingId);
     }
 
     // 7. Real-Time Device Registry (Write heartbeat validated; listing & deletion restricted to Admin)
     match /devices/{deviceId} {
-      allow get, list, delete: if isAdmin();
+      allow get, delete: if isAdmin() && isValidId(deviceId);
+      allow list: if isAdmin();
       allow create, update: if isValidId(deviceId) && isValidDevicePayload(deviceId, incoming());
     }
 
@@ -174,19 +212,27 @@ service cloud.firestore {
     match /users/{userId} {
       // Listing all users is strictly Admin-only (prevents PII harvesting)
       allow list: if isAdmin();
-      allow get: if isAdmin()
+      allow get: if isValidId(userId) && (
+        isAdmin()
         || isOwner(userId)
-        || (isSignedIn() && resource != null && resource.data.email is string && resource.data.email.lower() == authEmailLower());
-      allow create: if isAdmin() || (isOwner(userId) && isValidUserSelfCreate(userId, incoming()));
-      allow update: if isAdmin() || (isOwner(userId) && isValidUserSelfUpdate(userId, incoming(), existing()));
-      allow delete: if isAdmin();
+        || (isVerifiedAuth() && resource != null && resource.data.email is string && resource.data.email.lower() == authEmailLower())
+      );
+      allow create: if isValidId(userId) && (
+        isAdmin()
+        || (isOwner(userId) && isValidUserSelfCreate(userId, incoming()))
+      );
+      allow update: if isValidId(userId) && (
+        isAdmin()
+        || (isOwner(userId) && isValidUserSelfUpdate(userId, incoming(), existing()))
+      );
+      allow delete: if isAdmin() && isValidId(userId);
 
       match /states/{stateKey} {
-        allow read, write: if isAdmin() || isOwner(userId);
+        allow read, write: if isValidId(userId) && isValidId(stateKey) && (isAdmin() || isOwner(userId));
       }
 
       match /devices/{deviceId} {
-        allow read, write: if isAdmin() || isOwner(userId);
+        allow read, write: if isValidId(userId) && isValidId(deviceId) && (isAdmin() || isOwner(userId));
       }
     }
   }

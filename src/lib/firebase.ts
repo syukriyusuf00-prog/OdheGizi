@@ -242,6 +242,30 @@ console.error = function (...args) {
   originalConsoleError.apply(console, args);
 };
 
+// Recursively strip undefined properties so Firestore setDoc never rejects optional fields
+export function stripUndefinedDeep<T>(value: T): T {
+  if (value === null || value === undefined || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== undefined)
+      .map((item) => stripUndefinedDeep(item)) as unknown as T;
+  }
+  // Preserve Firestore FieldValue / Timestamp / Date class instances intact
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
+    return value;
+  }
+  const cleaned: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (v !== undefined) {
+      cleaned[k] = stripUndefinedDeep(v);
+    }
+  }
+  return cleaned as T;
+}
+
 // Initialize the Firebase App
 const app = initializeApp(firebaseConfig);
 
@@ -252,6 +276,7 @@ export const db = initializeFirestore(
   app,
   {
     experimentalAutoDetectLongPolling: true,
+    ignoreUndefinedProperties: true,
   },
   (firebaseConfig as { firestoreDatabaseId?: string }).firestoreDatabaseId
 );

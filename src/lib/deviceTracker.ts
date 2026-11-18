@@ -387,38 +387,15 @@ export const syncDeviceToFirestore = async (
         updatedAt: serverTimestamp(),
       };
 
-      const writeTasks: Promise<unknown>[] = [
-        setDoc(deviceDocRef, firestorePayload, { merge: true })
-          .then(() => reportFirestoreWriteResult(true))
-          .catch((err) => {
-            reportFirestoreWriteResult(false, err);
-            console.warn("Notice syncing device to /devices:", err);
-          }),
-      ];
-
-      // Mirror compact lastDevice onto /users/{uid} ONLY when explicitly forced (register/verify/login)
-      if (context.forceFirestore && syncedRecord.userUid && syncedRecord.userUid !== "demo_user_5min") {
-        const compact = toCompactDeviceSummary(syncedRecord);
-        const userRef = doc(db, "users", syncedRecord.userUid);
-        writeTasks.push(
-          setDoc(
-            userRef,
-            {
-              lastDevice: compact,
-              lastDeviceLabel: formatDeviceShortLabel(compact),
-              lastDeviceId: syncedRecord.deviceId,
-              lastDeviceSeenAt: syncedRecord.lastSeenAt,
-            },
-            { merge: true }
-          ).catch((err) => {
-            reportFirestoreWriteResult(false, err);
-            console.warn("Notice updating lastDevice on user profile:", err);
-          })
-        );
-      }
+      const writeTask = setDoc(deviceDocRef, firestorePayload, { merge: true })
+        .then(() => reportFirestoreWriteResult(true))
+        .catch((err) => {
+          reportFirestoreWriteResult(false, err);
+          console.warn("Notice syncing device to /devices:", err);
+        });
 
       await Promise.race([
-        Promise.all(writeTasks),
+        writeTask,
         new Promise((resolve) => setTimeout(resolve, 3500)),
       ]);
     }
