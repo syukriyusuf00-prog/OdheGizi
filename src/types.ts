@@ -3,7 +3,43 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+export type KopDocKey =
+  | "dashboard"
+  | "penerima"
+  | "menu"
+  | "foodcost"
+  | "nota"
+  | "cekgizi"
+  | "arsip";
+
+export interface UnifiedKopConfig {
+  leftLogoWidth: number; // px, 32..120
+  rightLogoWidth: number; // px, 32..120
+  linkLeftLogo: boolean;
+  linkRightLogo: boolean;
+  linkedDocs: Record<KopDocKey, boolean>;
+  autoPrintFormat: boolean; // Auto Arial + adaptive font + auto Portrait/Landscape
+}
+
+export const DEFAULT_UNIFIED_KOP_CONFIG: UnifiedKopConfig = {
+  leftLogoWidth: 56,
+  rightLogoWidth: 56,
+  linkLeftLogo: true,
+  linkRightLogo: true,
+  linkedDocs: {
+    dashboard: true,
+    penerima: true,
+    menu: true,
+    foodcost: true,
+    nota: true,
+    cekgizi: true,
+    arsip: true,
+  },
+  autoPrintFormat: true,
+};
+
 export interface SPPGProfile {
+  idSPPG?: string;
   namaLembaga: string;
   alamat: string;
   namaKepala: string;
@@ -159,7 +195,8 @@ export interface FoodCostDay {
   masterMenuPlanId?: string;
   porsiBesarBahan: BahanMakananInput[];
   porsiKecilBahan: BahanMakananInput[];
-  bufferPct: number; // 3 or 5
+  bufferPct: number; // 2.5, 3, 5, or custom
+  bumbuPct?: number; // default 10 or custom %
   customPmBesarCount?: number;
   customPmKecilCount?: number;
 }

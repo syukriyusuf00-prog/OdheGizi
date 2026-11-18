@@ -6,13 +6,14 @@
 import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, KelompokSasaranPM, HariPM } from "./types";
 
 export const INITIAL_SPPG_PROFILE: SPPGProfile = {
+  idSPPG: "",
   namaLembaga: "SPPG Muna Barat Sawerigadi Ondoke",
   alamat: "Jl. Poros Sawerigadi No. 12, Ondoke, Muna Barat, Sulawesi Tenggara",
-  namaKepala: "La Ode Muhammad Yusuf, S.Pd.",
-  namaAhliGizi: "Sitti Aminah, S.Gz.",
-  namaYayasan: "Yayasan Sinergi Membangun Sultra",
-  ketuaYayasan: "Drs. H. Syukri Yusuf, M.Si.",
-  namaAkuntan: "Megawati, S.Ak.",
+  namaKepala: "JABARNUR SALIM, S. H.",
+  namaAhliGizi: "LA ODE MUHAMMAD SUKRI YUSUF, S.Tr.Gz",
+  namaYayasan: "LAWOROKU",
+  ketuaYayasan: "ALI SAMDIN",
+  namaAkuntan: "NUR ANISSA SA'BAN RINDO, S.Ak",
   tahunAnggaran: "2026",
   periodeDates: [
     "2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09", "2026-07-10", "2026-07-11",
@@ -235,6 +236,7 @@ export const INITIAL_HARIAN_PM: HariPM[] = Array.from({ length: 10 }, (_, i) => 
 }));
 
 export const EMPTY_SPPG_PROFILE: SPPGProfile = {
+  idSPPG: "",
   namaLembaga: "",
   alamat: "",
   namaKepala: "",

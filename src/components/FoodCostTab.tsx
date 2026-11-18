@@ -4,16 +4,16 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { TKPIItem, BahanMakananInput, FoodCostDay, MasterMenu, HariPM } from "../types";
+import { TKPIItem, BahanMakananInput, FoodCostDay, MasterMenu, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 import { calculateDay, formatRupiah, getCountsForDay, CalcIngredientResult } from "../utils/calc";
 import SearchableTkpiDropdown from "./SearchableTkpiDropdown";
 import { PriceCalculatorPopover } from "./PriceCalculatorPopover";
 import { Plus, Trash2, HelpCircle, Sparkles, AlertTriangle, CheckCircle2, Calculator, Info, Sliders, Printer, Download, FileSpreadsheet, Edit3, RefreshCw, Image as ImageIcon, Settings, Eye, Layers, Tag, ChevronDown, ChevronUp, X, Check } from "lucide-react";
-import { downloadElementAsImage, exportToPDF } from "../lib/printUtils";
+import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import * as XLSX from "xlsx";
 
-import KopSuratConfigSection, { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import PrintPreviewModal from "./PrintPreviewModal";
 import {
   composeMenuName,
@@ -51,6 +51,9 @@ interface FoodCostTabProps {
   setRightLogoCrop?: (val: LogoCrop) => void;
   paperSize?: "A4" | "F4";
   setPaperSize?: (val: "A4" | "F4") => void;
+  kopConfig?: UnifiedKopConfig;
+  bumbuPct?: number;
+  setBumbuPct?: (val: number) => void;
   pmSettings?: any;
   setPmSettings?: (val: any) => void;
   onNavigateToMasterMenu?: () => void;
@@ -158,6 +161,9 @@ export default function FoodCostTab({
   setRightLogoCrop = () => {},
   paperSize = "A4",
   setPaperSize = () => {},
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
+  bumbuPct: propBumbuPct,
+  setBumbuPct: propSetBumbuPct,
   pmSettings,
   onNavigateToMasterMenu,
   onNavigateToPM
@@ -200,31 +206,18 @@ export default function FoodCostTab({
     localStorage.setItem("sisper_planning_mode", mode);
   };
 
-  // Mulai Baru: Clear all food cost items across all planned days
-  const handleMulaiBaruFoodCost = () => {
-    triggerConfirm({
-      title: "Mulai Baru Lembar Kerja Food Cost",
-      message: `Apakah Anda yakin ingin mengosongkan seluruh perencanaan bahan makanan Food Cost untuk semua ${totalDays} hari kerja untuk mulai lembar kerja baru dari awal?`,
-      confirmText: "Ya, Kosongkan Semua",
-      variant: "warning",
-      onConfirm: () => {
-        const resetDays: FoodCostDay[] = Array.from({ length: totalDays }).flatMap((_, i) => {
-          const dayNum = i + 1;
-          const tanggal = scheduleDates[i] || "";
-          return [
-            { hariKe: dayNum, jenisMenu: "Basah" as const, tanggal, porsiBesarBahan: [], porsiKecilBahan: [], bufferPct: 5 },
-            { hariKe: dayNum, jenisMenu: "Alergi" as const, tanggal, porsiBesarBahan: [], porsiKecilBahan: [], bufferPct: 5 },
-            { hariKe: dayNum, jenisMenu: "Kering" as const, tanggal, porsiBesarBahan: [], porsiKecilBahan: [], bufferPct: 5 },
-            { hariKe: dayNum, jenisMenu: "MP-ASI" as const, tanggal, porsiBesarBahan: [], porsiKecilBahan: [], bufferPct: 5 },
-          ];
-        });
-        onFoodCostDaysChange(resetDays);
-        setFcNotice({
-          type: "info",
-          text: `Seluruh perencanaan Food Cost untuk ${totalDays} hari telah dikosongkan.`,
-        });
-      },
-    });
+  const [localBumbuPct, setLocalBumbuPct] = useState<number>(() => {
+    const saved = Number(localStorage.getItem("sisper_bumbu_pct"));
+    return !isNaN(saved) && saved >= 0 && saved <= 100 ? saved : 10;
+  });
+
+  const activeBumbuPct = propBumbuPct !== undefined ? propBumbuPct : localBumbuPct;
+
+  const handleBumbuPctChange = (val: number) => {
+    const clamped = Math.max(0, Math.min(100, isNaN(val) ? 0 : val));
+    setLocalBumbuPct(clamped);
+    localStorage.setItem("sisper_bumbu_pct", String(clamped));
+    if (propSetBumbuPct) propSetBumbuPct(clamped);
   };
 
   // State for Calculator Modal
@@ -1032,7 +1025,8 @@ export default function FoodCostTab({
     pmBesar,
     pmKecil,
     currentDayData.bufferPct,
-    tkpiList
+    tkpiList,
+    activeBumbuPct
   );
 
   // Custom tables RAB calculation
@@ -1069,8 +1063,8 @@ export default function FoodCostTab({
   let customTablesBumbuTotal = 0;
   const customTablesActualTotal = (customTables || []).reduce((acc, t) => {
     const calcCustom = t.porsi === "besar"
-      ? calculateDay(t.bahanList || [], [], Number(t.pmCount) || 0, 0, t.bufferPct || 5, tkpiList)
-      : calculateDay([], t.bahanList || [], 0, Number(t.pmCount) || 0, t.bufferPct || 5, tkpiList);
+      ? calculateDay(t.bahanList || [], [], Number(t.pmCount) || 0, 0, t.bufferPct || 5, tkpiList, activeBumbuPct)
+      : calculateDay([], t.bahanList || [], 0, Number(t.pmCount) || 0, t.bufferPct || 5, tkpiList, activeBumbuPct);
     
     const bumbuCustom = t.porsi === "besar" ? calcCustom.bumbuBesarCost : calcCustom.bumbuKecilCost;
     customTablesBumbuTotal += bumbuCustom;
@@ -1540,7 +1534,7 @@ export default function FoodCostTab({
     items: CalcIngredientResult[],
     pmCount: number
   ) => {
-    const multiplier = planningMode === "with_bumbu_10" ? 1.1 : 1;
+    const multiplier = planningMode === "with_bumbu_10" ? (1 + activeBumbuPct / 100) : 1;
     const sortedDrivers = items
       .map((item) => ({
         id: item.id,
@@ -1653,7 +1647,7 @@ export default function FoodCostTab({
     );
   };
 
-  const logoSrc = customLogo || localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || "/assets/images/app_logo_sppg.png";
+  const logoSrc = leftLogo || customLogo || localStorage.getItem("kop_left_logo") || "";
 
   const handleExportExcel = () => {
     const wb = XLSX.utils.book_new();
@@ -1741,8 +1735,8 @@ export default function FoodCostTab({
       const pctSerat = targetSerat > 0 ? (sumSerat / targetSerat) * 100 : 0;
 
       sheetData.push(["KANDUNGAN GIZI", "", "", "", "", sumEnergi, sumProtein, sumLemak, sumKH, sumSerat, "", "", "JUMLAH (Rp)", totalBahan, "", "", "JUMLAH (Rp)", totalBahan]);
-      sheetData.push([`KEBUTUHAN RUJUKAN AKG`, "", "", "", "", targetEnergi, targetProtein, targetLemak, targetKH, targetSerat, "", "", "BUMBU 10% (Rp)", totalBahan * 0.1, "", "", "BUMBU 10% (Rp)", totalBahan * 0.1]);
-      sheetData.push(["KEBUTUHAN 90-110%", "", "", "", "", `${pctEnergi.toFixed(0)}%`, `${pctProtein.toFixed(0)}%`, `${pctLemak.toFixed(0)}%`, `${pctKH.toFixed(0)}%`, `${pctSerat.toFixed(0)}%`, "", "", "JUMLAH+BUMBU 10% (Rp)", totalBahan * 1.1, "", "", "JUMLAH+BUMBU 10% (Rp)", totalBahan * 1.1]);
+      sheetData.push([`KEBUTUHAN RUJUKAN AKG`, "", "", "", "", targetEnergi, targetProtein, targetLemak, targetKH, targetSerat, "", "", `BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (activeBumbuPct / 100), "", "", `BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (activeBumbuPct / 100)]);
+      sheetData.push(["KEBUTUHAN 90-110%", "", "", "", "", `${pctEnergi.toFixed(0)}%`, `${pctProtein.toFixed(0)}%`, `${pctLemak.toFixed(0)}%`, `${pctKH.toFixed(0)}%`, `${pctSerat.toFixed(0)}%`, "", "", `JUMLAH+BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (1 + activeBumbuPct / 100), "", "", `JUMLAH+BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (1 + activeBumbuPct / 100)]);
       sheetData.push([]);
       sheetData.push(["", "", "", "", "", "", "", "", "", "", "", "", "HARGA PER PORSI (Rp)", perPorsi]);
 
@@ -1764,8 +1758,8 @@ export default function FoodCostTab({
     // Append custom tables to Excel
     customTables.forEach((table, index) => {
       const resultsCustom = table.porsi === "besar"
-        ? calculateDay(table.bahanList, [], table.pmCount, 0, table.bufferPct || 5, tkpiList)
-        : calculateDay([], table.bahanList, 0, table.pmCount, table.bufferPct || 5, tkpiList);
+        ? calculateDay(table.bahanList, [], table.pmCount, 0, table.bufferPct || 5, tkpiList, activeBumbuPct)
+        : calculateDay([], table.bahanList, 0, table.pmCount, table.bufferPct || 5, tkpiList, activeBumbuPct);
 
       const itemsCustom = table.porsi === "besar" ? resultsCustom.porsiBesarItems : resultsCustom.porsiKecilItems;
       const totalBahanCustom = table.porsi === "besar" ? resultsCustom.totalBesarBahanCost : resultsCustom.totalKecilBahanCost;
@@ -1871,8 +1865,8 @@ export default function FoodCostTab({
       const pctSeratCustom = targetSeratCustom > 0 ? (sumSeratCustom / targetSeratCustom) * 100 : 0;
 
       sheetDataCustom.push(["KANDUNGAN GIZI", "", "", "", "", sumEnergiCustom, sumProteinCustom, sumLemakCustom, sumKHCustom, sumSeratCustom, "", "", "JUMLAH (Rp)", totalBahanCustom, "", "", "JUMLAH (Rp)", totalBahanCustom]);
-      sheetDataCustom.push([`KEBUTUHAN RUJUKAN AKG`, "", "", "", "", targetEnergiCustom, targetProteinCustom, targetLemakCustom, targetKHCustom, targetSeratCustom, "", "", "BUMBU 10% (Rp)", totalBahanCustom * 0.1, "", "", "BUMBU 10% (Rp)", totalBahanCustom * 0.1]);
-      sheetDataCustom.push(["KEBUTUHAN 90-110%", "", "", "", "", `${pctEnergiCustom.toFixed(0)}%`, `${pctProteinCustom.toFixed(0)}%`, `${pctLemakCustom.toFixed(0)}%`, `${pctKHCustom.toFixed(0)}%`, `${pctSeratCustom.toFixed(0)}%`, "", "", "JUMLAH+BUMBU 10% (Rp)", totalBahanCustom * 1.1, "", "", "JUMLAH+BUMBU 10% (Rp)", totalBahanCustom * 1.1]);
+      sheetDataCustom.push([`KEBUTUHAN RUJUKAN AKG`, "", "", "", "", targetEnergiCustom, targetProteinCustom, targetLemakCustom, targetKHCustom, targetSeratCustom, "", "", `BUMBU ${activeBumbuPct}% (Rp)`, totalBahanCustom * (activeBumbuPct / 100), "", "", `BUMBU ${activeBumbuPct}% (Rp)`, totalBahanCustom * (activeBumbuPct / 100)]);
+      sheetDataCustom.push(["KEBUTUHAN 90-110%", "", "", "", "", `${pctEnergiCustom.toFixed(0)}%`, `${pctProteinCustom.toFixed(0)}%`, `${pctLemakCustom.toFixed(0)}%`, `${pctKHCustom.toFixed(0)}%`, `${pctSeratCustom.toFixed(0)}%`, "", "", `JUMLAH+BUMBU ${activeBumbuPct}% (Rp)`, totalBahanCustom * (1 + activeBumbuPct / 100), "", "", `JUMLAH+BUMBU ${activeBumbuPct}% (Rp)`, totalBahanCustom * (1 + activeBumbuPct / 100)]);
       sheetDataCustom.push([]);
       sheetDataCustom.push(["", "", "", "", "", "", "", "", "", "", "", "", "HARGA PER PORSI (Rp)", perPorsiCustom]);
 
@@ -2549,9 +2543,9 @@ export default function FoodCostTab({
                 </>
               ) : (
                 <>
-                  {/* Right Part: BUMBU 10% (cols 11-22) */}
+                  {/* Right Part: BUMBU CUSTOM % (cols 11-22) */}
                   <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#FFFF00]">
-                    BUMBU 10%
+                    BUMBU {activeBumbuPct}%
                   </td>
                   <td className="p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 bg-[#FFFF00]">
                     <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950">
@@ -2566,7 +2560,7 @@ export default function FoodCostTab({
               )}
             </tr>
 
-            {/* ROW 3: KEBUTUHAN 90-110% + (JUMLAH+BUMBU 10% OR BLANK) */}
+            {/* ROW 3: KEBUTUHAN 90-110% + (JUMLAH+BUMBU % OR BLANK) */}
             <tr className="border border-black">
               {/* Left Part: Kebutuhan 90-110% (cols 1-10) */}
               <td colSpan={5} className="p-1.5 border border-black font-extrabold text-black uppercase bg-[#92D050] text-center">
@@ -2604,9 +2598,9 @@ export default function FoodCostTab({
                 </>
               ) : (
                 <>
-                  {/* Right Part: JUMLAH+BUMBU 10% (cols 11-22) */}
+                  {/* Right Part: JUMLAH+BUMBU % (cols 11-22) */}
                   <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#F8CBAD]">
-                    JUMLAH+BUMBU 10%
+                    JUMLAH+BUMBU {activeBumbuPct}%
                   </td>
                   <td className="p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 bg-[#F8CBAD]">
                     <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950">
@@ -2660,8 +2654,8 @@ export default function FoodCostTab({
 
   const renderCustomFoodCostTable = (table: any, isPrint: boolean) => {
     const results = table.porsi === "besar"
-      ? calculateDay(table.bahanList, [], table.pmCount, 0, table.bufferPct || 5, tkpiList)
-      : calculateDay([], table.bahanList, 0, table.pmCount, table.bufferPct || 5, tkpiList);
+      ? calculateDay(table.bahanList, [], table.pmCount, 0, table.bufferPct || 5, tkpiList, activeBumbuPct)
+      : calculateDay([], table.bahanList, 0, table.pmCount, table.bufferPct || 5, tkpiList, activeBumbuPct);
 
     const items = table.porsi === "besar" ? results.porsiBesarItems : results.porsiKecilItems;
     const totalBahanCost = table.porsi === "besar" ? results.totalBesarBahanCost : results.totalKecilBahanCost;
@@ -3242,9 +3236,9 @@ export default function FoodCostTab({
                 </>
               ) : (
                 <>
-                  {/* Right Part: BUMBU 10% (cols 11-22) */}
+                  {/* Right Part: BUMBU CUSTOM % (cols 11-22) */}
                   <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#FFFF00]">
-                    BUMBU 10%
+                    BUMBU {activeBumbuPct}%
                   </td>
                   <td className="p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 bg-[#FFFF00]">
                     <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950">
@@ -3259,7 +3253,7 @@ export default function FoodCostTab({
               )}
             </tr>
 
-            {/* ROW 3: KEBUTUHAN 90-110% + (JUMLAH+BUMBU 10% OR BLANK) */}
+            {/* ROW 3: KEBUTUHAN 90-110% + (JUMLAH+BUMBU % OR BLANK) */}
             <tr className="border border-black">
               {/* Left Part: Kebutuhan 90-110% (cols 1-10) */}
               <td colSpan={5} className="p-1.5 border border-black font-extrabold text-black uppercase bg-[#92D050] text-center">
@@ -3297,9 +3291,9 @@ export default function FoodCostTab({
                 </>
               ) : (
                 <>
-                  {/* Right Part: JUMLAH+BUMBU 10% (cols 11-22) */}
+                  {/* Right Part: JUMLAH+BUMBU % (cols 11-22) */}
                   <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#F8CBAD]">
-                    JUMLAH+BUMBU 10%
+                    JUMLAH+BUMBU {activeBumbuPct}%
                   </td>
                   <td className="p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 bg-[#F8CBAD]">
                     <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950">
@@ -3453,17 +3447,7 @@ export default function FoodCostTab({
             }`}
           >
             <Printer className="w-3.5 h-3.5" />
-            Pratinjau Cetak A4 / Ekspor
-          </button>
-          <button
-            type="button"
-            id="btn-mulai-baru-food-cost"
-            onClick={handleMulaiBaruFoodCost}
-            className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-extrabold flex items-center gap-1.5 transition-all shadow-xs shrink-0 cursor-pointer"
-            title={`Mulai Baru: Mengosongkan seluruh perencanaan bahan makanan Food Cost untuk ${totalDays} Hari`}
-          >
-            <Sparkles className="w-3.5 h-3.5" />
-            Mulai Baru
+            Pratinjau Cetak {paperSize} / Ekspor
           </button>
         </div>
       </div>
@@ -3668,15 +3652,25 @@ export default function FoodCostTab({
                 </select>
               </div>
 
-              {/* 4. Buffer Rate Selector */}
+              {/* 4. Buffer Rate Selector (2.5%, 3%, 5%, atau Custom %) */}
               <div className="space-y-1">
                 <label className="text-[10px] font-bold text-slate-400 uppercase block">Penyusutan/Kerusakan (Buffer)</label>
                 <div className="flex bg-slate-50 border border-slate-200 rounded-xl p-1 gap-1 items-center h-10">
                   <button
+                    id="btn-buffer-2-5"
+                    type="button"
+                    onClick={() => handleBufferChange(2.5)}
+                    className={`px-2 py-1 text-[11px] font-bold rounded-lg transition-all cursor-pointer whitespace-nowrap ${
+                      currentDayData.bufferPct === 2.5 ? "bg-white text-indigo-600 shadow-xs border border-slate-200/50" : "text-slate-500 hover:text-slate-800"
+                    }`}
+                  >
+                    2.5%
+                  </button>
+                  <button
                     id="btn-buffer-3"
                     type="button"
                     onClick={() => handleBufferChange(3)}
-                    className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                    className={`px-2 py-1 text-[11px] font-bold rounded-lg transition-all cursor-pointer whitespace-nowrap ${
                       currentDayData.bufferPct === 3 ? "bg-white text-indigo-600 shadow-xs border border-slate-200/50" : "text-slate-500 hover:text-slate-800"
                     }`}
                   >
@@ -3686,44 +3680,83 @@ export default function FoodCostTab({
                     id="btn-buffer-5"
                     type="button"
                     onClick={() => handleBufferChange(5)}
-                    className={`px-2.5 py-1 text-xs font-bold rounded-lg transition-all cursor-pointer ${
+                    className={`px-2 py-1 text-[11px] font-bold rounded-lg transition-all cursor-pointer whitespace-nowrap ${
                       currentDayData.bufferPct === 5 ? "bg-white text-indigo-600 shadow-xs border border-slate-200/50" : "text-slate-500 hover:text-slate-800"
                     }`}
                   >
                     5%
                   </button>
-                  <div className="flex-1 min-w-0 flex items-center bg-white border border-slate-200 rounded-lg px-1.5 py-0.5 h-8">
+                  <div className={`flex-1 min-w-[54px] flex items-center bg-white border rounded-lg px-1.5 py-0.5 h-8 ${
+                    ![2.5, 3, 5].includes(currentDayData.bufferPct) ? "border-indigo-400 ring-1 ring-indigo-500/20" : "border-slate-200"
+                  }`}>
                     <input
+                      id="input-buffer-custom"
                       type="number"
                       min="0"
                       max="100"
                       step="0.1"
-                      value={![3, 5].includes(currentDayData.bufferPct) ? currentDayData.bufferPct : ""}
+                      value={![2.5, 3, 5].includes(currentDayData.bufferPct) ? currentDayData.bufferPct : ""}
                       placeholder="Custom"
                       onChange={(e) => {
-                        const val = e.target.value === "" ? 3 : parseFloat(e.target.value);
+                        const raw = e.target.value;
+                        if (raw === "") {
+                          handleBufferChange(0);
+                          return;
+                        }
+                        const val = parseFloat(raw);
                         if (!isNaN(val)) {
-                          handleBufferChange(val);
+                          handleBufferChange(Math.max(0, Math.min(100, val)));
                         }
                       }}
-                      className="w-full text-center bg-transparent border-0 font-bold text-xs p-0 text-indigo-600 focus:outline-none focus:ring-0 placeholder:text-slate-400"
+                      className="w-full text-center bg-transparent border-0 font-bold text-xs p-0 text-indigo-600 focus:outline-none focus:ring-0 placeholder:text-slate-400 tabular-nums"
                     />
                     <span className="text-[9px] text-slate-400 font-bold">%</span>
                   </div>
                 </div>
               </div>
 
-              {/* 5. Spice Planning Selector */}
+              {/* 5. Spice Planning Selector + Custom Bumbu % */}
               <div className="space-y-1">
                 <label className="text-[10px] font-bold text-slate-400 uppercase block">Perencanaan Bumbu</label>
-                <select
-                  value={planningMode}
-                  onChange={(e) => handlePlanningModeChange(e.target.value as any)}
-                  className="bg-slate-50 border border-slate-200 rounded-xl text-xs px-3 py-2.5 text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500/20 w-full cursor-pointer h-10"
-                >
-                  <option value="with_bumbu_10">Bumbu Tambahan 10%</option>
-                  <option value="all_ingredients">Semua Bahan Termasuk Bumbu</option>
-                </select>
+                <div className="flex items-center gap-1.5 h-10">
+                  <select
+                    id="select-fc-planning-mode"
+                    value={planningMode}
+                    onChange={(e) => handlePlanningModeChange(e.target.value as any)}
+                    className="bg-slate-50 border border-slate-200 rounded-xl text-xs px-2.5 py-2 text-slate-800 font-bold focus:outline-none focus:ring-2 focus:ring-indigo-500/20 flex-1 min-w-0 cursor-pointer h-10"
+                  >
+                    <option value="with_bumbu_10">Bumbu ({activeBumbuPct}%)</option>
+                    <option value="all_ingredients">Semua Bahan Termasuk Bumbu</option>
+                  </select>
+                  {planningMode === "with_bumbu_10" && (
+                    <div
+                      className="flex items-center bg-white border border-indigo-300 rounded-xl px-2 h-10 w-[74px] shrink-0 focus-within:ring-2 focus-within:ring-indigo-500/20"
+                      title="Isi persentase Bumbu Custom (%) sesuai kebutuhan perencanaan"
+                    >
+                      <input
+                        id="input-custom-bumbu-pct"
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="0.5"
+                        value={activeBumbuPct}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          if (raw === "") {
+                            handleBumbuPctChange(0);
+                            return;
+                          }
+                          const parsed = parseFloat(raw);
+                          if (!isNaN(parsed)) {
+                            handleBumbuPctChange(parsed);
+                          }
+                        }}
+                        className="w-full text-center bg-transparent border-0 text-xs font-extrabold text-indigo-700 p-0 focus:outline-none focus:ring-0 tabular-nums"
+                      />
+                      <span className="text-[10px] font-extrabold text-indigo-500 ml-0.5">%</span>
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -4120,7 +4153,7 @@ export default function FoodCostTab({
                     Realisasi Belanja Harian (Actual)
                   </span>
                   <span className="text-[9px] font-black px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-200">
-                    {planningMode === "with_bumbu_10" ? "+10% Bumbu" : "Uraian Bumbu"}
+                    {planningMode === "with_bumbu_10" ? `+${activeBumbuPct}% Bumbu` : "Uraian Bumbu"}
                   </span>
                 </div>
                 <div className="mt-2 flex items-baseline justify-between gap-1">
@@ -4129,7 +4162,7 @@ export default function FoodCostTab({
                   </span>
                   {planningMode === "with_bumbu_10" && (
                     <div className="text-right">
-                      <span className="text-[9px] font-extrabold text-indigo-600 block uppercase tracking-tight">Total Bumbu 10%:</span>
+                      <span className="text-[9px] font-extrabold text-indigo-600 block uppercase tracking-tight">Total Bumbu {activeBumbuPct}%:</span>
                       <span className="text-xs font-black text-indigo-900 font-mono">
                         Rp {formatThousandSeparator(totalBumbu10Nominal)}
                       </span>
@@ -4150,7 +4183,7 @@ export default function FoodCostTab({
                     </span>
                     {planningMode === "with_bumbu_10" && (
                       <span className="text-[9.5px] font-bold text-indigo-900 bg-indigo-100/90 px-1.5 py-0.5 rounded border border-indigo-200/70 shrink-0 w-fit">
-                        Bumbu 10%: Rp {formatThousandSeparator(bumbuKecilNominal)}
+                        Bumbu {activeBumbuPct}%: Rp {formatThousandSeparator(bumbuKecilNominal)}
                       </span>
                     )}
                   </div>
@@ -4168,7 +4201,7 @@ export default function FoodCostTab({
                     </span>
                     {planningMode === "with_bumbu_10" && (
                       <span className="text-[9.5px] font-bold text-indigo-900 bg-indigo-100/90 px-1.5 py-0.5 rounded border border-indigo-200/70 shrink-0 w-fit">
-                        Bumbu 10%: Rp {formatThousandSeparator(bumbuBesarNominal)}
+                        Bumbu {activeBumbuPct}%: Rp {formatThousandSeparator(bumbuBesarNominal)}
                       </span>
                     )}
                   </div>
@@ -4176,8 +4209,8 @@ export default function FoodCostTab({
 
                 {customTables && customTables.map((t) => {
                   const calcCustom = t.porsi === "besar"
-                    ? calculateDay(t.bahanList || [], [], Number(t.pmCount) || 0, 0, t.bufferPct || 5, tkpiList)
-                    : calculateDay([], t.bahanList || [], 0, Number(t.pmCount) || 0, t.bufferPct || 5, tkpiList);
+                    ? calculateDay(t.bahanList || [], [], Number(t.pmCount) || 0, 0, t.bufferPct || 5, tkpiList, activeBumbuPct)
+                    : calculateDay([], t.bahanList || [], 0, Number(t.pmCount) || 0, t.bufferPct || 5, tkpiList, activeBumbuPct);
                   const tActual = t.porsi === "besar"
                     ? (planningMode === "with_bumbu_10" ? calcCustom.subtotalBesarCost : calcCustom.totalBesarBahanCost)
                     : (planningMode === "with_bumbu_10" ? calcCustom.subtotalKecilCost : calcCustom.totalKecilBahanCost);
@@ -4189,7 +4222,7 @@ export default function FoodCostTab({
                       <span>{t.namaTabel}: Rp {formatThousandSeparator(tActual)} (Rp {formatThousandSeparator(tPerPorsi)}/porsi)</span>
                       {planningMode === "with_bumbu_10" && (
                         <span className="text-[9.5px] font-bold text-purple-900 bg-purple-100/90 px-1.5 py-0.5 rounded border border-purple-200/70 shrink-0 w-fit">
-                          Bumbu 10%: Rp {formatThousandSeparator(tBumbuNominal)}
+                          Bumbu {activeBumbuPct}%: Rp {formatThousandSeparator(tBumbuNominal)}
                         </span>
                       )}
                     </div>
@@ -4654,7 +4687,7 @@ export default function FoodCostTab({
                   id="btn-fc-export-pdf"
                   type="button"
                   disabled={!!isDownloading}
-                  onClick={() => exportToPDF("print-area-food-cost", `Food_Cost_Hari_${selectedDay}_${selectedType}`, 100, setIsDownloading)}
+                  onClick={() => exportToPDF("print-area-food-cost", `Food_Cost_Hari_${selectedDay}_${selectedType}`, 100, setIsDownloading, { paperSize, orientation: "auto" })}
                   className="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow-xs flex items-center gap-1.5 transition"
                 >
                   <Download className="w-4 h-4" />
@@ -4682,11 +4715,11 @@ export default function FoodCostTab({
                 <button
                   id="btn-fc-print"
                   type="button"
-                  onClick={() => window.print()}
+                  onClick={() => printElementSmart("print-area-food-cost", { title: `Food Cost ${selectedType} — Hari Ke-${selectedDay}`, paperSize, orientation: "auto" })}
                   className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow-xs flex items-center gap-1.5 transition"
                 >
                   <Printer className="w-4 h-4" />
-                  Cetak / Simpan PDF (A4 Landscape)
+                  Cetak / Simpan PDF ({paperSize})
                 </button>
               </div>
             </div>
@@ -4730,56 +4763,31 @@ export default function FoodCostTab({
               </div>
             </div>
             <p className="text-[10px] text-slate-400 italic">
-              Tip: Menyesuaikan KOP di sini otomatis memperbarui KOP Master Menu. Tekan Cetak untuk mencetak langsung dengan presisi A4 Landscape.
+              Tip: Pengaturan KOP, logo kiri/kanan, font Arial presisi, dan orientasi Potret/Lansekap otomatis disinkronkan dari Panel Profil SPPG.
             </p>
           </div>
 
           <div className="bg-slate-100 p-6 rounded-2xl border border-slate-300 shadow-inner flex justify-center overflow-x-auto print:bg-transparent print:p-0 print:border-none print:shadow-none">
             <div 
               id="print-area-food-cost" 
-              className="bg-white p-8 border border-slate-400 shadow-md w-full max-w-[297mm] min-w-[210mm] font-sans text-slate-950 print:text-black print:border-none print:shadow-none print:p-0 print:m-0 space-y-10"
+              className="bg-white p-8 border border-slate-400 shadow-md w-full max-w-[297mm] min-w-[210mm] text-slate-950 print:text-black print:border-none print:shadow-none print:p-0 print:m-0 space-y-10"
+              style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
             >
               {/* SHEET 1: PORSI BESAR PAGE */}
               {(!appliedConfig.confirmed || showBesarTable) && (
                 <div className="space-y-6 print:break-after-page">
-                  <div className="relative flex items-center justify-between pb-3 border-b-2 border-black w-full" style={{ minHeight: '90px' }}>
-                    {/* Left Logo Container */}
-                    <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                      <img 
-                        src={leftLogo} 
-                        alt="Logo Kiri" 
-                        className="w-16 h-16 object-contain" 
-                        referrerPolicy="no-referrer"
-                        onError={(e) => {
-                          (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
-                        }}
-                      />
-                    </div>
-
-                    {/* Centered Kop Text */}
-                    <div className="text-center font-sans tracking-wide leading-snug px-4 flex-1">
-                      <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none" style={{ fontSize: '14pt' }}>{kopLine1}</div>
-                      <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine2}</div>
-                      <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine3}</div>
-                      <div className="italic text-slate-800 print:text-black font-sans mt-1.5" style={{ fontSize: '10pt' }}>{kopLine4}</div>
-                    </div>
-
-                    {/* Right Logo Container */}
-                    <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                      {rightLogo ? (
-                        <img 
-                          src={rightLogo} 
-                          alt="Logo Kanan" 
-                          className="w-16 h-16 object-contain" 
-                          referrerPolicy="no-referrer"
-                        />
-                      ) : (
-                        <div className="w-16 h-16 border border-dashed border-slate-300 rounded flex items-center justify-center text-[8px] text-slate-400 font-bold uppercase no-print">
-                          Logo Kanan
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  <KopSuratRenderHeader
+                    kopLine1={kopLine1}
+                    kopLine2={kopLine2}
+                    kopLine3={kopLine3}
+                    kopLine4={kopLine4}
+                    leftLogo={leftLogo}
+                    rightLogo={rightLogo}
+                    leftLogoCrop={leftLogoCrop}
+                    rightLogoCrop={rightLogoCrop}
+                    kopConfig={kopConfig}
+                    docKey="foodcost"
+                  />
 
                   <div className="text-center space-y-1">
                     <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: '13pt' }}>
@@ -4799,44 +4807,18 @@ export default function FoodCostTab({
               {/* SHEET 2: PORSI KECIL PAGE */}
               {(!appliedConfig.confirmed || showKecilTable) && (
                 <div className={`space-y-6 ${(!appliedConfig.confirmed || showBesarTable) ? "print:break-before-page pt-10 print:pt-0" : ""}`}>
-                  <div className="relative flex items-center justify-between pb-3 border-b-2 border-black w-full" style={{ minHeight: '90px' }}>
-                    {/* Left Logo Container */}
-                    <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                      <img 
-                        src={leftLogo} 
-                        alt="Logo Kiri" 
-                        className="w-16 h-16 object-contain" 
-                        referrerPolicy="no-referrer"
-                        onError={(e) => {
-                          (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
-                        }}
-                      />
-                    </div>
-
-                    {/* Centered Kop Text */}
-                    <div className="text-center font-sans tracking-wide leading-snug px-4 flex-1">
-                      <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none" style={{ fontSize: '14pt' }}>{kopLine1}</div>
-                      <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine2}</div>
-                      <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine3}</div>
-                      <div className="italic text-slate-800 print:text-black font-sans mt-1.5" style={{ fontSize: '10pt' }}>{kopLine4}</div>
-                    </div>
-
-                    {/* Right Logo Container */}
-                    <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                      {rightLogo ? (
-                        <img 
-                          src={rightLogo} 
-                          alt="Logo Kanan" 
-                          className="w-16 h-16 object-contain" 
-                          referrerPolicy="no-referrer"
-                        />
-                      ) : (
-                        <div className="w-16 h-16 border border-dashed border-slate-300 rounded flex items-center justify-center text-[8px] text-slate-400 font-bold uppercase no-print">
-                          Logo Kanan
-                        </div>
-                      )}
-                    </div>
-                  </div>
+                  <KopSuratRenderHeader
+                    kopLine1={kopLine1}
+                    kopLine2={kopLine2}
+                    kopLine3={kopLine3}
+                    kopLine4={kopLine4}
+                    leftLogo={leftLogo}
+                    rightLogo={rightLogo}
+                    leftLogoCrop={leftLogoCrop}
+                    rightLogoCrop={rightLogoCrop}
+                    kopConfig={kopConfig}
+                    docKey="foodcost"
+                  />
 
                   <div className="text-center space-y-1">
                     <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: '13pt' }}>
@@ -4857,44 +4839,18 @@ export default function FoodCostTab({
               {customTables.map((table) => {
                 return (
                   <div key={table.id} className="space-y-6 print:break-before-page pt-10 print:pt-0">
-                    <div className="relative flex items-center justify-between pb-3 border-b-2 border-black w-full" style={{ minHeight: '90px' }}>
-                      {/* Left Logo Container */}
-                      <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                        <img 
-                          src={leftLogo} 
-                          alt="Logo Kiri" 
-                          className="w-16 h-16 object-contain" 
-                          referrerPolicy="no-referrer"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
-                          }}
-                        />
-                      </div>
-
-                      {/* Centered Kop Text */}
-                      <div className="text-center font-sans tracking-wide leading-snug px-4 flex-1">
-                        <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none" style={{ fontSize: '14pt' }}>{kopLine1}</div>
-                        <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine2}</div>
-                        <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine3}</div>
-                        <div className="italic text-slate-800 print:text-black font-sans mt-1.5" style={{ fontSize: '10pt' }}>{kopLine4}</div>
-                      </div>
-
-                      {/* Right Logo Container */}
-                      <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                        {rightLogo ? (
-                          <img 
-                            src={rightLogo} 
-                            alt="Logo Kanan" 
-                            className="w-16 h-16 object-contain" 
-                            referrerPolicy="no-referrer"
-                          />
-                        ) : (
-                          <div className="w-16 h-16 border border-dashed border-slate-300 rounded flex items-center justify-center text-[8px] text-slate-400 font-bold uppercase no-print">
-                            Logo Kanan
-                          </div>
-                        )}
-                      </div>
-                    </div>
+                    <KopSuratRenderHeader
+                      kopLine1={kopLine1}
+                      kopLine2={kopLine2}
+                      kopLine3={kopLine3}
+                      kopLine4={kopLine4}
+                      leftLogo={leftLogo}
+                      rightLogo={rightLogo}
+                      leftLogoCrop={leftLogoCrop}
+                      rightLogoCrop={rightLogoCrop}
+                      kopConfig={kopConfig}
+                      docKey="foodcost"
+                    />
 
                     <div className="text-center space-y-1">
                       <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: '13pt' }}>
@@ -5779,7 +5735,7 @@ export default function FoodCostTab({
         filename={`Food_Cost_Hari_${selectedDay}_${selectedType}`}
         defaultScale={100}
         defaultPaperSize={paperSize as "A4" | "F4"}
-        defaultOrientation="landscape"
+        defaultOrientation="auto"
       />
     </div>
   );

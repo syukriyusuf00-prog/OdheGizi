@@ -12,9 +12,11 @@ import {
   MasterMenuScheduleConfig,
   MenuItem,
   SPPGProfile,
+  UnifiedKopConfig,
+  DEFAULT_UNIFIED_KOP_CONFIG,
 } from "../types";
-import { downloadElementAsImage, exportToPDF } from "../lib/printUtils";
-import KopSuratConfigSection, { LogoCrop } from "./KopSuratConfigSection";
+import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
+import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import PrintPreviewModal from "./PrintPreviewModal";
 import {
   SASARAN_KATEGORI_LIST,
@@ -51,7 +53,6 @@ import {
   Printer,
   RotateCcw,
   Send,
-  SlidersHorizontal,
   Table2,
   Trash2,
   Users,
@@ -83,6 +84,7 @@ interface MasterMenuTabProps {
   setRightLogoCrop?: (val: LogoCrop) => void;
   paperSize?: "A4" | "F4";
   setPaperSize?: (val: "A4" | "F4") => void;
+  kopConfig?: UnifiedKopConfig;
   isAdmin?: boolean;
 }
 
@@ -141,6 +143,7 @@ export default function MasterMenuTab({
   setRightLogoCrop = () => {},
   paperSize = "A4",
   setPaperSize = () => {},
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
   isAdmin = false,
 }: MasterMenuTabProps) {
   const normalizedMenu = useMemo(
@@ -165,7 +168,6 @@ export default function MasterMenuTab({
 
   const [viewMode, setViewMode] = useState<"table" | "cards" | "print">("table");
   const [showCustomDates, setShowCustomDates] = useState<boolean>(false);
-  const [showKopConfig, setShowKopConfig] = useState<boolean>(false);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
   const [copiedItem, setCopiedItem] = useState<{ sourceLabel: string; item: MenuItem } | null>(null);
@@ -978,19 +980,6 @@ export default function MasterMenuTab({
               Pratinjau Cetak Resmi
             </button>
           </div>
-
-          <button
-            type="button"
-            onClick={() => setShowKopConfig(!showKopConfig)}
-            className={`px-3 py-2 rounded-xl text-xs font-semibold border flex items-center gap-1.5 cursor-pointer transition whitespace-nowrap ${
-              showKopConfig
-                ? "bg-indigo-50 text-indigo-700 border-indigo-200"
-                : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
-            }`}
-          >
-            <SlidersHorizontal className="w-3.5 h-3.5" />
-            Atur KOP & Logo
-          </button>
         </div>
 
         {/* Actions: Reset + Export + Print */}
@@ -1024,7 +1013,9 @@ export default function MasterMenuTab({
               await exportToPDF(
                 "print-area-master-menu",
                 `Master_Menu_${totalDays}_Hari_${activePlan?.title || "SPPG"}`,
-                100
+                100,
+                undefined,
+                { paperSize, orientation: "auto" }
               );
               setIsDownloading(null);
             }}
@@ -1051,7 +1042,13 @@ export default function MasterMenuTab({
           </button>
           <button
             type="button"
-            onClick={() => window.print()}
+            onClick={() =>
+              printElementSmart("print-area-master-menu", {
+                title: masterBannerHeadline,
+                paperSize,
+                orientation: "auto",
+              })
+            }
             className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 cursor-pointer transition whitespace-nowrap"
           >
             <Printer className="w-3.5 h-3.5" />
@@ -1059,36 +1056,6 @@ export default function MasterMenuTab({
           </button>
         </div>
       </div>
-
-      {/* Collapsible KOP Surat Configuration */}
-      {showKopConfig && (
-        <div className="no-print">
-          <KopSuratConfigSection
-            kopLine1={kopLine1}
-            setKopLine1={setKopLine1}
-            kopLine2={kopLine2}
-            setKopLine2={setKopLine2}
-            kopLine3={kopLine3}
-            setKopLine3={setKopLine3}
-            kopLine4={kopLine4}
-            setKopLine4={setKopLine4}
-            leftLogo={leftLogo}
-            setLeftLogo={setLeftLogo}
-            rightLogo={rightLogo}
-            setRightLogo={setRightLogo}
-            leftLogoCrop={leftLogoCrop}
-            setLeftLogoCrop={setLeftLogoCrop}
-            rightLogoCrop={rightLogoCrop}
-            setRightLogoCrop={setRightLogoCrop}
-            paperSize={paperSize}
-            setPaperSize={setPaperSize}
-            isAdmin={isAdmin}
-            printTargetId="print-area-master-menu"
-            filename={`Master_Menu_${totalDays}_Hari_${activePlan?.title || "SPPG"}`}
-            title="MASTER MENU"
-          />
-        </div>
-      )}
 
       {/* SECTION 4A: CARD INPUT VIEW (for detailed card editing + explicit Nama Menu Food Cost) */}
       {viewMode === "cards" && activePlan && (
@@ -1193,49 +1160,22 @@ export default function MasterMenuTab({
       >
         <div
           id="print-area-master-menu"
-          className="bg-white p-4 sm:p-6 mx-auto border border-slate-300 shadow-sm min-w-[980px] max-w-[1400px] text-black font-sans print:shadow-none print:border-none print:p-0 print:max-w-full"
+          className="bg-white p-4 sm:p-6 mx-auto border border-slate-300 shadow-sm min-w-[980px] max-w-[1400px] text-black print:shadow-none print:border-none print:p-0 print:max-w-full"
+          style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
         >
-          {/* KOP SURAT SESUAI GAMBAR 1 */}
-          <div className="relative flex items-center justify-between pb-3 px-2">
-            <div className="w-20 h-20 flex items-center justify-center shrink-0">
-              <img
-                src={activeKopLeftSrc}
-                alt="Logo Kiri"
-                className="w-16 h-16 object-contain"
-                referrerPolicy="no-referrer"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src =
-                    "/assets/images/app_logo_sppg.png";
-                }}
-              />
-            </div>
-
-            <div className="flex-1 text-center px-4 leading-snug">
-              <div className="font-bold uppercase tracking-wide text-black text-[15pt]">
-                {kopLine1 || "BADAN GIZI NASIONAL"}
-              </div>
-              <div className="font-bold uppercase tracking-wide text-black text-[13pt]">
-                {kopLine2 || "SATUAN PELAYANAN PEMENUHAN GIZI"}
-              </div>
-              <div className="font-bold uppercase tracking-wide text-black text-[13pt]">
-                {kopLine3 || profile?.namaLembaga || "SPPG"}
-              </div>
-              <div className="italic underline text-black text-[10.5pt] mt-0.5">
-                {kopLine4 || (profile?.alamat ? `Alamat : ${profile.alamat}` : "")}
-              </div>
-            </div>
-
-            <div className="w-20 h-20 flex items-center justify-center shrink-0">
-              {rightLogo ? (
-                <img
-                  src={rightLogo}
-                  alt="Logo Kanan"
-                  className="w-16 h-16 object-contain"
-                  referrerPolicy="no-referrer"
-                />
-              ) : null}
-            </div>
-          </div>
+          {/* KOP SURAT TERPUSAT SPPG */}
+          <KopSuratRenderHeader
+            kopLine1={kopLine1 || "BADAN GIZI NASIONAL"}
+            kopLine2={kopLine2 || "SATUAN PELAYANAN PEMENUHAN GIZI"}
+            kopLine3={kopLine3 || profile?.namaLembaga || "SPPG"}
+            kopLine4={kopLine4 || (profile?.alamat ? `Alamat : ${profile.alamat}` : "")}
+            leftLogo={activeKopLeftSrc}
+            rightLogo={rightLogo}
+            leftLogoCrop={leftLogoCrop}
+            rightLogoCrop={rightLogoCrop}
+            kopConfig={kopConfig}
+            docKey="menu"
+          />
 
           {/* FULL-WIDTH GREEN TITLE BANNER (GAMBAR 1) */}
           <table className="w-full border-collapse border border-black text-[10.5pt]">
@@ -1405,7 +1345,7 @@ export default function MasterMenuTab({
         filename={`Master_Menu_${totalDays}_Hari_${activePlan?.title || "SPPG"}`}
         defaultScale={100}
         defaultPaperSize={paperSize}
-        defaultOrientation="landscape"
+        defaultOrientation="auto"
       />
     </div>
   );

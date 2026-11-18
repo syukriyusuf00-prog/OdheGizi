@@ -311,8 +311,9 @@ export function calculateDay(
   porsiKecilBahan: BahanMakananInput[],
   jumlahPMBesar: number,
   jumlahPMKecil: number,
-  bufferPct: number, // 3 or 5
-  tkpiListOrMap: TKPIItem[] | Map<string, TKPIItem>
+  bufferPct: number, // 2.5, 3, 5, or custom
+  tkpiListOrMap: TKPIItem[] | Map<string, TKPIItem>,
+  bumbuPct: number = 10
 ): DayCalculatedResult {
   const tkpiMap = tkpiListOrMap instanceof Map ? tkpiListOrMap : createTkpiMap(tkpiListOrMap);
   const besarItems = porsiBesarBahan.map((b) => calculateIngredient(b, tkpiMap, jumlahPMBesar, bufferPct));
@@ -324,8 +325,10 @@ export function calculateDay(
   const bufferBesarCost = (bufferPct / 100) * totalBesarBahanCost;
   const bufferKecilCost = (bufferPct / 100) * totalKecilBahanCost;
 
-  const bumbuBesarCost = 0.1 * totalBesarBahanCost;
-  const bumbuKecilCost = 0.1 * totalKecilBahanCost;
+  const safeBumbuPct = Number.isFinite(Number(bumbuPct)) ? Math.max(0, Number(bumbuPct)) : 10;
+  const bumbuRate = safeBumbuPct / 100;
+  const bumbuBesarCost = bumbuRate * totalBesarBahanCost;
+  const bumbuKecilCost = bumbuRate * totalKecilBahanCost;
 
   const subtotalBesarCost = totalBesarBahanCost + bumbuBesarCost;
   const subtotalKecilCost = totalKecilBahanCost + bumbuKecilCost;

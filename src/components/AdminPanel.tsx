@@ -71,6 +71,7 @@ interface AdminPanelProps {
   onClose: () => void;
   globalLogoUrl?: string | null;
   onUploadGlobalLogo?: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  onResetGlobalLogo?: () => void;
   adminEmail?: string;
 }
 
@@ -461,6 +462,7 @@ export default function AdminPanel({
   onClose,
   globalLogoUrl,
   onUploadGlobalLogo,
+  onResetGlobalLogo,
   adminEmail,
 }: AdminPanelProps) {
   const { user: authUser } = useAuth();
@@ -2170,29 +2172,47 @@ export default function AdminPanel({
             <div className="p-5 space-y-4 text-center">
               <div className="w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-500 mx-auto bg-slate-50">
                 <img
-                  src={globalLogoUrl || "/assets/aistudio/image_fd878a6e.png"}
+                  src={globalLogoUrl || "/assets/images/app_logo_sppg.png"}
                   alt="Logo Global SISPERMBG"
                   className="w-full h-full object-cover"
                   referrerPolicy="no-referrer"
+                  onError={(e) => {
+                    (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
+                  }}
                 />
               </div>
               <p className="text-xs text-slate-600 leading-relaxed">
-                Logo yang diunggah di sini otomatis diterapkan ke halaman depan Login dan seluruh akun pengguna SISPERMBG.
+                Khusus Admin: Logo ini hanya mengubah logo lingkaran di header atas aplikasi dan halaman depan Login (terpisah dari pengaturan Logo KOP Surat di Profil SPPG).
               </p>
-              <label className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl cursor-pointer transition">
-                <Camera className="w-4 h-4" />
-                <span>Pilih Gambar Logo Baru</span>
-                <input
-                  type="file"
-                  accept="image/*"
-                  onChange={(e) => {
-                    onUploadGlobalLogo(e);
-                    setIsLogoModalOpen(false);
-                    showToast("success", "Logo global aplikasi diperbarui.");
-                  }}
-                  className="hidden"
-                />
-              </label>
+              <div className="flex flex-wrap items-center justify-center gap-2">
+                <label className="inline-flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl cursor-pointer transition">
+                  <Camera className="w-4 h-4" />
+                  <span>Pilih Gambar Logo Baru</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => {
+                      onUploadGlobalLogo(e);
+                      setIsLogoModalOpen(false);
+                    }}
+                    className="hidden"
+                  />
+                </label>
+                {onResetGlobalLogo && globalLogoUrl && globalLogoUrl !== "/assets/images/app_logo_sppg.png" && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onResetGlobalLogo();
+                      setIsLogoModalOpen(false);
+                      showToast("success", "Logo header aplikasi dikembalikan ke standar default.");
+                    }}
+                    className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs rounded-xl cursor-pointer transition"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Reset Default</span>
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>

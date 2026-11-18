@@ -4,7 +4,7 @@
  */
 
 import { jsPDF } from "jspdf";
-import { SPPGProfile } from "../types";
+import { SPPGProfile, UnifiedKopConfig } from "../types";
 import { formatIndonesianDate } from "../utils/menuSchedule";
 import { formatRupiah } from "../utils/calc";
 
@@ -42,6 +42,7 @@ export interface ArchiveFoodCostSection {
   jenisMenu: string;
   namaMenu: string;
   bufferPct: number;
+  bumbuPct?: number;
   pmKecil: number;
   pmBesar: number;
   rabTotal: number;
@@ -99,6 +100,10 @@ export interface ArchivePdfOptions {
   category: ArchiveCategory;
   profile: SPPGProfile;
   kopLines: [string, string, string, string];
+  leftLogo?: string;
+  rightLogo?: string;
+  kopConfig?: UnifiedKopConfig;
+  paperSize?: "A4" | "F4";
 }
 
 const CATEGORY_TITLES: Record<ArchiveCategory, string> = {
@@ -124,15 +129,58 @@ export function buildArchivePdfFilename(entry: DailyArchiveEntry, category: Arch
   return `${CATEGORY_FILENAME_PREFIX[category]}_${safeDate}_${safeMenu}.pdf`;
 }
 
+function tryAddDataImage(
+  pdf: jsPDF,
+  src: string | undefined,
+  x: number,
+  y: number,
+  widthMm: number,
+  heightMm: number
+) {
+  if (!src || !src.startsWith("data:image/")) return;
+  try {
+    const isJpeg = src.includes("image/jpeg") || src.includes("image/jpg");
+    const isWebp = src.includes("image/webp");
+    const fmt = isJpeg ? "JPEG" : isWebp ? "WEBP" : "PNG";
+    pdf.addImage(src, fmt, x, y, widthMm, heightMm);
+  } catch {
+    // Skip invalid or unsupported embedded logo image gracefully
+  }
+}
+
+interface KopDrawAssets {
+  leftLogo?: string;
+  rightLogo?: string;
+  kopConfig?: UnifiedKopConfig;
+}
+
 function drawKopHeader(
   pdf: jsPDF,
   kopLines: [string, string, string, string],
   profile: SPPGProfile,
-  subtitle: string
+  subtitle: string,
+  assets?: KopDrawAssets
 ): number {
   const pageWidth = pdf.internal.pageSize.getWidth();
   const centerX = pageWidth / 2;
-  let y = 14;
+  let y = 13;
+
+  const isLinkedDoc = assets?.kopConfig ? assets.kopConfig.linkedDocs?.arsip !== false : true;
+  const showLeftLogo = isLinkedDoc && (assets?.kopConfig?.linkLeftLogo ?? true) && !!assets?.leftLogo;
+  const showRightLogo = isLinkedDoc && (assets?.kopConfig?.linkRightLogo ?? true) && !!assets?.rightLogo;
+
+  const leftMm = Math.min(24, Math.max(11, ((assets?.kopConfig?.leftLogoWidth || 56) / 56) * 16));
+  const rightMm = Math.min(24, Math.max(11, ((assets?.kopConfig?.rightLogoWidth || 56) / 56) * 16));
+
+  if (showLeftLogo) {
+    tryAddDataImage(pdf, assets?.leftLogo, 14, 10, leftMm, leftMm);
+  }
+  if (showRightLogo) {
+    tryAddDataImage(pdf, assets?.rightLogo, pageWidth - 14 - rightMm, 10, rightMm, rightMm);
+  }
+
+  const textPadding = Math.max(showLeftLogo ? leftMm + 4 : 0, showRightLogo ? rightMm + 4 : 0);
+  const maxTextWidth = Math.max(80, pageWidth - 28 - textPadding * 2);
 
   pdf.setTextColor(15, 23, 42);
   pdf.setFont("helvetica", "bold");
@@ -152,16 +200,16 @@ function drawKopHeader(
   pdf.setFontSize(8.5);
   pdf.setTextColor(71, 85, 105);
   const line4 = kopLines[3] || `Alamat: ${profile.alamat || "-"}`;
-  const wrappedKop4 = pdf.splitTextToSize(line4, pageWidth - 28);
+  const wrappedKop4 = pdf.splitTextToSize(line4, maxTextWidth);
   pdf.text(wrappedKop4, centerX, y, { align: "center" });
-  y += wrappedKop4.length * 3.8 + 2;
+  y = Math.max(y + wrappedKop4.length * 3.8 + 2, showLeftLogo || showRightLogo ? 10 + Math.max(leftMm, rightMm) + 2 : 0);
 
   pdf.setDrawColor(15, 23, 42);
   pdf.setLineWidth(0.7);
   pdf.line(14, y, pageWidth - 14, y);
   pdf.setLineWidth(0.2);
   pdf.line(14, y + 1.2, pageWidth - 14, y + 1.2);
-  y += 7;
+  y += 6.5;
 
   // Document Banner
   pdf.setFillColor(17, 36, 97);
@@ -170,7 +218,7 @@ function drawKopHeader(
   pdf.setFont("helvetica", "bold");
   pdf.setFontSize(10);
   pdf.text(subtitle, centerX, y + 5.7, { align: "center" });
-  y += 13;
+  y += 12.5;
 
   return y;
 }
@@ -182,7 +230,7 @@ function drawMetaBox(pdf: jsPDF, entry: DailyArchiveEntry, profile: SPPGProfile,
 
   pdf.setFillColor(248, 250, 252);
   pdf.setDrawColor(203, 213, 225);
-  pdf.roundedRect(14, startY, boxWidth, 18, 1.5, 1.5, "FD");
+  pdf.roundedRect(14, startY, boxWidth, 18.5, 1.5, 1.5, "FD");
 
   pdf.setTextColor(30, 41, 59);
   pdf.setFontSize(8.5);
@@ -199,9 +247,10 @@ function drawMetaBox(pdf: jsPDF, entry: DailyArchiveEntry, profile: SPPGProfile,
   pdf.text(menuText[0] || "-", 56, startY + 11);
 
   pdf.setFont("helvetica", "bold");
-  pdf.text("SPPG / Sumber Arsip :", 18, startY + 15.8);
+  pdf.text("SPPG / Sumber Arsip :", 18, startY + 16);
   pdf.setFont("helvetica", "normal");
-  pdf.text(`${profile.namaLembaga || "-"}  •  ${entry.sourceLabel}`, 56, startY + 15.8);
+  const idPart = profile.idSPPG ? ` [ID: ${profile.idSPPG}]` : "";
+  pdf.text(`${profile.namaLembaga || "-"}${idPart}  •  ${entry.sourceLabel}`, 56, startY + 16);
 
   return startY + 23;
 }
@@ -212,27 +261,33 @@ function ensurePageSpace(
   neededHeight: number,
   kopLines: [string, string, string, string],
   profile: SPPGProfile,
-  subtitle: string
+  subtitle: string,
+  assets?: KopDrawAssets
 ): number {
   const pageHeight = pdf.internal.pageSize.getHeight();
   if (currentY + neededHeight <= pageHeight - 16) {
     return currentY;
   }
   pdf.addPage();
-  return drawKopHeader(pdf, kopLines, profile, subtitle);
+  return drawKopHeader(pdf, kopLines, profile, subtitle, assets);
 }
 
 function drawSimpleTable(
   pdf: jsPDF,
   startY: number,
-  columns: Array<{ label: string; width: number; align?: "left" | "center" | "right" }>,
+  rawColumns: Array<{ label: string; width: number; align?: "left" | "center" | "right" }>,
   rows: Array<string[]>,
   kopLines: [string, string, string, string],
   profile: SPPGProfile,
-  subtitle: string
+  subtitle: string,
+  assets?: KopDrawAssets
 ): number {
   let y = startY;
   const startX = 14;
+  const targetWidth = pdf.internal.pageSize.getWidth() - 28;
+  const rawTotal = rawColumns.reduce((acc, c) => acc + c.width, 0) || targetWidth;
+  const scaleFactor = targetWidth / rawTotal;
+  const columns = rawColumns.map((c) => ({ ...c, width: c.width * scaleFactor }));
   const totalWidth = columns.reduce((acc, c) => acc + c.width, 0);
 
   const drawHeaderRow = (curY: number) => {
@@ -240,7 +295,7 @@ function drawSimpleTable(
     pdf.setDrawColor(148, 163, 184);
     pdf.rect(startX, curY, totalWidth, 7, "FD");
     pdf.setFont("helvetica", "bold");
-    pdf.setFontSize(7.5);
+    pdf.setFontSize(8);
     pdf.setTextColor(15, 23, 42);
 
     let x = startX;
@@ -259,25 +314,25 @@ function drawSimpleTable(
     return curY + 7;
   };
 
-  y = ensurePageSpace(pdf, y, 16, kopLines, profile, subtitle);
+  y = ensurePageSpace(pdf, y, 16, kopLines, profile, subtitle, assets);
   y = drawHeaderRow(y);
 
   pdf.setFont("helvetica", "normal");
-  pdf.setFontSize(7.5);
+  pdf.setFontSize(8);
 
   rows.forEach((row, rIdx) => {
     const cellLines = row.map((cell, cIdx) =>
       pdf.splitTextToSize(String(cell ?? "-"), Math.max(columns[cIdx].width - 3.5, 6))
     );
     const maxLines = Math.max(1, ...cellLines.map((l) => l.length));
-    const rowHeight = Math.max(6, maxLines * 3.5 + 2.5);
+    const rowHeight = Math.max(6, maxLines * 3.6 + 2.5);
 
     if (y + rowHeight > pdf.internal.pageSize.getHeight() - 16) {
       pdf.addPage();
-      y = drawKopHeader(pdf, kopLines, profile, subtitle);
+      y = drawKopHeader(pdf, kopLines, profile, subtitle, assets);
       y = drawHeaderRow(y);
       pdf.setFont("helvetica", "normal");
-      pdf.setFontSize(7.5);
+      pdf.setFontSize(8);
     }
 
     if (rIdx % 2 === 1) {
@@ -292,7 +347,7 @@ function drawSimpleTable(
     columns.forEach((col, cIdx) => {
       const lines = cellLines[cIdx];
       lines.forEach((ln: string, lineIdx: number) => {
-        const textY = y + 4 + lineIdx * 3.5;
+        const textY = y + 4.1 + lineIdx * 3.6;
         if (col.align === "right") {
           pdf.text(ln, x + col.width - 2, textY, { align: "right" });
         } else if (col.align === "center") {
@@ -344,11 +399,18 @@ function drawSignatureFooter(pdf: jsPDF, profile: SPPGProfile, startY: number): 
 }
 
 export function generateArchivePdfBlob(options: ArchivePdfOptions): Blob {
-  const { entry, category, profile, kopLines } = options;
-  const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4" });
+  const { entry, category, profile, kopLines, leftLogo, rightLogo, kopConfig, paperSize = "A4" } = options;
+  const assets: KopDrawAssets = { leftLogo, rightLogo, kopConfig };
+
+  // Wide multi-column worksheets automatically switch to Landscape; compact reports stay Portrait
+  const orientation: "portrait" | "landscape" =
+    category === "menu" || category === "food_cost" ? "landscape" : "portrait";
+  const format: "a4" | [number, number] = paperSize === "F4" ? [215, 330] : "a4";
+
+  const pdf = new jsPDF({ orientation, unit: "mm", format });
   const title = CATEGORY_TITLES[category];
 
-  let y = drawKopHeader(pdf, kopLines, profile, title);
+  let y = drawKopHeader(pdf, kopLines, profile, title, assets);
   y = drawMetaBox(pdf, entry, profile, y);
 
   if (category === "jumlah_pm") {
@@ -388,7 +450,8 @@ export function generateArchivePdfBlob(options: ArchivePdfOptions): Blob {
       rows,
       kopLines,
       profile,
-      title
+      title,
+      assets
     );
   } else if (category === "menu") {
     const rows =
@@ -409,19 +472,20 @@ export function generateArchivePdfBlob(options: ArchivePdfOptions): Blob {
       pdf,
       y,
       [
-        { label: "No", width: 8, align: "center" },
-        { label: "Kategori / Kelompok", width: 34, align: "left" },
-        { label: "Nama Menu", width: 32, align: "left" },
-        { label: "Pokok", width: 20, align: "left" },
-        { label: "L. Hewani", width: 22, align: "left" },
-        { label: "L. Nabati", width: 22, align: "left" },
-        { label: "Sayur", width: 22, align: "left" },
-        { label: "Buah / Susu", width: 22, align: "left" },
+        { label: "No", width: 10, align: "center" },
+        { label: "Kategori / Kelompok", width: 42, align: "left" },
+        { label: "Nama Menu", width: 42, align: "left" },
+        { label: "Pokok", width: 32, align: "left" },
+        { label: "L. Hewani", width: 36, align: "left" },
+        { label: "L. Nabati", width: 34, align: "left" },
+        { label: "Sayur", width: 36, align: "left" },
+        { label: "Buah / Susu", width: 36, align: "left" },
       ],
       rows,
       kopLines,
       profile,
-      title
+      title,
+      assets
     );
   } else if (category === "food_cost") {
     if (entry.foodCosts.length === 0) {
@@ -431,14 +495,15 @@ export function generateArchivePdfBlob(options: ArchivePdfOptions): Blob {
       y += 12;
     } else {
       entry.foodCosts.forEach((fc) => {
-        y = ensurePageSpace(pdf, y, 24, kopLines, profile, title);
+        y = ensurePageSpace(pdf, y, 24, kopLines, profile, title, assets);
         pdf.setFillColor(238, 242, 255);
         pdf.roundedRect(14, y, pdf.internal.pageSize.getWidth() - 28, 12, 1.5, 1.5, "F");
         pdf.setFont("helvetica", "bold");
         pdf.setFontSize(8.5);
         pdf.setTextColor(30, 58, 138);
+        const bumbuTag = fc.bumbuPct !== undefined ? `  |  Bumbu: ${fc.bumbuPct}%` : "";
         pdf.text(
-          `Kategori: ${fc.jenisMenu}  |  Menu: ${fc.namaMenu || entry.primaryMenuName}  |  Buffer: ${fc.bufferPct}%`,
+          `Kategori: ${fc.jenisMenu}  |  Menu: ${fc.namaMenu || entry.primaryMenuName}  |  Susut/Rusak: ${fc.bufferPct}%${bumbuTag}`,
           17,
           y + 4.8
         );
@@ -458,7 +523,7 @@ export function generateArchivePdfBlob(options: ArchivePdfOptions): Blob {
           energi: number,
           protein: number
         ) => {
-          y = ensurePageSpace(pdf, y, 14, kopLines, profile, title);
+          y = ensurePageSpace(pdf, y, 14, kopLines, profile, title, assets);
           pdf.setFont("helvetica", "bold");
           pdf.setFontSize(8.5);
           pdf.setTextColor(15, 23, 42);
@@ -487,19 +552,20 @@ export function generateArchivePdfBlob(options: ArchivePdfOptions): Blob {
             pdf,
             y,
             [
-              { label: "No", width: 9, align: "center" },
-              { label: "Nama Bahan", width: 52, align: "left" },
-              { label: "BB", width: 16, align: "center" },
-              { label: "URT", width: 22, align: "center" },
-              { label: "Keb. Kg", width: 20, align: "right" },
-              { label: "Jml+Buf", width: 18, align: "right" },
-              { label: "Harga", width: 22, align: "right" },
-              { label: "Total", width: 23, align: "right" },
+              { label: "No", width: 12, align: "center" },
+              { label: "Nama Bahan", width: 78, align: "left" },
+              { label: "BB", width: 22, align: "center" },
+              { label: "URT", width: 32, align: "center" },
+              { label: "Keb. Kg", width: 28, align: "right" },
+              { label: "Jml+Buf", width: 28, align: "right" },
+              { label: "Harga", width: 34, align: "right" },
+              { label: "Total", width: 35, align: "right" },
             ],
             rows,
             kopLines,
             profile,
-            title
+            title,
+            assets
           );
         };
 
@@ -538,10 +604,11 @@ export function generateArchivePdfBlob(options: ArchivePdfOptions): Blob {
       rows,
       kopLines,
       profile,
-      title
+      title,
+      assets
     );
 
-    y = ensurePageSpace(pdf, y, 12, kopLines, profile, title);
+    y = ensurePageSpace(pdf, y, 12, kopLines, profile, title, assets);
     pdf.setFillColor(236, 253, 245);
     pdf.setDrawColor(16, 185, 129);
     pdf.roundedRect(14, y, pdf.internal.pageSize.getWidth() - 28, 9, 1.5, 1.5, "FD");

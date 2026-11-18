@@ -4,13 +4,13 @@
  */
 
 import React, { useState, useEffect, useRef } from "react";
-import { FoodCostDay, TKPIItem, MasterMenu, HariPM, SPPGProfile } from "../types";
+import { FoodCostDay, TKPIItem, MasterMenu, HariPM, SPPGProfile, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 import { calculateDay, formatRupiah, getCountsForDay } from "../utils/calc";
 import { composeMenuName, formatIndonesianDate } from "../utils/menuSchedule";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import { PieChart, ListOrdered, PiggyBank, CalendarRange, TrendingDown, TrendingUp, AlertTriangle, Printer, Download, Image as ImageIcon, Eye, X, ZoomIn, RefreshCw, RotateCcw } from "lucide-react";
-import { downloadElementAsImage, exportToPDF } from "../lib/printUtils";
-import KopSuratConfigSection, { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
+import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import PrintPreviewModal from "./PrintPreviewModal";
 
 interface DashboardOutputsProps {
@@ -37,6 +37,8 @@ interface DashboardOutputsProps {
   setRightLogoCrop?: (val: LogoCrop) => void;
   paperSize?: "A4" | "F4";
   setPaperSize?: (val: "A4" | "F4") => void;
+  kopConfig?: UnifiedKopConfig;
+  bumbuPct?: number;
   isAdmin?: boolean;
 }
 
@@ -63,7 +65,9 @@ export default function DashboardOutputs({
   rightLogoCrop = { top: 0, bottom: 0, left: 0, right: 0 },
   setRightLogoCrop = () => {},
   paperSize = "A4",
-  setPaperSize = () => {}
+  setPaperSize = () => {},
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
+  bumbuPct = 10
 }: DashboardOutputsProps) {
   const [activeOutputTab, setActiveOutputTab] = useState<"rekap" | "nota">("rekap");
   const [targetBudgetPorsiBesar, setTargetBudgetPorsiBesar] = useState<number>(10000); // Default IDR 10,000 for Porsi Besar
@@ -234,7 +238,8 @@ export default function DashboardOutputs({
       dayCounts.pmBesarSekolah,
       dayCounts.pmKecilSekolah,
       schoolDayData.bufferPct,
-      tkpiList
+      tkpiList,
+      (schoolDayData as FoodCostDay).bumbuPct ?? bumbuPct
     );
 
     // 3B Group (MP-ASI)
@@ -252,7 +257,8 @@ export default function DashboardOutputs({
       dayCounts.pmBesar3B,
       dayCounts.pmKecil3B,
       threeBDayData.bufferPct,
-      tkpiList
+      tkpiList,
+      (threeBDayData as FoodCostDay).bumbuPct ?? bumbuPct
     );
 
     return {
@@ -312,7 +318,8 @@ export default function DashboardOutputs({
       group === "sekolah" ? dayCounts.pmBesarSekolah : dayCounts.pmBesar3B,
       group === "sekolah" ? dayCounts.pmKecilSekolah : dayCounts.pmKecil3B,
       dayData.bufferPct,
-      tkpiList
+      tkpiList,
+      dayData.bumbuPct ?? bumbuPct
     );
 
     // Group items by tkpiId to avoid multiple entries of the same food
@@ -1054,7 +1061,7 @@ export default function DashboardOutputs({
                 id="btn-do-download-pdf"
                 type="button"
                 disabled={!!isDownloading}
-                onClick={() => exportToPDF("print-area-dashboard-rekap", printDocType === "rekap" ? "RAB_10_Hari_Rekap_Gizi" : "Nota_Rincian_Bahan_Hari_" + selectedNotaDay, printScale, setIsDownloading)}
+                onClick={() => exportToPDF("print-area-dashboard-rekap", printDocType === "rekap" ? `RAB_${totalDays}_Hari_Rekap_Gizi` : "Nota_Rincian_Bahan_Hari_" + selectedNotaDay, printScale, setIsDownloading, { paperSize, orientation: "auto" })}
                 className="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow-xs flex items-center gap-1.5 transition"
               >
                 <Download className="w-4 h-4" />
@@ -1065,7 +1072,7 @@ export default function DashboardOutputs({
                 id="btn-do-download-img"
                 type="button"
                 disabled={!!isDownloading}
-                onClick={() => downloadElementAsImage("print-area-dashboard-rekap", printDocType === "rekap" ? "RAB_10_Hari_Rekap_Gizi" : "Nota_Rincian_Bahan_Hari_" + selectedNotaDay, setIsDownloading)}
+                onClick={() => downloadElementAsImage("print-area-dashboard-rekap", printDocType === "rekap" ? `RAB_${totalDays}_Hari_Rekap_Gizi` : "Nota_Rincian_Bahan_Hari_" + selectedNotaDay, setIsDownloading)}
                 className="bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow-xs flex items-center gap-1.5 transition"
               >
                 <ImageIcon className="w-4 h-4" />
@@ -1075,7 +1082,7 @@ export default function DashboardOutputs({
               <button
                 id="btn-do-print"
                 type="button"
-                onClick={() => window.print()}
+                onClick={() => printElementSmart("print-area-dashboard-rekap", { title: printDocType === "rekap" ? `RAB ${totalDays} Hari & Rekap Gizi` : `Nota Rincian Bahan Hari ${selectedNotaDay}`, paperSize, orientation: "auto" })}
                 className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow-xs flex items-center gap-1.5 transition"
               >
                 <Printer className="w-4 h-4" />
@@ -1127,48 +1134,22 @@ export default function DashboardOutputs({
         <div className="bg-slate-100 p-6 rounded-2xl border border-slate-300 shadow-inner flex justify-center overflow-x-auto print:bg-transparent print:p-0 print:border-none print:shadow-none">
           <div 
             id="print-area-dashboard-rekap" 
-            style={{ zoom: `${printScale}%` }}
-            className="bg-white p-8 border border-slate-400 shadow-md w-full max-w-[210mm] min-w-[210mm] font-sans text-slate-950 print:text-black print:border-none print:shadow-none print:p-0 print:m-0 space-y-8"
+            style={{ zoom: `${printScale}%`, fontFamily: "Arial, Helvetica, sans-serif" }}
+            className="bg-white p-8 border border-slate-400 shadow-md w-full max-w-[210mm] min-w-[210mm] text-slate-950 print:text-black print:border-none print:shadow-none print:p-0 print:m-0 space-y-8"
           >
-              {/* Kop Surat Header */}
-              <div className="relative flex items-center justify-between pb-3 border-b-2 border-black w-full" style={{ minHeight: '90px' }}>
-                {/* Left Logo */}
-                <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                  <img 
-                    src={leftLogo} 
-                    alt="Logo Kiri" 
-                    className="w-16 h-16 object-contain" 
-                    referrerPolicy="no-referrer"
-                    onError={(e) => {
-                      (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
-                    }}
-                  />
-                </div>
-
-                {/* Centered Kop Text */}
-                <div className="text-center font-sans tracking-wide leading-snug px-4 flex-1">
-                  <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none" style={{ fontSize: '14pt' }}>{kopLine1}</div>
-                  <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine2}</div>
-                  <div className="font-bold uppercase text-slate-950 print:text-black font-sans leading-none mt-1" style={{ fontSize: '13pt' }}>{kopLine3}</div>
-                  <div className="italic text-slate-800 print:text-black font-sans mt-1.5" style={{ fontSize: '10pt' }}>{kopLine4}</div>
-                </div>
-
-                {/* Right Logo */}
-                <div className="flex flex-col items-center justify-center w-20 h-20 shrink-0 relative">
-                  {rightLogo ? (
-                    <img 
-                      src={rightLogo} 
-                      alt="Logo Kanan" 
-                      className="w-16 h-16 object-contain" 
-                      referrerPolicy="no-referrer"
-                    />
-                  ) : (
-                    <div className="w-16 h-16 border border-dashed border-slate-300 rounded flex items-center justify-center text-[8px] text-slate-400 font-bold uppercase no-print">
-                      Logo Kanan
-                    </div>
-                  )}
-                </div>
-              </div>
+              {/* Kop Surat Terpusat SPPG */}
+              <KopSuratRenderHeader
+                kopLine1={kopLine1}
+                kopLine2={kopLine2}
+                kopLine3={kopLine3}
+                kopLine4={kopLine4}
+                leftLogo={leftLogo}
+                rightLogo={rightLogo}
+                leftLogoCrop={leftLogoCrop}
+                rightLogoCrop={rightLogoCrop}
+                kopConfig={kopConfig}
+                docKey="dashboard"
+              />
 
               {printDocType === "rekap" ? (
                 <div className="space-y-6">
@@ -1328,6 +1309,7 @@ export default function DashboardOutputs({
           filename={printDocType === "rekap" ? `RAB_${totalDays}_Hari_Rekap_Gizi` : `Nota_Rincian_Bahan_Hari_${selectedNotaDay}`}
           defaultScale={printScale}
           defaultPaperSize={paperSize}
+          defaultOrientation="auto"
         />
       </div>
   );

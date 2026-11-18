@@ -4,13 +4,13 @@
  */
 
 import React, { useState } from "react";
-import { TKPIItem, CekGiziInput } from "../types";
+import { TKPIItem, CekGiziInput, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import { Sparkles, Plus, Trash2, ArrowUpRight, Scale, Activity, Settings, Sliders, ChevronDown, ChevronUp, Printer, Download, Image as ImageIcon, Eye } from "lucide-react";
 import SearchableTkpiDropdown from "./SearchableTkpiDropdown";
-import { downloadElementAsImage, exportToPDF } from "../lib/printUtils";
+import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 
-import KopSuratConfigSection, { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import PrintPreviewModal from "./PrintPreviewModal";
 
 interface CekGiziTabProps {
@@ -35,6 +35,7 @@ interface CekGiziTabProps {
   setRightLogoCrop?: (val: LogoCrop) => void;
   paperSize?: "A4" | "F4";
   setPaperSize?: (val: "A4" | "F4") => void;
+  kopConfig?: UnifiedKopConfig;
   isAdmin?: boolean;
 }
 
@@ -59,7 +60,8 @@ export default function CekGiziTab({
   rightLogoCrop = { top: 0, bottom: 0, left: 0, right: 0 },
   setRightLogoCrop = () => {},
   paperSize = "A4",
-  setPaperSize = () => {}
+  setPaperSize = () => {},
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG
 }: CekGiziTabProps) {
   const [rujukanAkgType, setRujukanAkgType] = useState<string>("sd_besar");
   const [customRujukanAkg, setCustomRujukanAkg] = useState<number>(700); // kkal
@@ -534,7 +536,7 @@ export default function CekGiziTab({
                   id="btn-cg-export-pdf"
                   type="button"
                   disabled={!!isDownloading}
-                  onClick={() => exportToPDF("print-area-cek-gizi", "Laporan_Kandungan_Gizi_Sandbox", 100, setIsDownloading)}
+                  onClick={() => exportToPDF("print-area-cek-gizi", "Laporan_Kandungan_Gizi_Sandbox", 100, setIsDownloading, { paperSize, orientation: "auto" })}
                   className="bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow-xs flex items-center gap-1.5 transition"
                 >
                   <Download className="w-4 h-4" />
@@ -553,11 +555,11 @@ export default function CekGiziTab({
                 <button
                   id="btn-cg-print"
                   type="button"
-                  onClick={() => window.print()}
+                  onClick={() => printElementSmart("print-area-cek-gizi", { title: "Laporan Analisis Kandungan Gizi", paperSize, orientation: "auto" })}
                   className="bg-indigo-600 hover:bg-indigo-700 text-white px-3.5 py-2 rounded-xl text-xs font-bold shadow-xs flex items-center gap-1.5 transition"
                 >
                   <Printer className="w-4 h-4" />
-                  Cetak / Simpan PDF (A4 Portrait)
+                  Cetak / Simpan PDF ({paperSize})
                 </button>
               </div>
             </div>
@@ -605,58 +607,22 @@ export default function CekGiziTab({
           <div className="bg-slate-100 p-6 rounded-2xl border border-slate-300 shadow-inner flex justify-center overflow-x-auto print:bg-transparent print:p-0 print:border-none print:shadow-none">
             <div 
               id="print-area-cek-gizi" 
-              className="bg-white p-8 border border-slate-400 shadow-md w-full max-w-[210mm] min-w-[210mm] font-sans text-slate-950 print:text-black print:border-none print:shadow-none print:p-0 print:m-0 space-y-8"
+              className="bg-white p-8 border border-slate-400 shadow-md w-full max-w-[210mm] min-w-[210mm] text-slate-950 print:text-black print:border-none print:shadow-none print:p-0 print:m-0 space-y-6"
+              style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
             >
-              {/* Kop Surat Header (GiziSync - Sistem Informasi Pemantauan Status Gizi) */}
-              <div className="flex items-center justify-between pb-4 border-b-2 border-slate-300 w-full select-none" style={{ minHeight: '90px' }}>
-                {/* Left Section: Doctor Profile and Brand */}
-                <div className="flex items-center gap-3">
-                  {/* Doctor Profile Rounded Card */}
-                  <div className="w-[150px] h-[70px] bg-white border border-slate-200 rounded-xl shadow-xs relative flex items-center justify-end overflow-hidden p-1 shrink-0">
-                    {/* The cropped white card effect with doctor photo on the right half */}
-                    <div className="absolute left-0 top-0 h-full w-[45%] bg-white z-0"></div>
-                    <img 
-                      src={leftLogo || "/assets/images/app_logo_sppg.png"} 
-                      alt="Ahli Gizi" 
-                      className="w-14 h-14 rounded-full object-cover border border-slate-100 relative z-10 mr-1.5 bg-white"
-                      referrerPolicy="no-referrer"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
-                      }}
-                    />
-                  </div>
-                  
-                  {/* GiziSync Brand Text */}
-                  <div className="flex flex-col text-left font-sans leading-tight">
-                    <span className="text-[#0D6D41] font-extrabold text-[15px] tracking-wide uppercase">GiziSync</span>
-                    <span className="text-[#626FFF] text-[8px] font-extrabold tracking-wider uppercase">Nutrition, Synchronized</span>
-                  </div>
-                </div>
-
-                {/* Center Section: Main Header Text */}
-                <div className="text-center font-sans px-4 flex-1 flex flex-col justify-center items-center">
-                  <div className="font-extrabold text-[#0D6D41] font-sans leading-tight text-center max-w-sm" style={{ fontSize: '13pt', letterSpacing: '0.02em' }}>
-                    SISTEM INFORMASI PEMANTAUAN STATUS GIZI
-                  </div>
-                  <div className="text-[#626FFF] font-medium font-sans mt-1 text-center" style={{ fontSize: '9pt' }}>
-                    Sesuai format standar lampiran PMK No. 2 Tahun 2020.
-                  </div>
-                </div>
-
-                {/* Right Section: Creator and WA Info */}
-                <div className="flex flex-col items-end text-right font-sans shrink-0">
-                  <span className="text-[#1F87C0] font-black text-[13px] tracking-wide uppercase leading-none">GiziSync</span>
-                  <span className="text-slate-800 font-bold text-[10px] mt-1 leading-none">Syukri Odhe | Ahli Gizi</span>
-                  <a 
-                    href="https://wa.me/6282271095251" 
-                    target="_blank" 
-                    rel="noopener noreferrer" 
-                    className="text-[#1F87C0] font-semibold text-[9px] mt-1 hover:underline leading-none"
-                  >
-                    (WA_0822-7109-5251)
-                  </a>
-                </div>
-              </div>
+              {/* Kop Surat Terpusat SPPG (Serentak seluruh lembar kerja) */}
+              <KopSuratRenderHeader
+                kopLine1={kopLine1}
+                kopLine2={kopLine2}
+                kopLine3={kopLine3}
+                kopLine4={kopLine4}
+                leftLogo={leftLogo}
+                rightLogo={rightLogo}
+                leftLogoCrop={leftLogoCrop}
+                rightLogoCrop={rightLogoCrop}
+                kopConfig={kopConfig}
+                docKey="cekgizi"
+              />
 
               {/* Title */}
               <div className="text-center space-y-1">
@@ -743,7 +709,7 @@ export default function CekGiziTab({
         filename="Laporan_Kandungan_Gizi_Sandbox"
         defaultScale={100}
         defaultPaperSize={paperSize as "A4" | "F4"}
-        defaultOrientation="portrait"
+        defaultOrientation="auto"
       />
     </div>
   );

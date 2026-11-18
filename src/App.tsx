@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM } from "./types";
+import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "./types";
 import { 
   INITIAL_SPPG_PROFILE, 
   INITIAL_SEKOLAH_PM, 
@@ -102,7 +102,7 @@ import {
 import { doc, getDoc, onSnapshot, setDoc } from "firebase/firestore";
 
 const DEFAULT_FALLBACK_LOGO = "/assets/images/app_logo_sppg.png";
-const GLOBAL_LOGO_SCHEMA_VERSION = 2;
+const GLOBAL_LOGO_SCHEMA_VERSION = 3;
 const GLOBAL_LOGO_VERSION_KEY = "sisper_global_app_logo_version";
 
 const normalizeAppLogoUrl = (url?: string | null): string => {
@@ -112,7 +112,14 @@ const normalizeAppLogoUrl = (url?: string | null): string => {
   return url;
 };
 
-const readCachedGlobalLeftLogo = (): string => {
+const sanitizeKopLogoUrl = (url?: string | null): string => {
+  if (!url || !url.trim() || url === "/src/assets/images/logo_sppg_1782256222616.jpg") {
+    return "";
+  }
+  return url;
+};
+
+const readCachedGlobalAppLogo = (): string => {
   try {
     if (localStorage.getItem(GLOBAL_LOGO_VERSION_KEY) === String(GLOBAL_LOGO_SCHEMA_VERSION)) {
       return normalizeAppLogoUrl(localStorage.getItem("sisper_global_app_logo"));
@@ -219,15 +226,12 @@ export default function App() {
   }, [activeTab]);
   const [tkpiSearchQuery, setTkpiSearchQuery] = useState<string>("");
 
-  // Global App Logo (Left) controlled by Admin / Panel Admin holders and automatically followed by Login screen & all users
-  const [globalAppLogo, setGlobalAppLogo] = useState<string>(() => readCachedGlobalLeftLogo());
-  const [globalRightLogo, setGlobalRightLogo] = useState<string>(() => {
-    return localStorage.getItem("sisper_global_app_logo_right") || "";
-  });
+  // Global App Brand Logo (Header & Login screen) — strictly controlled by Admin only, NEVER altered by Profil SPPG KOP settings
+  const [globalAppLogo, setGlobalAppLogo] = useState<string>(() => readCachedGlobalAppLogo());
 
-  const [customLogo, setCustomLogo] = useState<string>(() => readCachedGlobalLeftLogo());
+  const [customLogo, setCustomLogo] = useState<string>(() => sanitizeKopLogoUrl(localStorage.getItem("kop_left_logo")));
 
-  // State untuk penyesuaian/pemotongan logo profil
+  // State untuk penyesuaian/pemotongan logo header aplikasi (Khusus Admin)
   const [isCropModalOpen, setIsCropModalOpen] = useState(false);
   const [cropImageSrc, setCropImageSrc] = useState<string>("");
   const [cropImageRatio, setCropImageRatio] = useState<number>(1);
@@ -237,13 +241,13 @@ export default function App() {
   const [cropDragging, setCropDragging] = useState(false);
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
 
-  // Synchronized KOP Surat, Logos, Logo Crop & Paper Size
+  // Synchronized KOP Surat, Logos, Logo Crop & Paper Size (Per-user SPPG KOP — completely independent from Header App Brand Logo)
   const [kopLine1, setKopLine1] = useState(() => localStorage.getItem("kop_line1") || "BADAN GIZI NASIONAL");
   const [kopLine2, setKopLine2] = useState(() => localStorage.getItem("kop_line2") || "SATUAN PELAYANAN PEMENUHAN GIZI");
   const [kopLine3, setKopLine3] = useState(() => localStorage.getItem("kop_line3") || "");
   const [kopLine4, setKopLine4] = useState(() => localStorage.getItem("kop_line4") || "");
-  const [kopLeftLogo, setKopLeftLogo] = useState(() => readCachedGlobalLeftLogo());
-  const [kopRightLogo, setKopRightLogo] = useState(() => localStorage.getItem("sisper_global_app_logo_right") || localStorage.getItem("kop_right_logo") || "");
+  const [kopLeftLogo, setKopLeftLogo] = useState(() => sanitizeKopLogoUrl(localStorage.getItem("kop_left_logo")));
+  const [kopRightLogo, setKopRightLogo] = useState(() => sanitizeKopLogoUrl(localStorage.getItem("kop_right_logo")));
   
   const [leftLogoCrop, setLeftLogoCrop] = useState(() => {
     const saved = localStorage.getItem("kop_left_logo_crop");
@@ -290,6 +294,44 @@ export default function App() {
       porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"]
     };
   });
+
+  // Centralized KOP & Logo synchronization config (synced to Cloud per user)
+  const [kopConfig, setKopConfig] = useState<UnifiedKopConfig>(() => {
+    try {
+      const saved = localStorage.getItem("sisper_kop_config");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        return {
+          ...DEFAULT_UNIFIED_KOP_CONFIG,
+          ...parsed,
+          linkedDocs: {
+            ...DEFAULT_UNIFIED_KOP_CONFIG.linkedDocs,
+            ...(parsed?.linkedDocs || {}),
+          },
+        };
+      }
+    } catch {}
+    return DEFAULT_UNIFIED_KOP_CONFIG;
+  });
+
+  // Global Custom Bumbu % for Food Cost & Nota Logistik (default 10%)
+  const [bumbuPct, setBumbuPct] = useState<number>(() => {
+    try {
+      const saved = localStorage.getItem("sisper_bumbu_pct");
+      if (saved !== null) {
+        const num = parseFloat(saved);
+        if (Number.isFinite(num) && num >= 0) return num;
+      }
+    } catch {}
+    return 10;
+  });
+
+  const userHasCustomLeftLogoRef = React.useRef<boolean>(false);
+  const userHasCustomRightLogoRef = React.useRef<boolean>(false);
+
+  // Welcome banner auto-hide after 10 seconds on login
+  const [showWelcomeBanner, setShowWelcomeBanner] = useState<boolean>(true);
+  const [autoArchiveToast, setAutoArchiveToast] = useState<string | null>(null);
 
   const { 
     user, 
@@ -398,6 +440,19 @@ export default function App() {
         user.uid === "admin_sukriyusuf82"
       : false;
 
+  // Auto-hide Welcome Banner 10 seconds after login
+  useEffect(() => {
+    if (!user?.uid) {
+      setShowWelcomeBanner(false);
+      return;
+    }
+    setShowWelcomeBanner(true);
+    const hideTimer = setTimeout(() => {
+      setShowWelcomeBanner(false);
+    }, 10000);
+    return () => clearTimeout(hideTimer);
+  }, [user?.uid]);
+
   // Real-time Global Logo & TKPI 2020 subscriptions (always active across Login screen and all user accounts)
   useEffect(() => {
     const logoDocRef = doc(db, "configs", "app_logo");
@@ -407,19 +462,11 @@ export default function App() {
       const primaryLogo = hasCurrentSchema
         ? normalizeAppLogoUrl(data?.url)
         : DEFAULT_FALLBACK_LOGO;
-      const rightLogoVal = data?.rightUrl ?? "";
 
+      // Update ONLY the global app brand logo (Header & Login) — NEVER overwrite per-user Profil SPPG KOP logos
       setGlobalAppLogo(primaryLogo);
-      setGlobalRightLogo(rightLogoVal);
-      setCustomLogo(primaryLogo);
-      setKopLeftLogo(primaryLogo);
-      setKopRightLogo(rightLogoVal);
       localStorage.setItem("sisper_global_app_logo", primaryLogo);
-      localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
       localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
-      localStorage.setItem("sisper_custom_logo", primaryLogo);
-      localStorage.setItem("kop_left_logo", primaryLogo);
-      localStorage.setItem("kop_right_logo", rightLogoVal);
     }, (error) => {
       console.warn("Gagal berlangganan logo global dari awan:", error);
     });
@@ -451,17 +498,6 @@ export default function App() {
       unsubscribeTkpi();
     };
   }, []);
-
-  // Keep global logo reflected for all non-admin users if globalAppLogo changes
-  useEffect(() => {
-    if (globalAppLogo) {
-      setCustomLogo(globalAppLogo);
-      setKopLeftLogo(globalAppLogo);
-    }
-    if (globalRightLogo !== undefined) {
-      setKopRightLogo(globalRightLogo);
-    }
-  }, [globalAppLogo, globalRightLogo]);
 
   // Tenant State Loader: strict empty isolation for every new user & demo separation
   useEffect(() => {
@@ -528,6 +564,10 @@ export default function App() {
             cloudCekGiziItems,
             cloudSavedPeriods,
             cloudPmSettings,
+            cloudKopConfig,
+            cloudKopLeftLogo,
+            cloudKopRightLogo,
+            cloudBumbuPct,
             globalLogoSnap
           ] = await Promise.all([
             loadStateFromCloud("profile"),
@@ -544,12 +584,16 @@ export default function App() {
             loadStateFromCloud("cekGiziItems"),
             loadStateFromCloud("savedPeriods"),
             loadStateFromCloud("pmSettings"),
+            loadStateFromCloud("kopConfig"),
+            loadStateFromCloud("kopLeftLogo"),
+            loadStateFromCloud("kopRightLogo"),
+            loadStateFromCloud("bumbuPct"),
             getDoc(doc(db, "configs", "app_logo")).catch(() => null)
           ]);
 
           if (cancelled) return;
 
-          // Apply latest Global Admin Left Logo to all users & upgrade legacy logo records to v2
+          // Apply Admin-controlled Global App Brand Logo strictly for Header & Login screen (independent of SPPG KOP logos)
           const logoData = globalLogoSnap && globalLogoSnap.exists() ? globalLogoSnap.data() : null;
           const hasCurrentLogoSchema = Boolean(
             logoData && (logoData.schemaVersion ?? 0) >= GLOBAL_LOGO_SCHEMA_VERSION
@@ -557,18 +601,49 @@ export default function App() {
           const primaryLogo = hasCurrentLogoSchema
             ? normalizeAppLogoUrl(logoData?.url)
             : DEFAULT_FALLBACK_LOGO;
-          const rightLogoVal = logoData?.rightUrl ?? "";
 
           setGlobalAppLogo(primaryLogo);
-          setGlobalRightLogo(rightLogoVal);
-          setCustomLogo(primaryLogo);
-          setKopLeftLogo(primaryLogo);
-          setKopRightLogo(rightLogoVal);
           localStorage.setItem("sisper_global_app_logo", primaryLogo);
-          localStorage.setItem("sisper_global_app_logo_right", rightLogoVal);
           localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
-          localStorage.setItem("sisper_custom_logo", primaryLogo);
-          localStorage.setItem("kop_left_logo", primaryLogo);
+
+          // Resolve user's SPPG KOP Left & Right logos strictly from user's own cloud states
+          const resolvedLeftLogo =
+            typeof cloudKopLeftLogo === "string" ? sanitizeKopLogoUrl(cloudKopLeftLogo) : "";
+          userHasCustomLeftLogoRef.current = Boolean(resolvedLeftLogo);
+
+          const resolvedRightLogo =
+            typeof cloudKopRightLogo === "string" ? sanitizeKopLogoUrl(cloudKopRightLogo) : "";
+          userHasCustomRightLogoRef.current = Boolean(resolvedRightLogo);
+
+          setCustomLogo(resolvedLeftLogo);
+          setKopLeftLogo(resolvedLeftLogo);
+          setKopRightLogo(resolvedRightLogo);
+          localStorage.setItem("sisper_custom_logo", resolvedLeftLogo);
+          localStorage.setItem("kop_left_logo", resolvedLeftLogo);
+          localStorage.setItem("kop_right_logo", resolvedRightLogo);
+
+          if (cloudKopConfig && typeof cloudKopConfig === "object") {
+            const mergedKopConfig: UnifiedKopConfig = {
+              ...DEFAULT_UNIFIED_KOP_CONFIG,
+              ...cloudKopConfig,
+              linkedDocs: {
+                ...DEFAULT_UNIFIED_KOP_CONFIG.linkedDocs,
+                ...(cloudKopConfig.linkedDocs || {}),
+              },
+            };
+            setKopConfig(mergedKopConfig);
+            localStorage.setItem("sisper_kop_config", JSON.stringify(mergedKopConfig));
+          } else {
+            setKopConfig(DEFAULT_UNIFIED_KOP_CONFIG);
+          }
+
+          if (cloudBumbuPct !== null && cloudBumbuPct !== undefined && Number.isFinite(Number(cloudBumbuPct))) {
+            const parsedBumbu = Math.max(0, Number(cloudBumbuPct));
+            setBumbuPct(parsedBumbu);
+            localStorage.setItem("sisper_bumbu_pct", String(parsedBumbu));
+          } else {
+            setBumbuPct(10);
+          }
 
           if (!hasCurrentLogoSchema && isAdminUser) {
             setDoc(
@@ -737,9 +812,13 @@ export default function App() {
       setKopLine2("SATUAN PELAYANAN PEMENUHAN GIZI");
       setKopLine3("");
       setKopLine4("");
-      setCustomLogo(globalAppLogo || DEFAULT_FALLBACK_LOGO);
-      setKopLeftLogo(globalAppLogo || DEFAULT_FALLBACK_LOGO);
-      setKopRightLogo(globalRightLogo || "");
+      userHasCustomLeftLogoRef.current = false;
+      userHasCustomRightLogoRef.current = false;
+      setCustomLogo("");
+      setKopLeftLogo("");
+      setKopRightLogo("");
+      setKopConfig(DEFAULT_UNIFIED_KOP_CONFIG);
+      setBumbuPct(10);
       setCekGiziItems([]);
       setSavedPeriods([]);
       setPmSettings({
@@ -792,6 +871,8 @@ export default function App() {
         cekGiziItems: JSON.stringify(cekGiziItems),
         savedPeriods: JSON.stringify(savedPeriods),
         pmSettings: JSON.stringify(pmSettings),
+        kopConfig: JSON.stringify(kopConfig),
+        bumbuPct: JSON.stringify(bumbuPct),
       };
     }
   }, [canAutoSyncCloud, user?.uid]);
@@ -938,6 +1019,20 @@ export default function App() {
     const timer = scheduleCloudSaveIfChanged("pmSettings", pmSettings);
     return () => { if (timer) clearTimeout(timer); };
   }, [user, pmSettings, canAutoSyncCloud]);
+
+  useEffect(() => {
+    if (!user) return;
+    localStorage.setItem("sisper_kop_config", JSON.stringify(kopConfig));
+    const timer = scheduleCloudSaveIfChanged("kopConfig", kopConfig);
+    return () => { if (timer) clearTimeout(timer); };
+  }, [user, kopConfig, canAutoSyncCloud]);
+
+  useEffect(() => {
+    if (!user) return;
+    localStorage.setItem("sisper_bumbu_pct", String(bumbuPct));
+    const timer = scheduleCloudSaveIfChanged("bumbuPct", bumbuPct);
+    return () => { if (timer) clearTimeout(timer); };
+  }, [user, bumbuPct, canAutoSyncCloud]);
 
   // Recipient totals (using Day 1 as default baseline display)
   const defaultDayCounts = getCountsForDay(harianPM, 1);
@@ -1171,15 +1266,16 @@ export default function App() {
 
   const handleLogoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = "";
     if (!file) return;
 
     if (!isAdminUser) {
-      alert("Hanya Administrator atau pemilik akses Panel Admin yang memiliki wewenang untuk mengubah logo aplikasi!");
+      showTkpiNotice("error", "Hanya Administrator yang memiliki wewenang untuk mengubah logo utama aplikasi di header.");
       return;
     }
 
     if (file.size > 10 * 1024 * 1024) {
-      alert("Ukuran berkas terlalu besar. Silakan pilih berkas di bawah 10 MB.");
+      showTkpiNotice("error", "Ukuran berkas terlalu besar. Silakan pilih gambar di bawah 10 MB.");
       return;
     }
 
@@ -1200,7 +1296,7 @@ export default function App() {
       reader.readAsDataURL(file);
     } catch (err) {
       console.error("Gagal memuat gambar untuk dipotong:", err);
-      alert("Gagal memuat gambar. Silakan coba gambar lain.");
+      showTkpiNotice("error", "Gagal memuat gambar. Silakan coba gambar lain.");
     }
   };
 
@@ -1275,24 +1371,22 @@ export default function App() {
 
         const compressedBase64 = canvas.toDataURL("image/jpeg", 0.85);
         if (compressedBase64 && isAdminUser) {
+          // Update ONLY the Admin-controlled Global App Brand Logo (Header & Login) — NEVER touch Profil SPPG KOP logos
           setGlobalAppLogo(compressedBase64);
-          setCustomLogo(compressedBase64);
-          setKopLeftLogo(compressedBase64);
           localStorage.setItem("sisper_global_app_logo", compressedBase64);
           localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
-          localStorage.setItem("sisper_custom_logo", compressedBase64);
-          localStorage.setItem("kop_left_logo", compressedBase64);
 
           try {
-            // Write left/main app logo directly to configs/app_logo for automatic sync to Login screen & all users
             await setDoc(doc(db, "configs", "app_logo"), {
               url: compressedBase64,
               schemaVersion: GLOBAL_LOGO_SCHEMA_VERSION,
               updatedBy: user?.email || "Admin SISPERMBG",
               updatedAt: new Date().toISOString()
             }, { merge: true });
+            showTkpiNotice("success", "Logo header utama aplikasi berhasil diperbarui oleh Admin.");
           } catch (err) {
             console.warn("Gagal memperbarui logo global di Firestore:", err);
+            showTkpiNotice("error", "Gagal menyimpan logo header aplikasi ke cloud.");
           }
         }
       }
@@ -1301,45 +1395,132 @@ export default function App() {
     img.src = cropImageSrc;
   };
 
-  const handleUpdateLeftLogo = async (newLogo: string) => {
+  // Admin-only reset for Header App Brand Logo back to default
+  const handleResetGlobalAppLogo = async () => {
     if (!isAdminUser) return;
-    const normalized = normalizeAppLogoUrl(newLogo);
-    setGlobalAppLogo(normalized);
-    setKopLeftLogo(normalized);
-    setCustomLogo(normalized);
-    localStorage.setItem("sisper_global_app_logo", normalized);
+    setGlobalAppLogo(DEFAULT_FALLBACK_LOGO);
+    localStorage.setItem("sisper_global_app_logo", DEFAULT_FALLBACK_LOGO);
     localStorage.setItem(GLOBAL_LOGO_VERSION_KEY, String(GLOBAL_LOGO_SCHEMA_VERSION));
-    localStorage.setItem("kop_left_logo", normalized);
-    localStorage.setItem("sisper_custom_logo", normalized);
-
     try {
       await setDoc(doc(db, "configs", "app_logo"), {
-        url: normalized,
+        url: DEFAULT_FALLBACK_LOGO,
         schemaVersion: GLOBAL_LOGO_SCHEMA_VERSION,
         updatedBy: user?.email || "Admin SISPERMBG",
         updatedAt: new Date().toISOString()
       }, { merge: true });
+      showTkpiNotice("success", "Logo header utama aplikasi dikembalikan ke standar default.");
     } catch (err) {
-      console.warn("Gagal menyinkronkan logo global ke cloud:", err);
+      console.warn("Gagal mereset logo global di Firestore:", err);
     }
   };
 
-  const handleUpdateRightLogo = async (newLogo: string) => {
-    if (!isAdminUser) return;
-    setGlobalRightLogo(newLogo);
-    setKopRightLogo(newLogo);
-    localStorage.setItem("sisper_global_app_logo_right", newLogo);
-    localStorage.setItem("kop_right_logo", newLogo);
+  // Profil SPPG KOP Left Logo — updates ONLY worksheet KOP Surat & user cloud state, NEVER alters Header App Brand Logo
+  const handleUpdateLeftLogo = async (newLogo: string) => {
+    const cleaned = sanitizeKopLogoUrl(newLogo);
+    userHasCustomLeftLogoRef.current = Boolean(cleaned);
+    setKopLeftLogo(cleaned);
+    setCustomLogo(cleaned);
+    localStorage.setItem("kop_left_logo", cleaned);
+    localStorage.setItem("sisper_custom_logo", cleaned);
 
-    try {
-      await setDoc(doc(db, "configs", "app_logo"), {
-        rightUrl: newLogo,
-        updatedBy: user?.email || "Admin SISPERMBG",
-        updatedAt: new Date().toISOString()
-      }, { merge: true });
-    } catch (err) {
-      console.warn("Gagal menyinkronkan logo kanan global ke cloud:", err);
+    if (canAutoSyncCloud && user?.uid) {
+      saveStateToCloud("kopLeftLogo", cleaned);
     }
+  };
+
+  // Profil SPPG KOP Right Logo — updates ONLY worksheet KOP Surat & user cloud state, NEVER alters Header App Brand Logo
+  const handleUpdateRightLogo = async (newLogo: string) => {
+    const cleaned = sanitizeKopLogoUrl(newLogo);
+    userHasCustomRightLogoRef.current = Boolean(cleaned);
+    setKopRightLogo(cleaned);
+    localStorage.setItem("kop_right_logo", cleaned);
+
+    if (canAutoSyncCloud && user?.uid) {
+      saveStateToCloud("kopRightLogo", cleaned);
+    }
+  };
+
+  // Automatically archive active planning snapshot whenever planning dates change
+  const autoArchiveOnDateChange = (prevProfile: SPPGProfile, nextDates: string[]) => {
+    const prevDates = (prevProfile.periodeDates || []).filter(Boolean);
+    const cleanedNext = (nextDates || []).filter(Boolean);
+    if (prevDates.length === 0 || cleanedNext.length === 0) return;
+    if (prevDates.join(",") === cleanedNext.join(",")) return;
+
+    const hasExistingContent =
+      (foodCostDays || []).some(
+        (d) => (d.porsiBesarBahan?.length || 0) > 0 || (d.porsiKecilBahan?.length || 0) > 0 || Boolean(d.namaMenu)
+      ) ||
+      (masterMenu?.plans || []).some((p) =>
+        (p.days || []).some((day) => Boolean(day?.namaMenu || day?.karbohidrat || day?.laukHewani))
+      ) ||
+      (harianPM || []).some((h) =>
+        (h.sasaran || []).some((s) => (s.porsiKecil || 0) > 0 || (s.porsiBesar || 0) > 0)
+      );
+
+    if (!hasExistingContent) return;
+
+    const formatShort = (iso: string) => {
+      try {
+        return new Date(iso + "T00:00:00").toLocaleDateString("id-ID", {
+          day: "numeric",
+          month: "short",
+          year: "2-digit",
+        });
+      } catch {
+        return iso;
+      }
+    };
+
+    const firstFmt = formatShort(prevDates[0]);
+    const lastFmt = formatShort(prevDates[prevDates.length - 1]);
+    const dateRangeKey = `${prevDates[0]}__${prevDates[prevDates.length - 1]}`;
+    const label =
+      prevDates.length === 1
+        ? `Arsip Otomatis · ${firstFmt}`
+        : `Arsip Otomatis · ${firstFmt} s/d ${lastFmt}`;
+
+    const timestampWib =
+      new Date().toLocaleString("id-ID", {
+        timeZone: "Asia/Jakarta",
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      }) + " WIB";
+
+    const snapshotRecord = {
+      id: `auto_${Date.now()}`,
+      dateRangeKey,
+      namaPeriode: label,
+      createdAt: timestampWib,
+      isAutoArchive: true,
+      profile: JSON.parse(JSON.stringify(prevProfile)),
+      sekolahPM: JSON.parse(JSON.stringify(sekolahPM)),
+      tigaBPM: JSON.parse(JSON.stringify(tigaBPM)),
+      harianPM: JSON.parse(JSON.stringify(harianPM)),
+      masterMenu: JSON.parse(JSON.stringify(masterMenu)),
+      foodCostDays: JSON.parse(JSON.stringify(foodCostDays)),
+    };
+
+    setSavedPeriods((prev) => {
+      // Update existing auto-archive with same date range so we never spam duplicates
+      const existingIdx = prev.findIndex((p: any) => p.dateRangeKey === dateRangeKey && p.isAutoArchive);
+      if (existingIdx >= 0) {
+        const updated = [...prev];
+        updated[existingIdx] = snapshotRecord;
+        return updated;
+      }
+      return [snapshotRecord, ...prev];
+    });
+
+    setAutoArchiveToast(
+      `Perencanaan periode ${firstFmt}${prevDates.length > 1 ? ` s/d ${lastFmt}` : ""} diarsipkan otomatis dan dapat dibuka kembali kapan saja.`
+    );
+    setTimeout(() => {
+      setAutoArchiveToast((cur) => (cur?.includes(firstFmt) ? null : cur));
+    }, 6000);
   };
 
   const buildOdheGiziWhatsAppUrl = (opts?: {
@@ -1685,7 +1866,7 @@ export default function App() {
             <div className="flex flex-col items-center gap-3 w-full">
               <div className="relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-lg bg-white flex items-center justify-center">
                 <img
-                  src={globalAppLogo || customLogo || kopLeftLogo || DEFAULT_FALLBACK_LOGO}
+                  src={globalAppLogo || DEFAULT_FALLBACK_LOGO}
                   alt="Logo GiziSync"
                   className="w-full h-full object-cover"
                   referrerPolicy="no-referrer"
@@ -2066,7 +2247,7 @@ export default function App() {
             <div className="flex items-center gap-4">
               <div className="w-16 h-16 rounded-full overflow-hidden border-2 border-emerald-400 bg-white shrink-0 shadow-md">
                 <img
-                  src={globalAppLogo || customLogo || kopLeftLogo || DEFAULT_FALLBACK_LOGO}
+                  src={globalAppLogo || DEFAULT_FALLBACK_LOGO}
                   alt="Logo SISPERMBG"
                   className="w-full h-full object-cover"
                   referrerPolicy="no-referrer"
@@ -2515,8 +2696,8 @@ export default function App() {
           <div className="flex items-center gap-3.5">
             <div className={`relative shrink-0 w-24 h-24 rounded-full overflow-hidden border-2 border-emerald-400 shadow-lg bg-white ${isAdminUser ? "group cursor-pointer" : ""}`}>
               <img
-                src={globalAppLogo || customLogo || kopLeftLogo || DEFAULT_FALLBACK_LOGO}
-                alt="Logo SPPG"
+                src={globalAppLogo || DEFAULT_FALLBACK_LOGO}
+                alt="Logo Aplikasi SISPERMBG"
                 className="w-full h-full object-cover"
                 referrerPolicy="no-referrer"
                 onError={(e) => {
@@ -2527,10 +2708,12 @@ export default function App() {
                 <>
                   <label
                     htmlFor="logo-uploader"
-                    className="absolute inset-0 bg-slate-950/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center cursor-pointer text-[10px] text-white font-bold"
+                    className="absolute inset-0 bg-slate-950/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center cursor-pointer text-[10px] text-white font-bold text-center px-1"
+                    title="Khusus Admin: Ubah logo utama aplikasi di header & halaman login"
                   >
-                    <Camera className="w-5 h-5 mb-1 text-emerald-400" />
-                    Ubah Logo
+                    <Camera className="w-5 h-5 mb-0.5 text-emerald-400" />
+                    <span>Ubah Logo</span>
+                    <span className="text-[8px] text-emerald-300 font-semibold">(Khusus Admin)</span>
                   </label>
                   <input
                     id="logo-uploader"
@@ -2690,12 +2873,7 @@ export default function App() {
           {/* Minimal info */}
           <div className="hidden lg:flex items-center gap-4 text-xs font-medium text-slate-500">
             <div className="flex items-center gap-1.5">
-              <Calendar className="w-4 h-4 text-slate-400" />
-              <span>Siklus {Math.max(profile.periodeDates?.length || 10, 1)} Hari Kerja Aktif</span>
-            </div>
-            <span className="text-slate-300">|</span>
-            <div className="flex items-center gap-1.5">
-              <Heart className="w-4 h-4 text-rose-500 animate-pulse" />
+              <Heart className="w-4 h-4 text-rose-500" />
               <span>Sesuai Juknis BGN No. 401.1/2025</span>
             </div>
           </div>
@@ -2708,21 +2886,46 @@ export default function App() {
         {isAdminPanelOpen && isAdminUser ? (
           <AdminPanel
             onClose={() => setIsAdminPanelOpen(false)}
-            globalLogoUrl={globalAppLogo || customLogo}
+            globalLogoUrl={globalAppLogo || DEFAULT_FALLBACK_LOGO}
             onUploadGlobalLogo={handleLogoUpload}
+            onResetGlobalLogo={handleResetGlobalAppLogo}
             adminEmail={user?.email || userProfile?.email || ""}
           />
         ) : (
           <>
-            {/* PERSONALIZED ROLE-BASED DASHBOARD BANNER FOR USERS */}
-            {userProfile && (
+            {/* AUTO-ARCHIVE TOAST NOTIFICATION */}
+            {autoArchiveToast && (
+              <div className="mb-4 px-4 py-3 bg-emerald-50 border border-emerald-200 text-emerald-900 rounded-2xl text-xs font-semibold flex items-center justify-between gap-3 shadow-xs no-print">
+                <div className="flex items-center gap-2">
+                  <Archive className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{autoArchiveToast}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAutoArchiveToast(null)}
+                  className="p-1 text-emerald-700 hover:bg-emerald-100 rounded-lg cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
+            {/* PERSONALIZED ROLE-BASED DASHBOARD BANNER (Auto-hides after 10s on login) */}
+            {userProfile && showWelcomeBanner && (
               <div className="mb-6 bg-gradient-to-r from-blue-900 via-indigo-900 to-slate-900 rounded-3xl p-5 md:p-6 text-white shadow-md relative overflow-hidden no-print">
                 <div className="absolute right-0 top-0 w-80 h-80 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
-                <div className="flex flex-col md:flex-row md:items-center justify-between gap-5 relative z-10">
+                <button
+                  type="button"
+                  onClick={() => setShowWelcomeBanner(false)}
+                  title="Tutup sambutan"
+                  className="absolute top-3 right-3 z-20 p-1.5 rounded-xl bg-white/10 hover:bg-white/20 text-white/80 hover:text-white transition cursor-pointer"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+                <div className="flex flex-col md:flex-row md:items-center justify-between gap-5 relative z-10 pr-8">
                   <div className="space-y-1.5">
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 px-3 py-1 rounded-full text-[11px] font-black uppercase tracking-wider flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
                         DASBOR {userProfile.profesi?.toUpperCase() || "PENGAWAS GIZI"}
                       </span>
                       <span className="bg-white/10 text-slate-200 px-3 py-1 rounded-full text-[11px] font-bold">
@@ -2739,7 +2942,7 @@ export default function App() {
                       {userProfile.profesi?.toLowerCase().includes("keuangan") || userProfile.profesi?.toLowerCase().includes("akuntan")
                         ? "Dasbor Anda dikustomisasi khusus untuk Manajemen Keuangan, Rekapitulasi Food Cost, Anggaran Belanja, dan Verifikasi Nota Logistik SPPG."
                         : userProfile.profesi?.toLowerCase().includes("chef") || userProfile.profesi?.toLowerCase().includes("masak") || userProfile.profesi?.toLowerCase().includes("koki")
-                        ? "Dasbor Anda dikustomisasi khusus untuk Operasional Dapur, Master Resep Siklus 10 Hari, Pembagian Gramatur Porsi, dan Nota Pesanan Bahan Baku."
+                        ? "Dasbor Anda dikustomisasi khusus untuk Operasional Dapur, Master Resep Siklus, Pembagian Gramatur Porsi, dan Nota Pesanan Bahan Baku."
                         : userProfile.profesi?.toLowerCase().includes("kepala") || userProfile.profesi?.toLowerCase().includes("pimpinan") || userProfile.profesi?.toLowerCase().includes("manager")
                         ? "Dasbor Pengawasan Executive SPPG: Monitoring Realisasi Anggaran, Kepatuhan Juknis BGN 2025, dan Status Penerima Manfaat."
                         : userProfile.profesi?.toLowerCase().includes("kesehatan") || userProfile.profesi?.toLowerCase().includes("pengawas")
@@ -2789,6 +2992,8 @@ export default function App() {
                   setLeftLogoCrop={setLeftLogoCrop}
                   rightLogoCrop={rightLogoCrop}
                   setRightLogoCrop={setRightLogoCrop}
+                  kopConfig={kopConfig}
+                  bumbuPct={bumbuPct}
                   paperSize={paperSize}
                   setPaperSize={setPaperSize}
                   isAdmin={isAdminUser}
@@ -2819,6 +3024,8 @@ export default function App() {
             setLeftLogoCrop={setLeftLogoCrop}
             rightLogoCrop={rightLogoCrop}
             setRightLogoCrop={setRightLogoCrop}
+            kopConfig={kopConfig}
+            bumbuPct={bumbuPct}
             paperSize={paperSize}
             setPaperSize={setPaperSize}
             isAdmin={isAdminUser}
@@ -2838,6 +3045,11 @@ export default function App() {
             activeSekolahPM={sekolahPM}
             activeTigaBPM={tigaBPM}
             kopLines={[kopLine1, kopLine2, kopLine3, kopLine4]}
+            leftLogo={kopLeftLogo}
+            rightLogo={kopRightLogo}
+            kopConfig={kopConfig}
+            paperSize={paperSize}
+            bumbuPct={bumbuPct}
             userEmail={user?.email}
             isDemo={isDemoUser}
           />
@@ -2864,19 +3076,22 @@ export default function App() {
               setMasterMenu(period.masterMenu);
               setFoodCostDays(period.foodCostDays);
             }}
-            startNewPeriod={() => {
-              // Create clean blank state
-              setProfile({
-                ...profile,
-                periodeDates: Array.from({ length: 10 }, () => ""),
-                awalPeriodeBerikutnya: ""
-              });
-              setSekolahPM([]);
-              setTigaBPM([]);
-              setHarianPM(EMPTY_HARIAN_PM);
-              setMasterMenu(EMPTY_MASTER_MENU);
-              setFoodCostDays(EMPTY_FOOD_COST_DAYS);
-            }}
+            kopLine1={kopLine1}
+            setKopLine1={setKopLine1}
+            kopLine2={kopLine2}
+            setKopLine2={setKopLine2}
+            kopLine3={kopLine3}
+            setKopLine3={setKopLine3}
+            kopLine4={kopLine4}
+            setKopLine4={setKopLine4}
+            leftLogo={kopLeftLogo}
+            setLeftLogo={handleUpdateLeftLogo}
+            rightLogo={kopRightLogo}
+            setRightLogo={handleUpdateRightLogo}
+            kopConfig={kopConfig}
+            setKopConfig={setKopConfig}
+            paperSize={paperSize}
+            setPaperSize={setPaperSize}
           />
         )}
 
@@ -2903,6 +3118,7 @@ export default function App() {
             setLeftLogoCrop={setLeftLogoCrop}
             rightLogoCrop={rightLogoCrop}
             setRightLogoCrop={setRightLogoCrop}
+            kopConfig={kopConfig}
             paperSize={paperSize}
             setPaperSize={setPaperSize}
             isAdmin={isAdminUser}
@@ -2915,6 +3131,7 @@ export default function App() {
             onChange={setMasterMenu} 
             profile={profile}
             onProfileChange={(updatedProfile) => {
+              autoArchiveOnDateChange(profile, updatedProfile.periodeDates || []);
               setProfile(updatedProfile);
               const targetDays = updatedProfile.periodeDates?.length || 0;
               if (targetDays > harianPM.length) {
@@ -2930,6 +3147,7 @@ export default function App() {
               }
             }}
             onSendToFoodCost={(updatedMenu, dates) => {
+              autoArchiveOnDateChange(profile, dates);
               const normMenu = ensureMasterMenuPlans(updatedMenu, dates);
               const targetDays = Math.max(dates.length, 1);
 
@@ -3025,6 +3243,7 @@ export default function App() {
             setLeftLogoCrop={setLeftLogoCrop}
             rightLogoCrop={rightLogoCrop}
             setRightLogoCrop={setRightLogoCrop}
+            kopConfig={kopConfig}
             paperSize={paperSize}
             setPaperSize={setPaperSize}
             isAdmin={isAdminUser}
@@ -3056,6 +3275,9 @@ export default function App() {
             setLeftLogoCrop={setLeftLogoCrop}
             rightLogoCrop={rightLogoCrop}
             setRightLogoCrop={setRightLogoCrop}
+            kopConfig={kopConfig}
+            bumbuPct={bumbuPct}
+            setBumbuPct={setBumbuPct}
             paperSize={paperSize}
             setPaperSize={setPaperSize}
             pmSettings={pmSettings}
@@ -3087,6 +3309,7 @@ export default function App() {
             setLeftLogoCrop={setLeftLogoCrop}
             rightLogoCrop={rightLogoCrop}
             setRightLogoCrop={setRightLogoCrop}
+            kopConfig={kopConfig}
             paperSize={paperSize}
             setPaperSize={setPaperSize}
             isAdmin={isAdminUser}
@@ -3885,8 +4108,8 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <Camera className="w-5 h-5 text-emerald-600" />
                 <div>
-                  <h3 className="font-extrabold text-slate-800 text-sm">Sesuaikan Foto Profil</h3>
-                  <p className="text-[10px] text-slate-400">Atur ukuran & letak logo SPPG</p>
+                  <h3 className="font-extrabold text-slate-800 text-sm">Sesuaikan Logo Header Aplikasi (Khusus Admin)</h3>
+                  <p className="text-[10px] text-slate-400">Hanya mengubah logo aplikasi di header &amp; layar login (tidak mengubah KOP surat)</p>
                 </div>
               </div>
               <button

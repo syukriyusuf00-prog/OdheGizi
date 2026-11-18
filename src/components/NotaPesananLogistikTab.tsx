@@ -4,17 +4,17 @@
  */
 
 import React, { useState, useEffect, useMemo, useCallback } from "react";
-import { SPPGProfile, HariPM, FoodCostDay, TKPIItem, MasterMenu } from "../types";
+import { SPPGProfile, HariPM, FoodCostDay, TKPIItem, MasterMenu, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 import { calculateDay, getCountsForDay, formatRupiah } from "../utils/calc";
 
 const formatThousandSeparator = (val: number) => {
   return new Intl.NumberFormat("id-ID").format(Math.round(val || 0));
 };
-import { Printer, Download, RefreshCw, Plus, Trash2, Calendar, FileText, Check, Combine, Eye, EyeOff, Maximize2, Minimize2, Sparkles } from "lucide-react";
+import { Printer, Download, RefreshCw, Plus, Trash2, Calendar, FileText, Check, Combine, Eye, EyeOff, Maximize2, Minimize2, FileDown } from "lucide-react";
 import { PriceCalculatorPopover } from "./PriceCalculatorPopover";
 import * as XLSX from "xlsx";
-
-import KopSuratConfigSection, { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import { printElementSmart, exportToPDF } from "../lib/printUtils";
+import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import PrintPreviewModal from "./PrintPreviewModal";
 
 interface NotaPesananLogistikTabProps {
@@ -41,6 +41,8 @@ interface NotaPesananLogistikTabProps {
   setRightLogoCrop?: (val: LogoCrop) => void;
   paperSize?: "A4" | "F4";
   setPaperSize?: (val: "A4" | "F4") => void;
+  kopConfig?: UnifiedKopConfig;
+  bumbuPct?: number;
   isAdmin?: boolean;
 }
 
@@ -141,8 +143,10 @@ export default function NotaPesananLogistikTab({
   setRightLogoCrop = () => {},
   paperSize = "A4",
   setPaperSize = () => {},
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
+  bumbuPct = 10,
 }: NotaPesananLogistikTabProps) {
-  const logoSrc = leftLogo || localStorage.getItem("sisper_global_app_logo") || localStorage.getItem("sisper_custom_logo") || "/assets/images/app_logo_sppg.png";
+  const logoSrc = leftLogo || localStorage.getItem("kop_left_logo") || "";
 
   const totalDays = Math.max(profile?.periodeDates?.length || 10, 1);
 
@@ -224,25 +228,6 @@ export default function NotaPesananLogistikTab({
   const [namaKepala, setNamaKepala] = useState(profile.namaKepala);
   const [jabatanKepala, setJabatanKepala] = useState("Kepala Satuan Pelayanan Pemenuhan Gizi");
 
-  // Mulai Baru: Clear/reset Nota Pesanan Logistik settings and mode
-  const handleMulaiBaruNotaLogistik = () => {
-    if (confirm("✨ MULAI BARU LEMBAR KERJA NOTA PESANAN LOGISTIK\n\nApakah Anda yakin ingin mereset lembar kerja Nota Pesanan Logistik (Gabungan Semua Food Cost) ke kondisi awal? Seluruh perubahan manual yang tersimpan akan dikembalikan ke kalkulasi otomatis.")) {
-      Object.keys(localStorage).forEach((key) => {
-        if (key.startsWith("sisper_nota_items_")) {
-          localStorage.removeItem(key);
-        }
-      });
-      setSelectedDay(1);
-      setMode("harian");
-      setSelectedDays(Array.from({ length: totalDays }, (_, i) => i + 1));
-      setKepada("Penyedia Logistik Bahan Makanan");
-      setDari(profile.namaLembaga);
-      setAlamat(profile.alamat);
-      setNamaKepala(profile.namaKepala);
-      handleReload(true);
-    }
-  };
-
   // Settings for Target Price and Classifications
   const [settings] = useState(() => {
     const saved = localStorage.getItem("sisper_pm_settings");
@@ -319,7 +304,8 @@ export default function NotaPesananLogistikTab({
         pmBesar,
         pmKecil,
         dayFC?.bufferPct ?? 3,
-        tkpiList
+        tkpiList,
+        dayFC?.bumbuPct ?? bumbuPct
       );
 
       const actualKecilDay = calcDay.subtotalKecilCost;
@@ -658,7 +644,8 @@ export default function NotaPesananLogistikTab({
           pmBesar,
           pmKecil,
           dayData.bufferPct,
-          tkpiList
+          tkpiList,
+          dayData.bumbuPct ?? bumbuPct
         );
         processItems(result.porsiBesarItems, result.jumlahPMBesar, dayData.bufferPct);
         processItems(result.porsiKecilItems, result.jumlahPMKecil, dayData.bufferPct);
@@ -678,8 +665,8 @@ export default function NotaPesananLogistikTab({
 
     customTables.forEach((table) => {
       const resultsCustom = table.porsi === "besar"
-        ? calculateDay(table.bahanList, [], table.pmCount, 0, table.bufferPct || 5, tkpiList)
-        : calculateDay([], table.bahanList, 0, table.pmCount, table.bufferPct || 5, tkpiList);
+        ? calculateDay(table.bahanList, [], table.pmCount, 0, table.bufferPct || 5, tkpiList, bumbuPct)
+        : calculateDay([], table.bahanList, 0, table.pmCount, table.bufferPct || 5, tkpiList, bumbuPct);
       
       const itemsCustom = table.porsi === "besar" ? resultsCustom.porsiBesarItems : resultsCustom.porsiKecilItems;
       const pmCountCustom = table.pmCount;
@@ -905,9 +892,25 @@ export default function NotaPesananLogistikTab({
     return items.reduce((acc, it) => acc + calculateRowTotal(it), 0);
   }, [items]);
 
-  // Trigger Print Dialog
+  // Trigger Smart Auto-Orientation Precision Print Dialog (Arial)
   const handlePrint = () => {
-    window.print();
+    printElementSmart("print-area-nota-logistik", {
+      title: `Nota Pesanan Logistik — ${mode === "harian" ? `Hari Ke-${selectedDay}` : `Gabungan ${selectedDays.length} Hari`}`,
+      paperSize,
+      orientation: "auto",
+    });
+  };
+
+  // Export directly to neat PDF (Arial + Auto Portrait/Landscape)
+  const handleExportPdf = async () => {
+    const filename =
+      mode === "gabungan"
+        ? "Nota_Pesanan_Logistik_Gabungan"
+        : `Nota_Pesanan_Logistik_Hari_${selectedDay}`;
+    await exportToPDF("print-area-nota-logistik", filename, 100, undefined, {
+      paperSize,
+      orientation: "auto",
+    });
   };
 
   const handleLogoLeftChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -1016,15 +1019,11 @@ export default function NotaPesananLogistikTab({
           max-width: ${previewWidth === "full" ? "none" : (bahanColWidth === "normal" ? "180px" : bahanColWidth === "extra-wide" ? "380px" : "280px")} !important;
         }
         @media print {
-          @page {
-            size: A4 portrait;
-            margin: 10mm 12mm 10mm 12mm;
-          }
           /* Hide all default page content and navigation panels */
           body {
             background-color: white !important;
             color: black !important;
-            font-family: Arial, sans-serif !important;
+            font-family: Arial, Helvetica, sans-serif !important;
             margin: 0 !important;
             padding: 0 !important;
           }
@@ -1115,11 +1114,11 @@ export default function NotaPesananLogistikTab({
               Nota Pesanan Logistik (Rekapitulasi Gabungan Terintegrasi)
             </h3>
             <p className="text-xs text-slate-500">
-              Kombinasi otomatis kebutuhan bahan kotor (Kg) harian atau rekap gabungan 10 hari kerja yang fleksibel. Siap cetak / ekspor.
+              Kombinasi otomatis kebutuhan bahan kotor (Kg) harian atau rekap gabungan {totalDays} hari kerja yang fleksibel. Siap cetak / ekspor rapi format Arial.
             </p>
           </div>
 
-          {/* Mode Switcher & Mulai Baru */}
+          {/* Mode Switcher */}
           <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 shadow-xs self-start lg:self-center items-center gap-1.5">
             <button
               type="button"
@@ -1138,16 +1137,6 @@ export default function NotaPesananLogistikTab({
               }`}
             >
               Gabungan {totalDays} Hari
-            </button>
-            <button
-              type="button"
-              id="btn-mulai-baru-nota-logistik"
-              onClick={handleMulaiBaruNotaLogistik}
-              className="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-extrabold flex items-center gap-1.5 transition-all shadow-xs shrink-0 cursor-pointer"
-              title="Mulai Baru: Mereset lembar kerja Nota Pesanan Logistik ke kondisi awal"
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              Mulai Baru
             </button>
           </div>
         </div>
@@ -1322,10 +1311,21 @@ export default function NotaPesananLogistikTab({
             </button>
 
             <button
+              id="btn-nota-logistik-pdf"
+              type="button"
+              onClick={handleExportPdf}
+              className="p-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl transition text-xs font-bold flex items-center gap-1.5 shadow-sm shadow-rose-500/10 cursor-pointer"
+              title="Unduh PDF Rapi (Arial, Otomatis Potret/Lansekap)"
+            >
+              <FileDown className="w-4 h-4" />
+              Unduh PDF
+            </button>
+
+            <button
               id="btn-nota-logistik-export"
               type="button"
               onClick={handleExportExcel}
-              className="p-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl transition text-xs font-bold flex items-center gap-1.5 shadow-sm shadow-emerald-500/10"
+              className="p-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl transition text-xs font-bold flex items-center gap-1.5 shadow-sm shadow-emerald-500/10 cursor-pointer"
             >
               <Download className="w-4 h-4" />
               Unduh Excel
@@ -1335,7 +1335,7 @@ export default function NotaPesananLogistikTab({
               id="btn-nota-logistik-print"
               type="button"
               onClick={handlePrint}
-              className="p-2 bg-orange-600 hover:bg-orange-700 text-white rounded-xl transition text-xs font-bold flex items-center gap-1.5 shadow-sm shadow-orange-500/10"
+              className="p-2 bg-orange-600 hover:bg-orange-700 text-white rounded-xl transition text-xs font-bold flex items-center gap-1.5 shadow-sm shadow-orange-500/10 cursor-pointer"
             >
               <Printer className="w-4 h-4" />
               Cetak Presisi 100%
@@ -1347,6 +1347,10 @@ export default function NotaPesananLogistikTab({
       {/* RAB & Realisasi Belanja Dashboard for Gabungan Semua Food Cost */}
       {(() => {
         const stats = getCombinedSummaryStats();
+        const activeBumbuDisplay =
+          mode === "harian"
+            ? (foodCostDays.find((fd) => fd.hariKe === selectedDay)?.bumbuPct ?? bumbuPct)
+            : bumbuPct;
         return (
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 my-4 no-print">
             {/* 1. Rencana Anggaran Biaya (RAB) */}
@@ -1375,7 +1379,7 @@ export default function NotaPesananLogistikTab({
                     Realisasi Belanja ({stats.isCombined ? "Gabungan" : "Harian"}) (Actual)
                   </span>
                   <span className="text-[9px] font-black px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 border border-indigo-200">
-                    +10% Bumbu
+                    +{activeBumbuDisplay}% Bumbu
                   </span>
                 </div>
                 <div className="mt-2 flex items-baseline justify-between gap-1">
@@ -1383,7 +1387,7 @@ export default function NotaPesananLogistikTab({
                     Rp {formatThousandSeparator(stats.totalActualCost)}
                   </span>
                   <div className="text-right">
-                    <span className="text-[9px] font-extrabold text-indigo-600 block uppercase tracking-tight">Total Bumbu 10%:</span>
+                    <span className="text-[9px] font-extrabold text-indigo-600 block uppercase tracking-tight">Total Bumbu {activeBumbuDisplay}%:</span>
                     <span className="text-xs font-black text-indigo-900 font-mono">
                       Rp {formatThousandSeparator(stats.totalBumbu10Nominal)}
                     </span>
@@ -1394,14 +1398,14 @@ export default function NotaPesananLogistikTab({
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
                   <span>Kecil: Rp {formatThousandSeparator(stats.porsiKecilActualCostTotal)} (Rp {formatThousandSeparator(stats.porsiKecilPerPorsi)}/porsi)</span>
                   <span className="text-[9.5px] font-bold text-indigo-900 bg-indigo-100/90 px-1.5 py-0.5 rounded border border-indigo-200/70 shrink-0 w-fit">
-                    Bumbu 10%: Rp {formatThousandSeparator(stats.bumbuKecilNominalTotal)}
+                    Bumbu {activeBumbuDisplay}%: Rp {formatThousandSeparator(stats.bumbuKecilNominalTotal)}
                   </span>
                 </div>
 
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
                   <span>Besar: Rp {formatThousandSeparator(stats.porsiBesarActualCostTotal)} (Rp {formatThousandSeparator(stats.porsiBesarPerPorsi)}/porsi)</span>
                   <span className="text-[9.5px] font-bold text-indigo-900 bg-indigo-100/90 px-1.5 py-0.5 rounded border border-indigo-200/70 shrink-0 w-fit">
-                    Bumbu 10%: Rp {formatThousandSeparator(stats.bumbuBesarNominalTotal)}
+                    Bumbu {activeBumbuDisplay}%: Rp {formatThousandSeparator(stats.bumbuBesarNominalTotal)}
                   </span>
                 </div>
               </div>
@@ -2153,111 +2157,24 @@ export default function NotaPesananLogistikTab({
 
         {/* Paper Preview Block */}
         <div className={`${isSidebarCollapsed ? "xl:col-span-4" : "xl:col-span-3"} flex justify-center w-full`} id="print-area-wrapper">
-          <div id="print-area-nota-logistik" className={`print-container w-full ${previewWidth === "full" ? "max-w-full" : "max-w-[210mm]"} min-h-[297mm] bg-white text-black p-[15mm] border border-slate-200 rounded-3xl shadow-lg relative flex flex-col gap-5 overflow-x-auto`}>
-            
-            {/* Header Surat */}
-            <div className="relative flex items-center justify-between pb-3 border-b-[3px] border-double border-black w-full mb-4 gap-4" style={{ minHeight: '100px' }}>
-              
-              {/* Logo Kiri */}
-              <div className="flex-shrink-0 flex items-center justify-start min-w-[80px]" style={{ width: `${logoLeftWidth}px` }}>
-                {logoLeft ? (
-                  <div 
-                    className="relative overflow-hidden flex items-center justify-center border border-slate-100 rounded bg-slate-50/30" 
-                    style={{ width: `${logoLeftWidth}px`, height: `${logoLeftWidth}px` }}
-                  >
-                    <img 
-                      src={logoLeft} 
-                      alt="Logo Kiri" 
-                      style={{
-                        width: "100%",
-                        height: "100%",
-                        objectFit: "contain",
-                        clipPath: `inset(${logoLeftCropTop}% ${logoLeftCropRight}% ${logoLeftCropBottom}% ${logoLeftCropLeft}%)`,
-                        transform: `scale(${logoLeftScale / 100}) translate(${logoLeftOffsetX}px, ${logoLeftOffsetY}px)`,
-                        transformOrigin: "center center",
-                      }}
-                      referrerPolicy="no-referrer"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).src = "/assets/images/app_logo_sppg.png";
-                      }}
-                    />
-                  </div>
-                ) : (
-                  <div className="w-16 h-16 border border-dashed border-slate-300 rounded flex items-center justify-center text-[10px] text-slate-400 text-center">
-                    No Logo Kiri
-                  </div>
-                )}
-              </div>
-              
-              {/* KOP Text content */}
-              <div className="text-center tracking-wide leading-snug px-2 flex-1 w-full">
-                <div 
-                  style={{ 
-                    fontSize: `${kopLine1Size}px`,
-                    fontFamily: kopLine1Font,
-                    fontWeight: kopLine1Weight,
-                    fontStyle: kopLine1Italic ? "italic" : "normal"
-                  }} 
-                  className="uppercase text-slate-900 print:text-black leading-tight"
-                >
-                  {kopLine1}
-                </div>
-                <div 
-                  style={{ 
-                    fontSize: `${kopLine2Size}px`,
-                    fontFamily: kopLine2Font,
-                    fontWeight: kopLine2Weight,
-                    fontStyle: kopLine2Italic ? "italic" : "normal"
-                  }} 
-                  className="uppercase text-slate-800 print:text-black mt-1 leading-tight"
-                >
-                  {kopLine2}
-                </div>
-                <div 
-                  style={{ 
-                    fontSize: `${kopLine3Size}px`,
-                    fontFamily: kopLine3Font,
-                    fontWeight: kopLine3Weight,
-                    fontStyle: kopLine3Italic ? "italic" : "normal"
-                  }} 
-                  className="uppercase mt-1 leading-tight text-indigo-900 print:text-black"
-                >
-                  {kopLine3}
-                </div>
-                <div className="italic text-slate-600 print:text-black mt-1.5 font-medium underline" style={{ fontSize: '10pt' }}>
-                  {kopLine4}
-                </div>
-              </div>
-
-              {/* Logo Kanan */}
-              <div className="flex-shrink-0 flex items-center justify-end min-w-[80px]" style={{ width: `${logoRightWidth}px` }}>
-                {logoRight ? (
-                  <div 
-                    className="relative overflow-hidden flex items-center justify-center border border-slate-100 rounded bg-slate-50/30" 
-                    style={{ width: `${logoRightWidth}px`, height: `${logoRightWidth}px` }}
-                  >
-                    <img 
-                      src={logoRight} 
-                      alt="Logo Kanan" 
-                      style={{
-                        width: "100%",
-                        height: "100%",
-                        objectFit: "contain",
-                        clipPath: `inset(${logoRightCropTop}% ${logoRightCropRight}% ${logoRightCropBottom}% ${logoRightCropLeft}%)`,
-                        transform: `scale(${logoRightScale / 100}) translate(${logoRightOffsetX}px, ${logoRightOffsetY}px)`,
-                        transformOrigin: "center center",
-                      }}
-                      referrerPolicy="no-referrer"
-                    />
-                  </div>
-                ) : (
-                  <div className="border border-dashed border-slate-300 rounded flex items-center justify-center text-[10px] text-slate-400 text-center no-print" style={{ width: `${logoRightWidth}px`, height: `${logoRightWidth}px` }}>
-                    No Logo Kanan
-                  </div>
-                )}
-              </div>
-
-            </div>
+          <div
+            id="print-area-nota-logistik"
+            style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
+            className={`print-container w-full ${previewWidth === "full" ? "max-w-full" : "max-w-[210mm]"} min-h-[297mm] bg-white text-black p-[15mm] border border-slate-200 rounded-3xl shadow-lg relative flex flex-col gap-5 overflow-x-auto`}
+          >
+            {/* Header Surat Terpusat (Serentak dari Profil SPPG - Format Arial) */}
+            <KopSuratRenderHeader
+              kopLine1={kopLine1}
+              kopLine2={kopLine2}
+              kopLine3={kopLine3}
+              kopLine4={kopLine4}
+              leftLogo={logoLeft}
+              rightLogo={logoRight}
+              leftLogoCrop={leftLogoCrop}
+              rightLogoCrop={rightLogoCrop}
+              kopConfig={kopConfig}
+              docKey="nota"
+            />
 
             {/* Metadata Surat */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs font-medium my-5 leading-normal">
@@ -2494,7 +2411,7 @@ export default function NotaPesananLogistikTab({
         filename={`Nota_Pesanan_Logistik_${mode === "harian" ? `Hari_${selectedDay}` : "Gabungan"}`}
         defaultScale={100}
         defaultPaperSize={paperSize as "A4" | "F4"}
-        defaultOrientation="portrait"
+        defaultOrientation="auto"
       />
     </div>
   );

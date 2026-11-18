@@ -36,6 +36,8 @@ import {
   SPPGProfile,
   TigaBPM,
   TKPIItem,
+  UnifiedKopConfig,
+  DEFAULT_UNIFIED_KOP_CONFIG,
 } from "../types";
 import { calculateDay, createTkpiMap, formatRupiah } from "../utils/calc";
 import {
@@ -77,6 +79,11 @@ interface ArsipTabProps {
   activeSekolahPM?: SekolahPM[];
   activeTigaBPM?: TigaBPM[];
   kopLines: [string, string, string, string];
+  leftLogo?: string;
+  rightLogo?: string;
+  kopConfig?: UnifiedKopConfig;
+  paperSize?: "A4" | "F4";
+  bumbuPct?: number;
   userEmail?: string | null;
   isDemo?: boolean;
 }
@@ -200,7 +207,8 @@ function buildFoodCostAndNotaForDay(
   foodCostDays: FoodCostDay[],
   tkpiMap: Map<string, TKPIItem>,
   pmSettings: any,
-  useLocalNotaOverrides: boolean
+  useLocalNotaOverrides: boolean,
+  defaultBumbuPct: number = 10
 ): {
   foodCosts: ArchiveFoodCostSection[];
   notaItems: ArchiveNotaItemRecord[];
@@ -262,13 +270,15 @@ function buildFoodCostAndNotaForDay(
     if (fc.customPmBesarCount !== undefined) pmBesar = fc.customPmBesarCount;
     if (fc.customPmKecilCount !== undefined) pmKecil = fc.customPmKecilCount;
 
+    const effectiveBumbuPct = fc.bumbuPct !== undefined ? fc.bumbuPct : defaultBumbuPct;
     const calc = calculateDay(
       fc.porsiBesarBahan || [],
       fc.porsiKecilBahan || [],
       pmBesar,
       pmKecil,
       fc.bufferPct ?? 5,
-      tkpiMap
+      tkpiMap,
+      effectiveBumbuPct
     );
 
     const rabTotal = pmBesar * porsiBesarHarga + pmKecil * porsiKecilHarga;
@@ -291,6 +301,7 @@ function buildFoodCostAndNotaForDay(
       jenisMenu: fc.jenisMenu,
       namaMenu: fc.namaMenu || "",
       bufferPct: fc.bufferPct ?? 5,
+      bumbuPct: effectiveBumbuPct,
       pmKecil: calc.jumlahPMKecil,
       pmBesar: calc.jumlahPMBesar,
       rabTotal,
@@ -380,7 +391,8 @@ function buildEntriesFromSource(
   pmSettings: any,
   sourceLabel: string,
   sourcePrefixId: string,
-  useLocalNotaOverrides: boolean
+  useLocalNotaOverrides: boolean,
+  defaultBumbuPct: number = 10
 ): DailyArchiveEntry[] {
   const configuredDates =
     sourceProfile?.periodeDates && sourceProfile.periodeDates.length > 0
@@ -434,7 +446,8 @@ function buildEntriesFromSource(
       sourceFoodCost,
       tkpiMap,
       pmSettings,
-      useLocalNotaOverrides
+      useLocalNotaOverrides,
+      defaultBumbuPct
     );
 
     const firstNonEmptyMenu =
@@ -472,6 +485,11 @@ export default function ArsipTab({
   activeSekolahPM = [],
   activeTigaBPM = [],
   kopLines,
+  leftLogo = "/assets/images/app_logo_sppg.png",
+  rightLogo = "",
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
+  paperSize = "A4",
+  bumbuPct = 10,
   userEmail,
   isDemo = false,
 }: ArsipTabProps) {
@@ -488,7 +506,8 @@ export default function ArsipTab({
       pmSettings,
       "Perencanaan Aktif",
       "active",
-      true
+      true,
+      bumbuPct
     );
 
     const byDateKey = new Map<string, DailyArchiveEntry>();
@@ -504,7 +523,8 @@ export default function ArsipTab({
         pmSettings,
         period.namaPeriode || "Arsip Periode Tersimpan",
         period.id || "saved",
-        false
+        false,
+        bumbuPct
       );
       periodEntries.forEach((entry) => {
         byDateKey.set(`${entry.dateStr}_${entry.hariKe}`, entry);
@@ -520,7 +540,7 @@ export default function ArsipTab({
       const cmp = a.dateStr.localeCompare(b.dateStr);
       return cmp !== 0 ? cmp : a.hariKe - b.hariKe;
     });
-  }, [profile, harianPM, masterMenu, foodCostDays, tkpiMap, pmSettings, savedPeriods]);
+  }, [profile, harianPM, masterMenu, foodCostDays, tkpiMap, pmSettings, savedPeriods, bumbuPct]);
 
   const availableMonths = useMemo(() => {
     const map = new Map<string, { monthKey: string; count: number; totalPM: number }>();
@@ -691,6 +711,10 @@ export default function ArsipTab({
       category,
       profile,
       kopLines,
+      leftLogo,
+      rightLogo,
+      kopConfig,
+      paperSize,
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -815,6 +839,10 @@ export default function ArsipTab({
           category: task.category,
           profile,
           kopLines,
+          leftLogo,
+          rightLogo,
+          kopConfig,
+          paperSize,
         });
 
         const uploaded = await uploadPdfToDriveFolder(

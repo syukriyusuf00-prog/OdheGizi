@@ -5,10 +5,14 @@
     /* Set page margins and colors */
     @page {
       size: auto;
-      margin: 5mm;
+      margin: 7mm 8mm;
     }
 
-    /* Force background colors and exact print rendering */
+    /* Force uniform Arial typography, background colors, and exact print rendering */
+    html, body, body * {
+      font-family: Arial, Helvetica, sans-serif !important;
+    }
+
     html, body {
       background-color: #ffffff !important;
       color: #000000 !important;

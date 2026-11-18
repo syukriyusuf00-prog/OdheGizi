@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { HariPM, KelompokSasaranPM, SPPGProfile } from "../types";
+import { HariPM, KelompokSasaranPM, SPPGProfile, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 import { formatIndonesianDate } from "../utils/menuSchedule";
 import { 
   Calendar, 
@@ -23,12 +23,11 @@ import {
   ChevronUp,
   Printer,
   Image as ImageIcon,
-  Eye,
-  Sparkles
+  Eye
 } from "lucide-react";
 import * as XLSX from "xlsx";
-import { downloadElementAsImage, exportToPDF } from "../lib/printUtils";
-import KopSuratConfigSection, { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
+import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
+import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import PrintPreviewModal from "./PrintPreviewModal";
 
 interface PenerimaManfaatTabProps {
@@ -60,6 +59,7 @@ interface PenerimaManfaatTabProps {
   setRightLogoCrop?: (val: LogoCrop) => void;
   paperSize?: "A4" | "F4";
   setPaperSize?: (val: "A4" | "F4") => void;
+  kopConfig?: UnifiedKopConfig;
   isAdmin?: boolean;
 }
 
@@ -86,7 +86,8 @@ export default function PenerimaManfaatTab({
   rightLogoCrop = { top: 0, bottom: 0, left: 0, right: 0 },
   setRightLogoCrop = () => {},
   paperSize = "A4",
-  setPaperSize = () => {}
+  setPaperSize = () => {},
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG
 }: PenerimaManfaatTabProps) {
   const [selectedDay, setSelectedDay] = useState<number>(1);
   const [alertMsg, setAlertMsg] = useState<{ type: "success" | "info" | "error"; text: string } | null>(null);
@@ -224,24 +225,6 @@ export default function PenerimaManfaatTab({
       });
       onChange(updatedHarian);
       triggerAlert("info", `Data Jumlah Penerima Manfaat Hari Ke-${selectedDay} telah dibersihkan menjadi 0.`);
-    }
-  };
-
-  // Mulai Baru: Clear PM data for ALL days
-  const handleMulaiBaruPM = () => {
-    if (confirm(`✨ MULAI BARU LEMBAR KERJA PENERIMA MANFAAT\n\nApakah Anda yakin ingin mengosongkan SELURUH data jumlah Penerima Manfaat (PM) untuk SEMUA ${effectiveTotalDays} HARI perencanaan?`)) {
-      const clearedHarian = harianPM.map(day => ({
-        ...day,
-        sasaran: day.sasaran.map(item => ({
-          ...item,
-          porsiKecil: 0,
-          porsiBesar: 0,
-          alergiKecil: 0,
-          alergiBesar: 0
-        }))
-      }));
-      onChange(clearedHarian);
-      triggerAlert("success", `Lembar Kerja Penerima Manfaat untuk seluruh ${effectiveTotalDays} Hari telah berhasil dibersihkan untuk Mulai Baru.`);
     }
   };
 
@@ -474,6 +457,8 @@ export default function PenerimaManfaatTab({
           rightLogo={rightLogo}
           leftLogoCrop={leftLogoCrop}
           rightLogoCrop={rightLogoCrop}
+          kopConfig={kopConfig}
+          docKey="penerima"
         />
 
         <div className="text-center mb-4 border-b border-slate-200 pb-2">
@@ -510,7 +495,7 @@ export default function PenerimaManfaatTab({
               id="btn-export-pm-pdf"
               type="button"
               disabled={!!isDownloading}
-              onClick={() => exportToPDF("print-area-penerima-manfaat", `Rekap_Penerima_Manfaat_Hari_${selectedDay}`, 100, setIsDownloading)}
+              onClick={() => exportToPDF("print-area-penerima-manfaat", `Rekap_Penerima_Manfaat_Hari_${selectedDay}`, 100, setIsDownloading, { paperSize, orientation: "auto" })}
               className="flex items-center gap-1.5 px-3 py-2 bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded-xl text-xs font-bold transition cursor-pointer shadow-xs"
             >
               <Download className="w-3.5 h-3.5" />
@@ -531,7 +516,7 @@ export default function PenerimaManfaatTab({
             <button
               id="btn-print-pm-direct"
               type="button"
-              onClick={() => window.print()}
+              onClick={() => printElementSmart("print-area-penerima-manfaat", { title: `Rekap Penerima Manfaat — Hari Ke-${selectedDay}`, paperSize, orientation: "auto" })}
               className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition cursor-pointer shadow-xs"
             >
               <Printer className="w-3.5 h-3.5" />
@@ -567,20 +552,10 @@ export default function PenerimaManfaatTab({
               type="button"
               onClick={handleResetJumlahPM}
               className="flex items-center gap-1.5 px-3 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 rounded-xl text-xs font-bold transition cursor-pointer"
-              title="Sembuhkan/Reset semua jumlah PM pada tabel hari ini menjadi 0"
+              title="Reset semua jumlah PM pada tabel hari ini menjadi 0"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               Reset Jumlah PM
-            </button>
-            <button
-              id="btn-mulai-baru-pm"
-              type="button"
-              onClick={handleMulaiBaruPM}
-              className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-extrabold transition cursor-pointer shadow-xs"
-              title={`Mulai Baru: Mengosongkan seluruh data Penerima Manfaat untuk ${effectiveTotalDays} Hari`}
-            >
-              <Sparkles className="w-3.5 h-3.5" />
-              Mulai Baru
             </button>
           </div>
         </div>
@@ -887,6 +862,7 @@ export default function PenerimaManfaatTab({
         filename={`Rekap_Penerima_Manfaat_Hari_${selectedDay}`}
         defaultScale={100}
         defaultPaperSize={paperSize as "A4" | "F4"}
+        defaultOrientation="auto"
       />
 
     </div>

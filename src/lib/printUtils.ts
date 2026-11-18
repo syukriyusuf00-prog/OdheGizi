@@ -278,10 +278,175 @@ function createSanitizedComputedStyle(origFn: typeof window.getComputedStyle) {
   };
 }
 
+export interface OptimalPrintLayout {
+  orientation: "portrait" | "landscape";
+  adaptiveFontPt: number;
+  maxCols: number;
+  contentWidthPx: number;
+}
+
+export interface SmartPrintOptions {
+  title?: string;
+  paperSize?: "A4" | "F4";
+  orientation?: "auto" | "portrait" | "landscape";
+  scalePercent?: number;
+}
+
+/**
+ * Inspects a worksheet DOM element and determines whether it fits cleanly in Portrait
+ * or should automatically switch to Landscape with adaptive Arial typography.
+ */
+export function detectOptimalPrintLayout(
+  element: HTMLElement | null,
+  paperSize: "A4" | "F4" = "A4"
+): OptimalPrintLayout {
+  if (!element) {
+    return {
+      orientation: "portrait",
+      adaptiveFontPt: 9.5,
+      maxCols: 0,
+      contentWidthPx: 0,
+    };
+  }
+
+  // Printable width in CSS px (~96dpi) with ~16mm total horizontal margin
+  const portraitPrintablePx = paperSize === "F4" ? 736 : 718;
+
+  let maxCols = 0;
+  let widestTablePx = 0;
+
+  element.querySelectorAll("table").forEach((table) => {
+    if (table.closest(".no-print")) return;
+    const htmlTable = table as HTMLElement;
+    const style = window.getComputedStyle(htmlTable);
+    if (style.display === "none") return;
+
+    const tblWidth = Math.max(htmlTable.scrollWidth || 0, htmlTable.offsetWidth || 0);
+    if (tblWidth > widestTablePx) widestTablePx = tblWidth;
+
+    table.querySelectorAll("tr").forEach((tr) => {
+      if (tr.closest(".no-print")) return;
+      let colCount = 0;
+      Array.from(tr.children).forEach((cell) => {
+        if ((cell as HTMLElement).classList?.contains("no-print")) return;
+        const cs = parseInt((cell as HTMLTableCellElement).getAttribute("colspan") || "1", 10);
+        colCount += Number.isFinite(cs) && cs > 0 ? cs : 1;
+      });
+      if (colCount > maxCols) maxCols = colCount;
+    });
+  });
+
+  const rectWidth = element.getBoundingClientRect?.().width || 0;
+  const contentWidthPx = Math.max(widestTablePx, element.scrollWidth || 0, rectWidth);
+
+  // Switch to landscape when the table has many columns (>= 9) or naturally overflows Portrait width
+  const needsLandscape =
+    maxCols >= 9 ||
+    widestTablePx > portraitPrintablePx * 1.06 ||
+    (maxCols >= 7 && widestTablePx > portraitPrintablePx * 0.98);
+
+  const orientation: "portrait" | "landscape" = needsLandscape ? "landscape" : "portrait";
+
+  let adaptiveFontPt = 9.5;
+  if (maxCols >= 14) {
+    adaptiveFontPt = 7.2;
+  } else if (maxCols >= 11) {
+    adaptiveFontPt = 7.8;
+  } else if (maxCols >= 9) {
+    adaptiveFontPt = 8.4;
+  } else if (maxCols >= 7) {
+    adaptiveFontPt = 8.8;
+  }
+
+  return {
+    orientation,
+    adaptiveFontPt,
+    maxCols,
+    contentWidthPx,
+  };
+}
+
+/**
+ * Replaces form inputs, textareas, and selects inside a cloned DOM tree with crisp static text
+ * spans so printed sheets and exported PDFs render cleanly in Arial without clipping or borders.
+ */
+export function convertFormControlsToStaticText(root: HTMLElement) {
+  const doc = root.ownerDocument || document;
+
+  root.querySelectorAll("input, textarea, select").forEach((ctrl) => {
+    if (ctrl.closest(".no-print")) {
+      ctrl.remove();
+      return;
+    }
+
+    if (ctrl instanceof HTMLInputElement) {
+      if (ctrl.type === "hidden" || ctrl.type === "file") {
+        ctrl.remove();
+        return;
+      }
+      if (ctrl.type === "checkbox" || ctrl.type === "radio") {
+        const mark = doc.createElement("span");
+        mark.textContent = ctrl.checked ? "✓" : "☐";
+        mark.style.fontFamily = "Arial, Helvetica, sans-serif";
+        mark.style.fontWeight = "700";
+        ctrl.replaceWith(mark);
+        return;
+      }
+
+      const span = doc.createElement("span");
+      span.className = ctrl.className;
+      span.textContent = ctrl.value || "";
+      span.style.display = "inline-block";
+      span.style.border = "none";
+      span.style.background = "transparent";
+      span.style.boxShadow = "none";
+      span.style.padding = "0";
+      span.style.fontFamily = "Arial, Helvetica, sans-serif";
+      span.style.whiteSpace = "pre-wrap";
+      span.style.wordBreak = "break-word";
+      ctrl.replaceWith(span);
+      return;
+    }
+
+    if (ctrl instanceof HTMLTextAreaElement) {
+      const div = doc.createElement("div");
+      div.className = ctrl.className;
+      div.textContent = ctrl.value || "";
+      div.style.border = "none";
+      div.style.background = "transparent";
+      div.style.boxShadow = "none";
+      div.style.padding = "0";
+      div.style.fontFamily = "Arial, Helvetica, sans-serif";
+      div.style.whiteSpace = "pre-wrap";
+      div.style.wordBreak = "break-word";
+      ctrl.replaceWith(div);
+      return;
+    }
+
+    if (ctrl instanceof HTMLSelectElement) {
+      const selectedOpt = ctrl.options[ctrl.selectedIndex];
+      const span = doc.createElement("span");
+      span.className = ctrl.className;
+      span.textContent = selectedOpt ? selectedOpt.text : ctrl.value || "";
+      span.style.display = "inline-block";
+      span.style.border = "none";
+      span.style.background = "transparent";
+      span.style.boxShadow = "none";
+      span.style.padding = "0";
+      span.style.fontFamily = "Arial, Helvetica, sans-serif";
+      ctrl.replaceWith(span);
+    }
+  });
+}
+
 /**
  * Applies onclone DOM transformations and getComputedStyle patch for html2canvas
  */
-function prepareClonedDoc(clonedDoc: Document, elementTarget: string | HTMLElement) {
+function prepareClonedDoc(
+  clonedDoc: Document,
+  elementTarget: string | HTMLElement,
+  adaptiveFontPt: number = 9
+) {
   const clonedWin = clonedDoc.defaultView || window;
   if (clonedWin) {
     clonedWin.getComputedStyle = createSanitizedComputedStyle(clonedWin.getComputedStyle.bind(clonedWin));
@@ -312,7 +477,7 @@ function prepareClonedDoc(clonedDoc: Document, elementTarget: string | HTMLEleme
     clonedDoc.head.appendChild(newStyle);
   }
 
-  // Inject global print overrides to enforce clean, crisp paper rendering
+  // Inject global print overrides to enforce uniform Arial typography & crisp paper rendering
   const overrideStyle = clonedDoc.createElement("style");
   overrideStyle.setAttribute("type", "text/css");
   overrideStyle.textContent = `
@@ -320,6 +485,7 @@ function prepareClonedDoc(clonedDoc: Document, elementTarget: string | HTMLEleme
       -webkit-print-color-adjust: exact !important;
       print-color-adjust: exact !important;
       box-sizing: border-box !important;
+      font-family: Arial, Helvetica, sans-serif !important;
     }
     body, html {
       background-color: #ffffff !important;
@@ -327,6 +493,7 @@ function prepareClonedDoc(clonedDoc: Document, elementTarget: string | HTMLEleme
       margin: 0 !important;
       padding: 0 !important;
       width: 100% !important;
+      font-family: Arial, Helvetica, sans-serif !important;
     }
     .no-print, header, nav, footer, button, .tab-bar {
       display: none !important;
@@ -342,6 +509,16 @@ function prepareClonedDoc(clonedDoc: Document, elementTarget: string | HTMLEleme
     }
     table {
       border-collapse: collapse !important;
+      width: 100% !important;
+      font-family: Arial, Helvetica, sans-serif !important;
+    }
+    th, td {
+      font-family: Arial, Helvetica, sans-serif !important;
+      font-size: ${adaptiveFontPt}pt !important;
+      line-height: 1.28 !important;
+    }
+    .overflow-x-auto, .overflow-auto {
+      overflow: visible !important;
     }
   `;
   clonedDoc.head.appendChild(overrideStyle);
@@ -387,7 +564,7 @@ function prepareClonedDoc(clonedDoc: Document, elementTarget: string | HTMLEleme
     }
   });
 
-  // 4. Adjust target element layout
+  // 4. Adjust target element layout & convert form controls cleanly
   let clonedEl: HTMLElement | null = null;
   if (typeof elementTarget === "string") {
     clonedEl = clonedDoc.getElementById(elementTarget);
@@ -401,18 +578,21 @@ function prepareClonedDoc(clonedDoc: Document, elementTarget: string | HTMLEleme
   }
 
   if (clonedEl) {
+    clonedEl.querySelectorAll(".no-print").forEach((node) => node.remove());
+    convertFormControlsToStaticText(clonedEl);
     clonedEl.style.transform = "none";
     clonedEl.style.margin = "0 auto";
     clonedEl.style.boxShadow = "none";
     clonedEl.style.border = "none";
     clonedEl.style.width = "100%";
     clonedEl.style.zoom = "1";
+    clonedEl.style.fontFamily = "Arial, Helvetica, sans-serif";
   }
 }
 
 /**
  * Downloads a specific DOM element as a high-resolution PNG image.
- * Uses html2canvas with proper cross-origin configurations and OKLCH/OKLAB color sanitization.
+ * Uses html2canvas with uniform Arial typography, cross-origin support, and OKLCH/OKLAB sanitization.
  */
 export const downloadElementAsImage = async (
   elementTarget: string | HTMLElement,
@@ -425,18 +605,19 @@ export const downloadElementAsImage = async (
     if (onProgress) onProgress("Elemen tidak ditemukan.");
     return;
   }
-  
-  if (onProgress) onProgress("Memproses gambar...");
+
+  if (onProgress) onProgress("Merapikan tata letak Arial & memproses gambar...");
 
   const origWindowGetComputedStyle = window.getComputedStyle;
   const targetDoc = element.ownerDocument || document;
   const targetWin = targetDoc.defaultView || window;
+  const layout = detectOptimalPrintLayout(element, "A4");
 
   try {
     window.getComputedStyle = createSanitizedComputedStyle(origWindowGetComputedStyle);
 
     const canvas = await html2canvas(element, {
-      scale: 2, // 2x scale for crisp print quality
+      scale: 2,
       useCORS: true,
       allowTaint: true,
       backgroundColor: "#ffffff",
@@ -446,18 +627,18 @@ export const downloadElementAsImage = async (
       windowWidth: targetDoc.documentElement ? targetDoc.documentElement.scrollWidth : targetWin.innerWidth,
       windowHeight: targetDoc.documentElement ? targetDoc.documentElement.scrollHeight : targetWin.innerHeight,
       onclone: (clonedDoc) => {
-        prepareClonedDoc(clonedDoc, elementTarget);
+        prepareClonedDoc(clonedDoc, elementTarget, layout.adaptiveFontPt);
       }
     });
-    
+
     if (onProgress) onProgress("Mengunduh gambar...");
-    
+
     const imgData = canvas.toDataURL("image/png");
     const link = document.createElement("a");
     link.download = `${filename}.png`;
     link.href = imgData;
     link.click();
-    
+
     if (onProgress) onProgress(null);
   } catch (error) {
     console.error("Gagal mengunduh gambar:", error);
@@ -471,22 +652,230 @@ export const downloadElementAsImage = async (
 };
 
 /**
- * Triggers standard browser printing for a specific target by temporarily
- * hiding other elements or directly calling print.
+ * Triggers standard browser printing for a specific target.
  */
 export const triggerPrint = () => {
   window.print();
 };
 
 /**
+ * Precision hidden-iframe printing (no popups) with uniform Arial typography,
+ * adaptive font sizing, and automatic Portrait vs Landscape selection.
+ */
+export const printElementSmart = (
+  elementTarget: string | HTMLElement,
+  options: SmartPrintOptions = {}
+) => {
+  const element = typeof elementTarget === "string" ? document.getElementById(elementTarget) : elementTarget;
+  if (!element) {
+    window.print();
+    return;
+  }
+
+  const paperSize = options.paperSize || "A4";
+  const detected = detectOptimalPrintLayout(element, paperSize);
+  const resolvedOrientation: "portrait" | "landscape" =
+    options.orientation && options.orientation !== "auto"
+      ? options.orientation
+      : detected.orientation;
+
+  const pageSizeCss = paperSize === "F4" ? `215mm 330mm ${resolvedOrientation}` : `A4 ${resolvedOrientation}`;
+  const scalePercent = options.scalePercent || 100;
+
+  // Gather and sanitize stylesheets from current document
+  let combinedStyles = "";
+  document.querySelectorAll("style, link[rel='stylesheet']").forEach((styleEl) => {
+    if (styleEl.tagName.toLowerCase() === "style") {
+      combinedStyles += (styleEl.textContent || "") + "\n";
+    } else if (styleEl.tagName.toLowerCase() === "link") {
+      try {
+        const sheet = (styleEl as HTMLLinkElement).sheet;
+        if (sheet) {
+          Array.from(sheet.cssRules).forEach((rule) => {
+            combinedStyles += rule.cssText + "\n";
+          });
+        }
+      } catch {
+        // Ignore CORS stylesheets
+      }
+    }
+  });
+
+  const sanitizedCss = sanitizeOklchString(combinedStyles);
+
+  // Clone element cleanly and replace inputs/selects with static Arial text
+  const cloned = element.cloneNode(true) as HTMLElement;
+  cloned.querySelectorAll(".no-print, button").forEach((n) => n.remove());
+  convertFormControlsToStaticText(cloned);
+  cloned.style.margin = "0 auto";
+  cloned.style.boxShadow = "none";
+  cloned.style.border = "none";
+  cloned.style.width = "100%";
+  cloned.style.maxWidth = "100%";
+  cloned.style.transform = "none";
+
+  // Remove any stale hidden print iframe
+  const existingFrame = document.getElementById("sispermbg-smart-print-frame");
+  if (existingFrame) existingFrame.remove();
+
+  const iframe = document.createElement("iframe");
+  iframe.id = "sispermbg-smart-print-frame";
+  iframe.setAttribute("aria-hidden", "true");
+  iframe.style.position = "fixed";
+  iframe.style.right = "0";
+  iframe.style.bottom = "0";
+  iframe.style.width = "0";
+  iframe.style.height = "0";
+  iframe.style.border = "0";
+  iframe.style.opacity = "0";
+  iframe.style.pointerEvents = "none";
+  document.body.appendChild(iframe);
+
+  const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+  if (!iframeDoc) {
+    iframe.remove();
+    window.print();
+    return;
+  }
+
+  const safeTitle = (options.title || document.title || "Dokumen SISPERMBG").replace(/</g, "&lt;");
+
+  iframeDoc.open();
+  iframeDoc.write(`<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>${safeTitle}</title>
+    <style>
+      ${sanitizedCss}
+
+      *, *::before, *::after {
+        box-sizing: border-box !important;
+        -webkit-print-color-adjust: exact !important;
+        print-color-adjust: exact !important;
+        font-family: Arial, Helvetica, sans-serif !important;
+      }
+
+      @page {
+        size: ${pageSizeCss};
+        margin: 7mm 8mm;
+      }
+
+      html, body {
+        margin: 0 !important;
+        padding: 0 !important;
+        width: 100% !important;
+        background: #ffffff !important;
+        color: #000000 !important;
+        font-family: Arial, Helvetica, sans-serif !important;
+      }
+
+      .smart-print-root {
+        width: 100% !important;
+        margin: 0 auto !important;
+        zoom: ${scalePercent}%;
+        font-family: Arial, Helvetica, sans-serif !important;
+      }
+
+      .no-print, header, nav, footer, button, .tab-bar {
+        display: none !important;
+      }
+
+      .overflow-x-auto, .overflow-auto {
+        overflow: visible !important;
+      }
+
+      table {
+        width: 100% !important;
+        border-collapse: collapse !important;
+        page-break-inside: auto;
+        font-family: Arial, Helvetica, sans-serif !important;
+      }
+
+      thead {
+        display: table-header-group;
+      }
+
+      tr {
+        page-break-inside: avoid;
+        break-inside: avoid;
+      }
+
+      th, td {
+        font-family: Arial, Helvetica, sans-serif !important;
+        font-size: ${detected.adaptiveFontPt}pt !important;
+        line-height: 1.25 !important;
+      }
+
+      img {
+        max-width: 100% !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="smart-print-root">
+      ${cloned.outerHTML}
+    </div>
+  </body>
+</html>`);
+  iframeDoc.close();
+
+  const runPrint = () => {
+    try {
+      iframe.contentWindow?.focus();
+      iframe.contentWindow?.print();
+    } catch {
+      window.print();
+    }
+    setTimeout(() => {
+      iframe.remove();
+    }, 1500);
+  };
+
+  // Wait briefly for all images inside cloned document to finish loading
+  const imgs = Array.from(iframeDoc.querySelectorAll("img"));
+  if (imgs.length === 0) {
+    setTimeout(runPrint, 250);
+  } else {
+    let loaded = 0;
+    let triggered = false;
+    const triggerOnce = () => {
+      if (triggered) return;
+      triggered = true;
+      setTimeout(runPrint, 180);
+    };
+    imgs.forEach((img) => {
+      if (img.complete) {
+        loaded += 1;
+      } else {
+        img.onload = () => {
+          loaded += 1;
+          if (loaded >= imgs.length) triggerOnce();
+        };
+        img.onerror = () => {
+          loaded += 1;
+          if (loaded >= imgs.length) triggerOnce();
+        };
+      }
+    });
+    if (loaded >= imgs.length) {
+      triggerOnce();
+    } else {
+      setTimeout(triggerOnce, 1200);
+    }
+  }
+};
+
+/**
  * Exports a specific DOM element directly to a PDF file using html2canvas and jsPDF,
- * taking into account custom zoom scale percentages.
+ * automatically enforcing uniform Arial typography, F4/A4 sizing, and auto Portrait/Landscape selection.
  */
 export const exportToPDF = async (
   elementTarget: string | HTMLElement,
   filename: string,
   _scalePercent: number = 100,
-  onProgress?: (msg: string | null) => void
+  onProgress?: (msg: string | null) => void,
+  options?: { paperSize?: "A4" | "F4"; orientation?: "auto" | "portrait" | "landscape" }
 ) => {
   const element = typeof elementTarget === "string" ? document.getElementById(elementTarget) : elementTarget;
   if (!element) {
@@ -495,7 +884,17 @@ export const exportToPDF = async (
     return;
   }
 
-  if (onProgress) onProgress("Memproses dokumen PDF...");
+  const paperSize = options?.paperSize || "A4";
+  const detected = detectOptimalPrintLayout(element, paperSize);
+  const requestedOrientation = options?.orientation || "auto";
+  const resolvedOrientation: "portrait" | "landscape" =
+    requestedOrientation === "auto" ? detected.orientation : requestedOrientation;
+
+  if (onProgress) {
+    onProgress(
+      `Merapikan format Arial (${paperSize} ${resolvedOrientation === "landscape" ? "Lansekap" : "Potret"})...`
+    );
+  }
 
   const origWindowGetComputedStyle = window.getComputedStyle;
   const targetDoc = element.ownerDocument || document;
@@ -504,7 +903,7 @@ export const exportToPDF = async (
   try {
     window.getComputedStyle = createSanitizedComputedStyle(origWindowGetComputedStyle);
 
-    const renderScale = 2; // Always 2x scale for sharp crisp rendering
+    const renderScale = 2; // 2x scale for sharp crisp rendering
     const canvas = await html2canvas(element, {
       scale: renderScale,
       useCORS: true,
@@ -516,58 +915,64 @@ export const exportToPDF = async (
       windowWidth: targetDoc.documentElement ? targetDoc.documentElement.scrollWidth : targetWin.innerWidth,
       windowHeight: targetDoc.documentElement ? targetDoc.documentElement.scrollHeight : targetWin.innerHeight,
       onclone: (clonedDoc) => {
-        prepareClonedDoc(clonedDoc, elementTarget);
+        prepareClonedDoc(clonedDoc, elementTarget, detected.adaptiveFontPt);
       }
     });
 
-    if (onProgress) onProgress("Membuat file PDF...");
+    if (onProgress) onProgress("Menyusun file PDF presisi...");
 
     const imgData = canvas.toDataURL("image/png");
     const imgWidth = canvas.width;
     const imgHeight = canvas.height;
 
-    // Detect orientation
-    const isLandscape = imgWidth > imgHeight;
-    const orientation = isLandscape ? "landscape" : "portrait";
+    const finalOrientation: "portrait" | "landscape" =
+      requestedOrientation === "auto"
+        ? detected.orientation === "landscape" || imgWidth / Math.max(imgHeight, 1) > 1.25
+          ? "landscape"
+          : "portrait"
+        : resolvedOrientation;
+
+    const pdfFormat: "a4" | [number, number] = paperSize === "F4" ? [215, 330] : "a4";
 
     const pdf = new jsPDF({
-      orientation,
+      orientation: finalOrientation,
       unit: "mm",
-      format: "a4",
+      format: pdfFormat,
     });
 
     const pdfWidth = pdf.internal.pageSize.getWidth();
     const pdfHeight = pdf.internal.pageSize.getHeight();
 
-    const margin = 5; // 5mm margin
-    const availWidth = pdfWidth - (margin * 2);
-    const availHeight = pdfHeight - (margin * 2);
+    const marginX = 7;
+    const marginY = 7;
+    const availWidth = pdfWidth - marginX * 2;
+    const availHeight = pdfHeight - marginY * 2;
 
-    const imgAspect = imgHeight / imgWidth;
+    const imgAspect = imgHeight / Math.max(imgWidth, 1);
     let printWidth = availWidth;
     let printHeight = printWidth * imgAspect;
 
-    // If page content slightly exceeds page height, fit height so it doesn't spill onto an extra empty page
-    if (printHeight > availHeight && printHeight <= availHeight * 1.15) {
+    // If page content slightly exceeds page height, fit height neatly onto one page
+    if (printHeight > availHeight && printHeight <= availHeight * 1.16) {
       printHeight = availHeight;
       printWidth = printHeight / imgAspect;
     }
 
-    const xPos = margin + Math.max(0, (availWidth - printWidth) / 2);
-    const yPos = margin + Math.max(0, (availHeight - printHeight) / 2);
+    const xPos = marginX + Math.max(0, (availWidth - printWidth) / 2);
+    const yPos = marginY;
 
     if (printHeight <= availHeight) {
       pdf.addImage(imgData, "PNG", xPos, yPos, printWidth, printHeight);
     } else {
       let heightLeft = printHeight;
-      let position = margin;
+      let position = marginY;
 
       pdf.addImage(imgData, "PNG", xPos, position, printWidth, printHeight);
       heightLeft -= availHeight;
 
       while (heightLeft > 0) {
         pdf.addPage();
-        position = margin - (printHeight - heightLeft);
+        position = marginY - (printHeight - heightLeft);
         pdf.addImage(imgData, "PNG", xPos, position, printWidth, printHeight);
         heightLeft -= availHeight;
       }
@@ -577,14 +982,19 @@ export const exportToPDF = async (
     if (onProgress) onProgress(null);
   } catch (err) {
     console.error("Gagal mengekspor PDF:", err);
-    if (onProgress) onProgress("Gagal membuat PDF. Mengalihkan ke Cetak Browser...");
+    if (onProgress) onProgress("Gagal membuat PDF. Mengalihkan ke Cetak Presisi...");
     setTimeout(() => {
       if (onProgress) onProgress(null);
-      window.print();
-    }, 1500);
+      printElementSmart(element, {
+        title: filename,
+        paperSize,
+        orientation: requestedOrientation,
+      });
+    }, 1200);
   } finally {
     window.getComputedStyle = origWindowGetComputedStyle;
   }
 };
+
 
 

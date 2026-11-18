@@ -4,8 +4,9 @@
  */
 
 import React, { useState } from "react";
-import { Sliders, Edit3, Image as ImageIcon, Printer, Download, RotateCcw, ChevronDown, ChevronUp, Check, Settings2, Trash2, Lock } from "lucide-react";
-import { downloadElementAsImage } from "../lib/printUtils";
+import { Sliders, Edit3, Image as ImageIcon, Printer, Download, RotateCcw, ChevronDown, ChevronUp, Trash2 } from "lucide-react";
+import { downloadElementAsImage, printElementSmart } from "../lib/printUtils";
+import { KopDocKey, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 
 export interface LogoCrop {
   top: number;
@@ -50,7 +51,9 @@ export function KopSuratRenderHeader({
   leftLogo,
   rightLogo,
   leftLogoCrop = defaultLogoCrop,
-  rightLogoCrop = defaultLogoCrop
+  rightLogoCrop = defaultLogoCrop,
+  kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
+  docKey,
 }: {
   kopLine1: string;
   kopLine2: string;
@@ -60,65 +63,86 @@ export function KopSuratRenderHeader({
   rightLogo: string;
   leftLogoCrop?: LogoCrop;
   rightLogoCrop?: LogoCrop;
+  kopConfig?: UnifiedKopConfig;
+  docKey?: KopDocKey;
 }) {
+  const isDocEnabled = docKey ? kopConfig?.linkedDocs?.[docKey] !== false : true;
+  const showLeftLogo = isDocEnabled && (kopConfig?.linkLeftLogo ?? true) && !!leftLogo;
+  const showRightLogo = isDocEnabled && (kopConfig?.linkRightLogo ?? true) && !!rightLogo;
+
+  const leftPx = Math.min(120, Math.max(32, Number(kopConfig?.leftLogoWidth) || 56));
+  const rightPx = Math.min(120, Math.max(32, Number(kopConfig?.rightLogoWidth) || 56));
+  const sideSlotPx = Math.max(showLeftLogo ? leftPx + 8 : 0, showRightLogo ? rightPx + 8 : 0);
+
   return (
-    <div className="border-b-2 border-slate-900 pb-2 mb-3 text-slate-950 font-serif w-full">
-      <div className="flex items-center justify-between gap-4">
-        {/* Left Logo */}
-        <div className="w-20 h-20 sm:w-24 sm:h-24 flex items-center justify-center overflow-hidden shrink-0">
-          {leftLogo ? (
-            <img
-              src={leftLogo}
-              alt="Logo Kiri"
-              className="max-w-full max-h-full object-contain transition-all"
-              style={{
-                clipPath: `inset(${leftLogoCrop.top}% ${leftLogoCrop.right}% ${leftLogoCrop.bottom}% ${leftLogoCrop.left}%)`
-              }}
-              referrerPolicy="no-referrer"
-            />
-          ) : (
-            <div className="w-16 h-16 rounded border border-dashed border-slate-300 flex items-center justify-center text-[9px] text-slate-400">
-              Logo 1
-            </div>
-          )}
-        </div>
+    <div
+      className="border-b-2 border-slate-900 pb-2 mb-3 text-slate-950 w-full"
+      style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
+    >
+      <div className="flex items-center justify-between gap-3">
+        {/* Left Logo Slot */}
+        {sideSlotPx > 0 && (
+          <div
+            className="flex items-center justify-center overflow-hidden shrink-0"
+            style={{ width: `${sideSlotPx}px`, minHeight: `${Math.max(leftPx, 48)}px` }}
+          >
+            {showLeftLogo && (
+              <img
+                src={leftLogo}
+                alt="Logo Kiri"
+                className="object-contain transition-all"
+                style={{
+                  width: `${leftPx}px`,
+                  height: `${leftPx}px`,
+                  clipPath: `inset(${leftLogoCrop.top}% ${leftLogoCrop.right}% ${leftLogoCrop.bottom}% ${leftLogoCrop.left}%)`,
+                }}
+                referrerPolicy="no-referrer"
+              />
+            )}
+          </div>
+        )}
 
         {/* Center Kop Text */}
-        <div className="text-center flex-1 px-2">
-          <h1 className="text-xs sm:text-sm md:text-base font-extrabold uppercase tracking-wide leading-tight text-slate-950">
+        <div className="text-center flex-1 px-2" style={{ fontFamily: "Arial, Helvetica, sans-serif" }}>
+          <h1 className="text-xs sm:text-sm md:text-base font-bold uppercase tracking-wide leading-tight text-slate-950">
             {kopLine1}
           </h1>
           <h2 className="text-[11px] sm:text-xs md:text-sm font-bold uppercase tracking-wide leading-tight text-slate-900 mt-0.5">
             {kopLine2}
           </h2>
-          <h3 className="text-[11px] sm:text-xs md:text-sm font-extrabold uppercase tracking-wide leading-tight text-slate-900 mt-0.5">
+          <h3 className="text-[11px] sm:text-xs md:text-sm font-bold uppercase tracking-wide leading-tight text-slate-900 mt-0.5">
             {kopLine3}
           </h3>
-          <p className="text-[9px] sm:text-[10px] md:text-[11px] font-medium leading-tight text-slate-700 italic mt-1 border-t border-slate-200 pt-0.5">
-            {kopLine4}
-          </p>
-        </div>
-
-        {/* Right Logo */}
-        <div className="w-20 h-20 sm:w-24 sm:h-24 flex items-center justify-center overflow-hidden shrink-0">
-          {rightLogo ? (
-            <img
-              src={rightLogo}
-              alt="Logo Kanan"
-              className="max-w-full max-h-full object-contain transition-all"
-              style={{
-                clipPath: `inset(${rightLogoCrop.top}% ${rightLogoCrop.right}% ${rightLogoCrop.bottom}% ${rightLogoCrop.left}%)`
-              }}
-              referrerPolicy="no-referrer"
-            />
-          ) : (
-            <div className="w-16 h-16 rounded border border-dashed border-slate-300 flex items-center justify-center text-[9px] text-slate-400">
-              Logo 2
-            </div>
+          {kopLine4 && (
+            <p className="text-[9px] sm:text-[10px] md:text-[11px] font-normal leading-tight text-slate-800 italic underline underline-offset-2 mt-1">
+              {kopLine4}
+            </p>
           )}
         </div>
+
+        {/* Right Logo Slot */}
+        {sideSlotPx > 0 && (
+          <div
+            className="flex items-center justify-center overflow-hidden shrink-0"
+            style={{ width: `${sideSlotPx}px`, minHeight: `${Math.max(rightPx, 48)}px` }}
+          >
+            {showRightLogo && (
+              <img
+                src={rightLogo}
+                alt="Logo Kanan"
+                className="object-contain transition-all"
+                style={{
+                  width: `${rightPx}px`,
+                  height: `${rightPx}px`,
+                  clipPath: `inset(${rightLogoCrop.top}% ${rightLogoCrop.right}% ${rightLogoCrop.bottom}% ${rightLogoCrop.left}%)`,
+                }}
+                referrerPolicy="no-referrer"
+              />
+            )}
+          </div>
+        )}
       </div>
-      <div className="border-b border-slate-900 mt-1"></div>
+      <div className="border-b border-slate-900 mt-1.5"></div>
     </div>
   );
 }
@@ -198,7 +222,15 @@ export default function KopSuratConfigSection({
   };
 
   const handlePrint = () => {
-    window.print();
+    if (printTargetId) {
+      printElementSmart(printTargetId, {
+        title: filename,
+        paperSize,
+        orientation: "auto",
+      });
+    } else {
+      window.print();
+    }
   };
 
   const handleDownloadPNG = async () => {
@@ -380,19 +412,13 @@ export default function KopSuratConfigSection({
                     <ImageIcon className="w-4 h-4 text-indigo-600" />
                     Logo Pojok Kiri (SPPG / BGN)
                   </span>
-                  {isAdmin ? (
-                    <button
-                      type="button"
-                      onClick={() => setLeftLogo("/assets/images/app_logo_sppg.png")}
-                      className="text-[10px] text-indigo-600 hover:underline font-bold flex items-center gap-1 cursor-pointer"
-                    >
-                      <RotateCcw className="w-3 h-3" /> Reset Standar
-                    </button>
-                  ) : (
-                    <span className="text-[10px] text-amber-800 bg-amber-100 font-bold px-2 py-0.5 rounded-md flex items-center gap-1">
-                      <Lock className="w-3 h-3" /> Logo dari Admin
-                    </span>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => setLeftLogo("/assets/images/app_logo_sppg.png")}
+                    className="text-[10px] text-indigo-600 hover:underline font-bold flex items-center gap-1 cursor-pointer"
+                  >
+                    <RotateCcw className="w-3 h-3" /> Reset Standar
+                  </button>
                 </div>
 
                 <div className="flex items-center gap-4">
@@ -404,21 +430,12 @@ export default function KopSuratConfigSection({
                     )}
                   </div>
                   <div className="space-y-2 flex-1">
-                    {isAdmin ? (
-                      <>
-                        <label className="px-3 py-1.5 bg-white border border-slate-300 hover:border-indigo-400 rounded-xl text-xs font-bold text-slate-700 cursor-pointer inline-flex items-center gap-1.5 shadow-xs">
-                          <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
-                          Pilih Logo Kiri
-                          <input type="file" accept="image/*" onChange={handleLeftLogoUpload} className="hidden" />
-                        </label>
-                        <p className="text-[10px] text-slate-400">Format PNG, JPG atau SVG. Logo ini terhubung otomatis ke halaman login dan seluruh sistem.</p>
-                      </>
-                    ) : (
-                      <div className="p-2.5 bg-amber-50/80 border border-amber-200 rounded-xl text-[11px] text-amber-900 font-semibold flex items-center gap-2">
-                        <Lock className="w-4 h-4 text-amber-600 shrink-0" />
-                        <span>Logo aplikasi ditentukan & dikelola terpusat oleh Admin SISPERMBG.</span>
-                      </div>
-                    )}
+                    <label className="px-3 py-1.5 bg-white border border-slate-300 hover:border-indigo-400 rounded-xl text-xs font-bold text-slate-700 cursor-pointer inline-flex items-center gap-1.5 shadow-xs">
+                      <ImageIcon className="w-3.5 h-3.5 text-indigo-600" />
+                      Pilih Logo Kiri
+                      <input type="file" accept="image/*" onChange={handleLeftLogoUpload} className="hidden" />
+                    </label>
+                    <p className="text-[10px] text-slate-400">Format PNG, JPG atau SVG. Logo otomatis tersinkron ke seluruh lembar kerja.</p>
                   </div>
                 </div>
               </div>
