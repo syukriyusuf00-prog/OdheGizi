@@ -865,7 +865,7 @@ export async function loadGlobalSheetSyncConfig(): Promise<SheetSyncConfig | nul
   // 1. Express Real-Time Hub (fast, works even during Firestore quota cap)
   try {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 4000);
+    const timer = setTimeout(() => controller.abort(), 2500);
     const res = await fetch("/api/realtime/sheet-config", {
       method: "GET",
       cache: "no-store",
@@ -883,10 +883,13 @@ export async function loadGlobalSheetSyncConfig(): Promise<SheetSyncConfig | nul
     }
   } catch {}
 
-  // 2. Firestore global config
+  // 2. Firestore global config (strictly bounded at 2.5s so login never stalls on mobile/Incognito)
   try {
-    const snap = await getDoc(doc(db, "configs", "user_sheet_sync"));
-    if (snap.exists()) {
+    const snap = await Promise.race([
+      getDoc(doc(db, "configs", "user_sheet_sync")).catch(() => null),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2500)),
+    ]);
+    if (snap && snap.exists()) {
       const fsCfg = snap.data() as SheetSyncConfig;
       if (fsCfg && (fsCfg.spreadsheetId || fsCfg.webhookUrl)) {
         try {

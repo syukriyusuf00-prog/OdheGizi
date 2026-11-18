@@ -11,10 +11,34 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function authEmailLower() {
+      return isSignedIn() && ('email' in request.auth.token) && request.auth.token.email is string
+        ? request.auth.token.email.lower()
+        : '';
+    }
+
     function isVerifiedAuth() {
       return isSignedIn()
+        && ('email' in request.auth.token)
         && request.auth.token.email is string
+        && ('email_verified' in request.auth.token)
         && request.auth.token.email_verified == true;
+    }
+
+    // Allows Google Sign-In tenants (including Google accounts linked to external domains) to self-register as pending USER
+    function isGoogleOrVerifiedAuth() {
+      return isSignedIn()
+        && ('email' in request.auth.token)
+        && request.auth.token.email is string
+        && request.auth.token.email.size() > 0
+        && (
+          (('email_verified' in request.auth.token) && request.auth.token.email_verified == true)
+          || (
+            ('firebase' in request.auth.token)
+            && ('sign_in_provider' in request.auth.token.firebase)
+            && request.auth.token.firebase.sign_in_provider == 'google.com'
+          )
+        );
     }
 
     function isOwner(userId) {
@@ -33,12 +57,6 @@ service cloud.firestore {
       return resource.data;
     }
 
-    function authEmailLower() {
-      return isSignedIn() && request.auth.token.email is string
-        ? request.auth.token.email.lower()
-        : '';
-    }
-
     function isMainAdminToken() {
       return isVerifiedAuth()
         && authEmailLower() in [
@@ -53,50 +71,49 @@ service cloud.firestore {
         || (
           isVerifiedAuth()
           && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+          && ('peran' in get(/databases/$(database)/documents/users/$(request.auth.uid)).data)
           && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.peran == 'ADMIN'
         );
     }
 
     // Allows first-time Google login migration ONLY if Admin already pre-approved an active sheet_user_* record for the exact same verified email
     function hasApprovedSheetMigration(data) {
-      return ('migratedFromDocId' in data)
+      return isVerifiedAuth()
+        && ('migratedFromDocId' in data)
         && data.migratedFromDocId is string
         && data.migratedFromDocId.matches('^sheet_user_[a-z0-9_]+$')
         && exists(/databases/$(database)/documents/users/$(data.migratedFromDocId))
+        && ('email' in get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data)
         && get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data.email is string
         && get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data.email.lower() == authEmailLower()
+        && ('statusPersetujuan' in get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data)
         && get(/databases/$(database)/documents/users/$(data.migratedFromDocId)).data.statusPersetujuan == 'aktif';
     }
 
-    // 3. Strict User Self-Create & Self-Update Validators (Prevents RBAC Escalation & Tampering with Admin Access Controls)
-    function isOptionalBoundedString(data, field, maxLen) {
-      return !(field in data)
-        || data[field] == null
-        || (data[field] is string && data[field].size() <= maxLen);
-    }
-
+    // 3. Strict User Self-Create & Self-Update Validators (Explicit static checks — zero runtime evaluation traps)
     function isValidUserFieldBounds(data) {
-      return data.email is string && data.email.size() > 0 && data.email.size() <= 256
-        && isOptionalBoundedString(data, 'namaLengkap', 160)
-        && isOptionalBoundedString(data, 'profesi', 120)
-        && isOptionalBoundedString(data, 'namaSPPG', 160)
-        && isOptionalBoundedString(data, 'noHp', 40)
-        && isOptionalBoundedString(data, 'mulaiPada', 32)
-        && isOptionalBoundedString(data, 'berakhirPada', 32)
-        && isOptionalBoundedString(data, 'keterangan', 300)
-        && isOptionalBoundedString(data, 'sumber', 64)
-        && isOptionalBoundedString(data, 'lastDeviceId', 64)
-        && isOptionalBoundedString(data, 'lastDeviceLabel', 160)
+      return ('email' in data) && data.email is string && data.email.size() > 0 && data.email.size() <= 256
+        && (!('namaLengkap' in data) || data.namaLengkap == null || (data.namaLengkap is string && data.namaLengkap.size() <= 160))
+        && (!('profesi' in data) || data.profesi == null || (data.profesi is string && data.profesi.size() <= 120))
+        && (!('namaSPPG' in data) || data.namaSPPG == null || (data.namaSPPG is string && data.namaSPPG.size() <= 160))
+        && (!('noHp' in data) || data.noHp == null || (data.noHp is string && data.noHp.size() <= 40))
+        && (!('mulaiPada' in data) || data.mulaiPada == null || (data.mulaiPada is string && data.mulaiPada.size() <= 32))
+        && (!('berakhirPada' in data) || data.berakhirPada == null || (data.berakhirPada is string && data.berakhirPada.size() <= 32))
+        && (!('keterangan' in data) || data.keterangan == null || (data.keterangan is string && data.keterangan.size() <= 300))
+        && (!('sumber' in data) || data.sumber == null || (data.sumber is string && data.sumber.size() <= 64))
+        && (!('lastDeviceId' in data) || data.lastDeviceId == null || (data.lastDeviceId is string && data.lastDeviceId.size() <= 64))
+        && (!('lastDeviceLabel' in data) || data.lastDeviceLabel == null || (data.lastDeviceLabel is string && data.lastDeviceLabel.size() <= 160))
         && (!('loginCount' in data) || (data.loginCount is number && data.loginCount >= 0 && data.loginCount <= 1000000));
     }
 
     function isValidUserSelfCreate(userId, data) {
-      return isVerifiedAuth()
+      return isGoogleOrVerifiedAuth()
         && isValidId(userId)
         && isValidUserFieldBounds(data)
-        && data.uid == userId
+        && ('uid' in data) && data.uid == userId
         && data.email.lower() == authEmailLower()
-        && data.peran == 'USER'
+        && ('peran' in data) && data.peran == 'USER'
+        && ('statusPersetujuan' in data)
         && (
           (
             data.statusPersetujuan == 'menunggu'
@@ -110,34 +127,46 @@ service cloud.firestore {
 
     function isSafeSelfRoleTransition(next, prev) {
       return (!('peran' in prev) || prev.peran == null || prev.peran == '')
-        ? next.peran == 'USER'
-        : next.peran == prev.peran;
+        ? (('peran' in next) && next.peran == 'USER')
+        : (('peran' in next) && next.peran == prev.peran);
     }
 
     function isSafeSelfStatusTransition(next, prev) {
       return (!('statusPersetujuan' in prev) || prev.statusPersetujuan == null || prev.statusPersetujuan == '' || prev.statusPersetujuan == 'pending')
-        ? next.statusPersetujuan == 'menunggu'
-        : next.statusPersetujuan == prev.statusPersetujuan;
+        ? (('statusPersetujuan' in next) && next.statusPersetujuan == 'menunggu')
+        : (('statusPersetujuan' in next) && next.statusPersetujuan == prev.statusPersetujuan);
     }
 
-    function isAdminFieldUnchanged(field, next, prev, allowedInitial) {
-      return (!(field in next) && (!(field in prev) || prev[field] == null || prev[field] == ''))
-        || ((field in prev) && prev[field] != null && prev[field] != '' && (field in next) && next[field] == prev[field])
-        || ((!(field in prev) || prev[field] == null || prev[field] == '') && (field in next) && (next[field] == null || next[field] in allowedInitial));
+    function isMulaiPadaUnchanged(next, prev) {
+      return (!('mulaiPada' in prev) || prev.mulaiPada == null || prev.mulaiPada == '')
+        ? (!('mulaiPada' in next) || next.mulaiPada == null || next.mulaiPada == '')
+        : (('mulaiPada' in next) && next.mulaiPada == prev.mulaiPada);
+    }
+
+    function isBerakhirPadaUnchanged(next, prev) {
+      return (!('berakhirPada' in prev) || prev.berakhirPada == null || prev.berakhirPada == '')
+        ? (!('berakhirPada' in next) || next.berakhirPada == null || next.berakhirPada == '')
+        : (('berakhirPada' in next) && next.berakhirPada == prev.berakhirPada);
+    }
+
+    function isKeteranganUnchanged(next, prev) {
+      return (!('keterangan' in prev) || prev.keterangan == null || prev.keterangan == '')
+        ? (!('keterangan' in next) || next.keterangan == null || next.keterangan in ['', 'Daftar Tunggu - Menunggu ACC Admin Odhe Gizi'])
+        : (('keterangan' in next) && next.keterangan == prev.keterangan);
     }
 
     function isValidUserSelfUpdate(userId, next, prev) {
-      return isVerifiedAuth()
+      return isGoogleOrVerifiedAuth()
         && isValidId(userId)
         && isValidUserFieldBounds(next)
-        && next.uid == userId
+        && ('uid' in next) && next.uid == userId
         && next.email.lower() == authEmailLower()
         && (!('email' in prev) || prev.email == null || prev.email == '' || next.email.lower() == prev.email.lower())
         && isSafeSelfRoleTransition(next, prev)
         && isSafeSelfStatusTransition(next, prev)
-        && isAdminFieldUnchanged('mulaiPada', next, prev, [''])
-        && isAdminFieldUnchanged('berakhirPada', next, prev, [''])
-        && isAdminFieldUnchanged('keterangan', next, prev, ['', 'Daftar Tunggu - Menunggu ACC Admin Odhe Gizi']);
+        && isMulaiPadaUnchanged(next, prev)
+        && isBerakhirPadaUnchanged(next, prev)
+        && isKeteranganUnchanged(next, prev);
     }
 
     // 4. Device Telemetry Payload Validator
@@ -158,13 +187,13 @@ service cloud.firestore {
         && data.browserName is string && data.browserName.size() <= 80
         && data.sessionState is string && data.sessionState in ['guest', 'registering', 'active', 'demo']
         && data.lastSeenAt is string && data.lastSeenAt.size() <= 64
-        && (!('deviceModel' in data) || (data.deviceModel is string && data.deviceModel.size() <= 100))
-        && (!('screenResolution' in data) || (data.screenResolution is string && data.screenResolution.size() <= 40))
-        && (!('viewportSize' in data) || (data.viewportSize is string && data.viewportSize.size() <= 40))
-        && (!('language' in data) || (data.language is string && data.language.size() <= 32))
-        && (!('timezone' in data) || (data.timezone is string && data.timezone.size() <= 80))
-        && (!('ipAddress' in data) || (data.ipAddress is string && data.ipAddress.size() <= 64))
-        && (!('userAgent' in data) || (data.userAgent is string && data.userAgent.size() <= 320))
+        && (!('deviceModel' in data) || data.deviceModel == null || (data.deviceModel is string && data.deviceModel.size() <= 100))
+        && (!('screenResolution' in data) || data.screenResolution == null || (data.screenResolution is string && data.screenResolution.size() <= 40))
+        && (!('viewportSize' in data) || data.viewportSize == null || (data.viewportSize is string && data.viewportSize.size() <= 40))
+        && (!('language' in data) || data.language == null || (data.language is string && data.language.size() <= 32))
+        && (!('timezone' in data) || data.timezone == null || (data.timezone is string && data.timezone.size() <= 80))
+        && (!('ipAddress' in data) || data.ipAddress == null || (data.ipAddress is string && data.ipAddress.size() <= 64))
+        && (!('userAgent' in data) || data.userAgent == null || (data.userAgent is string && data.userAgent.size() <= 320))
         && (!('userUid' in data) || data.userUid == null || (data.userUid is string && data.userUid.size() <= 128))
         && (!('userEmail' in data) || data.userEmail == null || (data.userEmail is string && data.userEmail.size() <= 256))
         && (!('userName' in data) || data.userName == null || (data.userName is string && data.userName.size() <= 160))
@@ -172,7 +201,7 @@ service cloud.firestore {
         && (!('peran' in data) || data.peran == null || (data.peran is string && data.peran.size() <= 32))
         && (!('statusPersetujuan' in data) || data.statusPersetujuan == null || (data.statusPersetujuan is string && data.statusPersetujuan.size() <= 32))
         && (!('isOnline' in data) || data.isOnline is bool)
-        && (!('firstSeenAt' in data) || (data.firstSeenAt is string && data.firstSeenAt.size() <= 64));
+        && (!('firstSeenAt' in data) || data.firstSeenAt == null || (data.firstSeenAt is string && data.firstSeenAt.size() <= 64));
     }
 
     // 5. Connectivity Probe
@@ -203,7 +232,7 @@ service cloud.firestore {
 
     // 7. Real-Time Device Registry (Write heartbeat validated; listing & deletion restricted to Admin)
     match /devices/{deviceId} {
-      allow get, delete: if isAdmin() && isValidId(deviceId);
+      allow get, delete: if isValidId(deviceId) && isAdmin();
       allow list: if isAdmin();
       allow create, update: if isValidId(deviceId) && isValidDevicePayload(deviceId, incoming());
     }
@@ -212,27 +241,34 @@ service cloud.firestore {
     match /users/{userId} {
       // Listing all users is strictly Admin-only (prevents PII harvesting)
       allow list: if isAdmin();
+      // Evaluate isOwner FIRST so non-admin users never incur or trip on Admin doc lookups
       allow get: if isValidId(userId) && (
-        isAdmin()
-        || isOwner(userId)
-        || (isVerifiedAuth() && resource != null && resource.data.email is string && resource.data.email.lower() == authEmailLower())
+        isOwner(userId)
+        || isAdmin()
+        || (isVerifiedAuth() && resource != null && ('email' in resource.data) && resource.data.email is string && resource.data.email.lower() == authEmailLower())
       );
       allow create: if isValidId(userId) && (
-        isAdmin()
-        || (isOwner(userId) && isValidUserSelfCreate(userId, incoming()))
+        (isOwner(userId) && isValidUserSelfCreate(userId, incoming()))
+        || isAdmin()
       );
       allow update: if isValidId(userId) && (
-        isAdmin()
-        || (isOwner(userId) && isValidUserSelfUpdate(userId, incoming(), existing()))
+        (isOwner(userId) && isValidUserSelfUpdate(userId, incoming(), existing()))
+        || isAdmin()
       );
-      allow delete: if isAdmin() && isValidId(userId);
+      allow delete: if isValidId(userId) && isAdmin();
 
       match /states/{stateKey} {
-        allow read, write: if isValidId(userId) && isValidId(stateKey) && (isAdmin() || isOwner(userId));
+        allow get, list: if isValidId(userId) && isValidId(stateKey) && (isOwner(userId) || isAdmin());
+        allow create, update: if isValidId(userId) && isValidId(stateKey)
+          && (isOwner(userId) || isAdmin())
+          && (!('userId' in incoming()) || incoming().userId == userId)
+          && (!('stateKey' in incoming()) || incoming().stateKey == stateKey)
+          && (!('data' in incoming()) || (incoming().data is string && incoming().data.size() <= 950000));
+        allow delete: if isValidId(userId) && isValidId(stateKey) && (isOwner(userId) || isAdmin());
       }
 
       match /devices/{deviceId} {
-        allow read, write: if isValidId(userId) && isValidId(deviceId) && (isAdmin() || isOwner(userId));
+        allow read, write: if isValidId(userId) && isValidId(deviceId) && (isOwner(userId) || isAdmin());
       }
     }
   }

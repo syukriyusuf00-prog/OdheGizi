@@ -1,14 +1,23 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { onAuthStateChanged, User } from "firebase/auth";
 import {
   collection,
   onSnapshot,
-  getDocs,
+  getDocsFromServer,
   doc,
   setDoc,
   deleteDoc,
   serverTimestamp,
 } from "firebase/firestore";
-import { db, reportFirestoreWriteResult, stripUndefinedDeep } from "../lib/firebase.ts";
+import {
+  auth,
+  db,
+  firestoreRestDeleteDoc,
+  firestoreRestListCollection,
+  firestoreRestUpsertDoc,
+  reportFirestoreWriteResult,
+  stripUndefinedDeep,
+} from "../lib/firebase.ts";
 import {
   DEFAULT_WAITING_NOTE,
   isMainAdminEmail,
@@ -286,9 +295,17 @@ const synthesizeUsersFromDevices = (devicesList: DeviceRecord[]): any[] => {
   return Array.from(byEmail.values());
 };
 
-const mergeDeduplicatedUsers = (sources: any[][]): any[] => {
+interface MergeUserSources {
+  authoritative?: any[]; // Cloud Firestore users & Real-Time Hub users — NEVER hidden by local deleted_tenant_emails
+  deviceFallback?: any[]; // Synthesized from devices — filtered by deleted_tenant_emails unless newer
+  localCached?: any[]; // Local browser cache — filtered by deleted_tenant_emails
+  pendingDeleted?: Map<string, number>; // Short-lived in-flight deletes (prevents 1-2s snapshot flicker)
+}
+
+const mergeDeduplicatedUsers = (sources: MergeUserSources): any[] => {
   const deletedMap = getDeletedTenantEmailMap();
   const byEmail = new Map<string, any>();
+  const now = Date.now();
 
   const isPlaceholderId = (id: string) =>
     id.startsWith("custom_user_") ||
@@ -296,24 +313,44 @@ const mergeDeduplicatedUsers = (sources: any[][]): any[] => {
     id.startsWith("device_user_") ||
     id.startsWith("admin_");
 
-  sources.flat().forEach((raw) => {
+  const taggedItems: Array<{ raw: any; isAuthoritative: boolean }> = [
+    ...(sources.authoritative || []).map((raw) => ({ raw, isAuthoritative: true })),
+    ...(sources.deviceFallback || []).map((raw) => ({ raw, isAuthoritative: false })),
+    ...(sources.localCached || []).map((raw) => ({ raw, isAuthoritative: false })),
+  ];
+
+  taggedItems.forEach(({ raw, isAuthoritative }) => {
     if (!raw || !raw.email) return;
     const em = String(raw.email).toLowerCase().trim();
     if (!em || em === "demo@sispermbg.id") return;
 
-    const deletedAtMs = deletedMap[em];
-    if (deletedAtMs) {
-      const recordActivityMs = Math.max(
-        getTimestampMs(raw.loginTerakhir),
-        getTimestampMs(raw.updatedAt),
-        getTimestampMs(raw.createdAt)
-      );
-      // If this user logged in AGAIN after Admin deleted them, automatically un-hide them!
-      if (recordActivityMs > deletedAtMs + 1500) {
+    // Suppress only while an explicit Admin DELETE is currently propagating (< 6 seconds)
+    const pendingDeleteTs = sources.pendingDeleted?.get(em);
+    if (pendingDeleteTs && now - pendingDeleteTs < 6000) {
+      return;
+    }
+
+    if (isAuthoritative) {
+      // Authoritative live record from Cloud Firestore or Hub must NEVER be hidden by stale localStorage cache
+      if (deletedMap[em]) {
         removeDeletedTenantEmail(em);
         delete deletedMap[em];
-      } else {
-        return;
+      }
+    } else {
+      const deletedAtMs = deletedMap[em];
+      if (deletedAtMs) {
+        const recordActivityMs = Math.max(
+          getTimestampMs(raw.loginTerakhir),
+          getTimestampMs(raw.updatedAt),
+          getTimestampMs(raw.createdAt)
+        );
+        // If this user logged in AGAIN after Admin deleted them, automatically un-hide them!
+        if (recordActivityMs > deletedAtMs + 1500) {
+          removeDeletedTenantEmail(em);
+          delete deletedMap[em];
+        } else {
+          return;
+        }
       }
     }
 
@@ -427,12 +464,17 @@ export default function AdminPanel({
   adminEmail,
 }: AdminPanelProps) {
   const { user: authUser } = useAuth();
+  const [firebaseAuthUser, setFirebaseAuthUser] = useState<User | null>(() => auth.currentUser);
   const firestoreUsersRef = useRef<any[]>([]);
   const hubUsersRef = useRef<any[]>([]);
   const firestoreDevicesRef = useRef<DeviceRecord[]>([]);
   const hubDevicesRef = useRef<DeviceRecord[]>([]);
+  const pendingDeletedEmailsRef = useRef<Map<string, number>>(new Map());
+  const isFetchingCloudRef = useRef<boolean>(false);
 
-  const [users, setUsers] = useState<any[]>(() => mergeDeduplicatedUsers([readLocalCachedUsers()]));
+  const [users, setUsers] = useState<any[]>(() =>
+    mergeDeduplicatedUsers({ localCached: readLocalCachedUsers() })
+  );
   const [devices, setDevices] = useState<DeviceRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -456,6 +498,14 @@ export default function AdminPanel({
 
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
+  // Track the live Firebase Auth instance directly (independent of local simulated sessions)
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setFirebaseAuthUser(u);
+    });
+    return () => unsub();
+  }, []);
+
   const showToast = useCallback((type: "success" | "error" | "info", text: string) => {
     setToast({ type, text });
   }, []);
@@ -471,12 +521,12 @@ export default function AdminPanel({
       ...firestoreDevicesRef.current,
       ...hubDevicesRef.current,
     ]);
-    const merged = mergeDeduplicatedUsers([
-      firestoreUsersRef.current,
-      hubUsersRef.current,
-      deviceFallbackUsers,
-      readLocalCachedUsers(),
-    ]);
+    const merged = mergeDeduplicatedUsers({
+      authoritative: [...firestoreUsersRef.current, ...hubUsersRef.current],
+      deviceFallback: deviceFallbackUsers,
+      localCached: readLocalCachedUsers(),
+      pendingDeleted: pendingDeletedEmailsRef.current,
+    });
     setUsers(merged);
   }, []);
 
@@ -497,75 +547,164 @@ export default function AdminPanel({
     recomputeUsers();
   }, [recomputeUsers]);
 
-  // Manual / on-demand refresh across BOTH Firestore collections and Real-Time Hub
+  // Authoritative Cloud Firestore fetch via Direct Authenticated REST API v1 (+ getDocsFromServer fallback)
+  // Bypasses stalled WebChannels / stale IndexedDB caches so mobile & Incognito logins appear immediately!
+  const fetchFirestoreAuthoritative = useCallback(
+    async (fbUser: User | null, forceTokenRefresh = false): Promise<{ ok: boolean; count: number }> => {
+      if (!fbUser || isFetchingCloudRef.current) {
+        return { ok: false, count: firestoreUsersRef.current.length };
+      }
+      isFetchingCloudRef.current = true;
+      try {
+        let idToken = await fbUser.getIdToken(forceTokenRefresh).catch(() => null);
+        if (!idToken) {
+          idToken = await fbUser.getIdToken(true).catch(() => null);
+        }
+
+        let [usersRes, devicesRes] = await Promise.all([
+          firestoreRestListCollection("users", { idToken, timeoutMs: 6500 }),
+          firestoreRestListCollection("devices", { idToken, timeoutMs: 6500 }),
+        ]);
+
+        // If 403 occurred due to stale token, force-refresh ID token and retry once
+        if (!usersRes.ok && usersRes.permissionDenied && !forceTokenRefresh) {
+          const freshToken = await fbUser.getIdToken(true).catch(() => null);
+          if (freshToken) {
+            [usersRes, devicesRes] = await Promise.all([
+              firestoreRestListCollection("users", { idToken: freshToken, timeoutMs: 6500 }),
+              firestoreRestListCollection("devices", { idToken: freshToken, timeoutMs: 6500 }),
+            ]);
+          }
+        }
+
+        let gotUsers = false;
+        if (usersRes.ok && Array.isArray(usersRes.data)) {
+          gotUsers = true;
+          setFirestoreSyncError(null);
+          firestoreUsersRef.current = usersRes.data
+            .filter((d) => d && d.email)
+            .map((d) => ({
+              ...d,
+              id: d.id,
+              uid: d.uid || d.id,
+            }));
+        } else if (usersRes.permissionDenied) {
+          setFirestoreSyncError(
+            "Akses baca database cloud ditolak untuk akun ini. Pastikan Anda masuk Panel Admin menggunakan email Google Admin utama (bukan sesi lokal) lalu klik Muat Ulang Cloud."
+          );
+        } else if (usersRes.quotaExceeded) {
+          setFirestoreSyncError(
+            "Kuota harian Firestore (Free Tier) sedang penuh sementara. Klik Muat Ulang Cloud lagi nanti atau tinjau kuota Firebase Console."
+          );
+        } else {
+          // Fallback to Firestore SDK server fetch when direct REST encounters transient network hiccup
+          try {
+            const sdkUsersSnap = await fetchWithTimeout(
+              getDocsFromServer(collection(db, "users")),
+              5500,
+              null
+            );
+            if (sdkUsersSnap) {
+              gotUsers = true;
+              setFirestoreSyncError(null);
+              const list: any[] = [];
+              sdkUsersSnap.forEach((docSnap) => {
+                const data = docSnap.data();
+                if (data && data.email) {
+                  list.push({ id: docSnap.id, uid: data.uid || docSnap.id, ...data });
+                }
+              });
+              firestoreUsersRef.current = list;
+            }
+          } catch (err: any) {
+            setFirestoreSyncError(
+              `Sinkronisasi Cloud Firestore sementara terganggu (${err?.code || err?.message || "offline"}). Klik Muat Ulang Cloud untuk mencoba lagi.`
+            );
+          }
+        }
+
+        if (devicesRes.ok && Array.isArray(devicesRes.data)) {
+          firestoreDevicesRef.current = devicesRes.data.filter(
+            (d): d is DeviceRecord => Boolean(d && d.deviceId)
+          );
+        } else if (!devicesRes.permissionDenied && !devicesRes.quotaExceeded) {
+          try {
+            const sdkDevicesSnap = await fetchWithTimeout(
+              getDocsFromServer(collection(db, "devices")),
+              4500,
+              null
+            );
+            if (sdkDevicesSnap) {
+              const list: DeviceRecord[] = [];
+              sdkDevicesSnap.forEach((docSnap) => {
+                const data = docSnap.data() as DeviceRecord;
+                if (data && data.deviceId) list.push(data);
+              });
+              firestoreDevicesRef.current = list;
+            }
+          } catch {}
+        }
+
+        recomputeDevices();
+        recomputeUsers();
+        return { ok: gotUsers, count: firestoreUsersRef.current.length };
+      } finally {
+        isFetchingCloudRef.current = false;
+      }
+    },
+    [recomputeDevices, recomputeUsers]
+  );
+
+  // Manual / on-demand refresh across BOTH Cloud Firestore (REST + SDK) and Real-Time Hub
   const handleManualRefresh = useCallback(
     async (silent = false) => {
       if (!silent) setIsRefreshing(true);
       try {
-        const [hubSnap, fsUsersSnap, fsDevicesSnap] = await Promise.all([
+        const activeFbUser = firebaseAuthUser || auth.currentUser;
+        const [hubSnap] = await Promise.all([
           fetch("/api/realtime/snapshot", { cache: "no-store" })
             .then((r) => (r.ok ? r.json() : null))
             .catch(() => null),
-          authUser?.uid
-            ? getDocs(collection(db, "users")).catch((err) => {
-                setFirestoreSyncError(
-                  `Sinkronisasi Firestore sementara terganggu (${err?.code || err?.message || "offline"}). Klik Segarkan untuk mencoba lagi.`
-                );
-                return null;
-              })
-            : Promise.resolve(null),
-          authUser?.uid
-            ? getDocs(collection(db, "devices")).catch(() => null)
-            : Promise.resolve(null),
+          activeFbUser ? fetchFirestoreAuthoritative(activeFbUser, !silent) : Promise.resolve(null),
         ]);
 
         if (hubSnap) {
           if (Array.isArray(hubSnap.users)) hubUsersRef.current = hubSnap.users;
           if (Array.isArray(hubSnap.devices)) hubDevicesRef.current = hubSnap.devices;
         }
-        if (fsUsersSnap) {
-          setFirestoreSyncError(null);
-          const list: any[] = [];
-          fsUsersSnap.forEach((docSnap) => {
-            const data = docSnap.data();
-            if (data && data.email) {
-              list.push({ id: docSnap.id, uid: data.uid || docSnap.id, ...data });
-            }
-          });
-          firestoreUsersRef.current = list;
-        }
-        if (fsDevicesSnap) {
-          const list: DeviceRecord[] = [];
-          fsDevicesSnap.forEach((docSnap) => {
-            const data = docSnap.data() as DeviceRecord;
-            if (data && data.deviceId) list.push(data);
-          });
-          firestoreDevicesRef.current = list;
-        }
         recomputeDevices();
         recomputeUsers();
         if (!silent) {
-          const totalCount = mergeDeduplicatedUsers([
-            firestoreUsersRef.current,
-            hubUsersRef.current,
-            synthesizeUsersFromDevices([...firestoreDevicesRef.current, ...hubDevicesRef.current]),
-            readLocalCachedUsers(),
-          ]).length;
-          showToast("success", `Daftar pengguna berhasil disegarkan (${totalCount} akun terdeteksi).`);
+          const totalCount = mergeDeduplicatedUsers({
+            authoritative: [...firestoreUsersRef.current, ...hubUsersRef.current],
+            deviceFallback: synthesizeUsersFromDevices([
+              ...firestoreDevicesRef.current,
+              ...hubDevicesRef.current,
+            ]),
+            localCached: readLocalCachedUsers(),
+            pendingDeleted: pendingDeletedEmailsRef.current,
+          }).length;
+          showToast(
+            "success",
+            `Daftar pengguna berhasil disegarkan dari Cloud (${totalCount} akun terdeteksi).`
+          );
         }
       } finally {
         if (!silent) setIsRefreshing(false);
         setLoading(false);
       }
     },
-    [authUser?.uid, recomputeDevices, recomputeUsers, showToast]
+    [firebaseAuthUser, fetchFirestoreAuthoritative, recomputeDevices, recomputeUsers, showToast]
   );
 
-  // Dual-Channel Real-Time Sync: Firestore onSnapshot + Express SSE Real-Time Hub
+  // Triple-Channel Real-Time Sync:
+  // 1. Direct Cloud Firestore REST authoritative fetch (on mount, window focus, tab return, and 15s poll)
+  // 2. Cloud Firestore SDK onSnapshot real-time push listeners
+  // 3. Express SSE Real-Time Hub (for same-origin instant notifications)
   useEffect(() => {
     let mounted = true;
 
-    // 1. Express Real-Time Snapshot + SSE Stream (instant mobile -> laptop detection)
+    // Channel 1: Express Real-Time Snapshot + SSE Stream
     fetch("/api/realtime/snapshot", { cache: "no-store" })
       .then((res) => (res.ok ? res.json() : null))
       .then((snap) => {
@@ -578,10 +717,10 @@ export default function AdminPanel({
           hubDevicesRef.current = snap.devices;
           recomputeDevices();
         }
-        setLoading(false);
+        if (!firebaseAuthUser) setLoading(false);
       })
       .catch(() => {
-        if (mounted) setLoading(false);
+        if (mounted && !firebaseAuthUser) setLoading(false);
       });
 
     let sse: EventSource | null = null;
@@ -609,6 +748,7 @@ export default function AdminPanel({
           if (!incoming?.email) return;
           const em = String(incoming.email).toLowerCase().trim();
           removeDeletedTenantEmail(em);
+          pendingDeletedEmailsRef.current.delete(em);
           const next = hubUsersRef.current.filter(
             (u) => String(u.email || "").toLowerCase().trim() !== em && u.uid !== incoming.uid
           );
@@ -659,11 +799,20 @@ export default function AdminPanel({
       });
     } catch {}
 
-    // 2. Firestore real-time collection listeners (attached once Auth session is ready)
+    // Channel 2 & 3: Cloud Firestore Authoritative REST Fetch + SDK onSnapshot + Focus/Interval Safety Net
     let unsubUsers: (() => void) | null = null;
     let unsubDevices: (() => void) | null = null;
+    let pollTimer: number | null = null;
+    let handleWindowFocus: (() => void) | null = null;
+    let handleVisibilityChange: (() => void) | null = null;
 
-    if (authUser?.uid) {
+    if (firebaseAuthUser?.uid) {
+      // Immediate authoritative fetch on mount so Admin never waits on WebChannel negotiation
+      fetchFirestoreAuthoritative(firebaseAuthUser, false).finally(() => {
+        if (mounted) setLoading(false);
+      });
+
+      // Live real-time push listeners via Firestore SDK
       try {
         unsubUsers = onSnapshot(
           collection(db, "users"),
@@ -683,11 +832,11 @@ export default function AdminPanel({
           },
           (err) => {
             console.warn("Firestore users listener notice:", err);
+            // Fall back smoothly to authoritative REST fetch when SDK stream hits hiccup
             if (mounted) {
-              setFirestoreSyncError(
-                `Koneksi real-time Firestore mengalami kendala (${err?.code || "terputus"}). Data lokal/server relay tetap ditampilkan — klik Segarkan untuk memuat ulang.`
-              );
-              setLoading(false);
+              fetchFirestoreAuthoritative(firebaseAuthUser, false).finally(() => {
+                if (mounted) setLoading(false);
+              });
             }
           }
         );
@@ -713,6 +862,27 @@ export default function AdminPanel({
           }
         );
       } catch {}
+
+      // Refresh immediately when Admin returns to laptop/tab after testing on HP or Incognito
+      handleWindowFocus = () => {
+        if (mounted) fetchFirestoreAuthoritative(firebaseAuthUser, false);
+      };
+      handleVisibilityChange = () => {
+        if (mounted && document.visibilityState === "visible") {
+          fetchFirestoreAuthoritative(firebaseAuthUser, false);
+        }
+      };
+      window.addEventListener("focus", handleWindowFocus);
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+
+      // Gentle 15-second visible background poll so even if a browser throttles WebChannel, new logins appear automatically
+      pollTimer = window.setInterval(() => {
+        if (mounted && document.visibilityState === "visible") {
+          fetchFirestoreAuthoritative(firebaseAuthUser, false);
+        }
+      }, 15_000);
+    } else if (authUser?.uid) {
+      setLoading(false);
     }
 
     return () => {
@@ -720,8 +890,11 @@ export default function AdminPanel({
       if (sse) sse.close();
       if (unsubUsers) unsubUsers();
       if (unsubDevices) unsubDevices();
+      if (pollTimer !== null) window.clearInterval(pollTimer);
+      if (handleWindowFocus) window.removeEventListener("focus", handleWindowFocus);
+      if (handleVisibilityChange) document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [authUser?.uid, recomputeUsers, recomputeDevices]);
+  }, [firebaseAuthUser, authUser?.uid, fetchFirestoreAuthoritative, recomputeUsers, recomputeDevices]);
 
   const todayIso = getTodayIsoLocal();
 
@@ -874,34 +1047,69 @@ export default function AdminPanel({
         return next;
       });
 
-      // Push to Express Real-Time Hub (instant SSE unlock + optional Apps Script Webhook) & Firestore
+      // Push to Express Real-Time Hub (+ optional Apps Script Webhook) AND Cloud Firestore (Direct REST + SDK fallback)
+      const activeFbUser = firebaseAuthUser || auth.currentUser;
+      const idToken = activeFbUser ? await activeFbUser.getIdToken(false).catch(() => null) : null;
+      let anyCloudWriteFailed = false;
+      let lastCloudErr: string | null = null;
+
       await Promise.all([
         syncUserToRealtimeHub(updatedRecord),
-        ...docIds.map((docId) =>
-          fetchWithTimeout(
+        ...docIds.map(async (docId) => {
+          const cleanPayload = stripUndefinedDeep({
+            ...updatedRecord,
+            uid: docId,
+            id: docId,
+            updatedAt: nowIso,
+          });
+          // Primary fast path: Direct Authenticated Cloud Firestore REST PATCH (keepalive)
+          if (idToken) {
+            const restRes = await firestoreRestUpsertDoc("users", docId, cleanPayload, {
+              idToken,
+              keepalive: true,
+              timeoutMs: 5500,
+            });
+            if (restRes.ok) return;
+            lastCloudErr = restRes.error || null;
+          }
+          // Fallback path: Firestore SDK setDoc
+          const sdkOk = await fetchWithTimeout(
             setDoc(
               doc(db, "users", docId),
               stripUndefinedDeep({
-                ...updatedRecord,
-                uid: docId,
-                id: docId,
+                ...cleanPayload,
                 updatedAt: serverTimestamp(),
               }),
               { merge: true }
             )
-              .then(() => reportFirestoreWriteResult(true))
-              .catch((err) => reportFirestoreWriteResult(false, err)),
-            4500,
-            null
-          )
-        ),
+              .then(() => {
+                reportFirestoreWriteResult(true);
+                return true;
+              })
+              .catch((err) => {
+                reportFirestoreWriteResult(false, err);
+                lastCloudErr = err?.message || String(err);
+                return false;
+              }),
+            5000,
+            false
+          );
+          if (!sdkOk) anyCloudWriteFailed = true;
+        }),
       ]);
 
       setRecentlySavedEmail(email);
       window.setTimeout(() => {
         setRecentlySavedEmail((prev) => (prev === email ? null : prev));
       }, 2400);
-      showToast("success", successMessage);
+      if (anyCloudWriteFailed && activeFbUser) {
+        showToast(
+          "error",
+          `Perubahan lokal tersimpan, tetapi gagal sinkron ke Cloud Firestore (${lastCloudErr || "jaringan"}). Klik Muat Ulang Cloud lalu ulangi.`
+        );
+      } else {
+        showToast("success", successMessage);
+      }
     } catch (err: any) {
       showToast("error", err?.message || `Gagal menyimpan perubahan untuk ${email}.`);
     } finally {
@@ -1039,31 +1247,70 @@ export default function AdminPanel({
 
     setIsDeleting(true);
     try {
+      const deleteTs = Date.now();
+      pendingDeletedEmailsRef.current.set(email, deleteTs);
       addDeletedTenantEmail(email);
+
+      // Identify all device logs tied to this email so synthesizeUsersFromDevices never resurrects the deleted user
+      const matchingDeviceIds = Array.from(
+        new Set(
+          [...firestoreDevicesRef.current, ...hubDevicesRef.current]
+            .filter((d) => String(d?.userEmail || "").toLowerCase().trim() === email)
+            .map((d) => d.deviceId)
+            .filter(Boolean)
+        )
+      );
+
       hubUsersRef.current = hubUsersRef.current.filter(
         (u) => String(u.email || "").toLowerCase().trim() !== email
       );
       firestoreUsersRef.current = firestoreUsersRef.current.filter(
         (u) => String(u.email || "").toLowerCase().trim() !== email
       );
+      if (matchingDeviceIds.length > 0) {
+        const delDevSet = new Set(matchingDeviceIds);
+        hubDevicesRef.current = hubDevicesRef.current.filter((d) => !delDevSet.has(d.deviceId));
+        firestoreDevicesRef.current = firestoreDevicesRef.current.filter(
+          (d) => !delDevSet.has(d.deviceId)
+        );
+      }
       docIds.forEach((id) => {
         try {
           localStorage.removeItem(`offline_user_${id}`);
         } catch {}
       });
+      recomputeDevices();
       recomputeUsers();
+
+      const activeFbUser = firebaseAuthUser || auth.currentUser;
+      const idToken = activeFbUser ? await activeFbUser.getIdToken(false).catch(() => null) : null;
 
       await Promise.all([
         deleteUserFromRealtimeHub(target.uid || target.id, email),
-        ...docIds.map((id) =>
-          fetchWithTimeout(
+        ...docIds.map(async (id) => {
+          if (idToken) {
+            const restDel = await firestoreRestDeleteDoc("users", id, { idToken, timeoutMs: 4500 });
+            if (restDel.ok) return;
+          }
+          await fetchWithTimeout(
             deleteDoc(doc(db, "users", id))
               .then(() => reportFirestoreWriteResult(true))
               .catch((err) => reportFirestoreWriteResult(false, err)),
-            3000,
+            3500,
             null
-          )
-        ),
+          );
+        }),
+        ...matchingDeviceIds.map(async (devId) => {
+          await deleteDeviceFromRealtimeHub(devId);
+          if (idToken) {
+            const restDevDel = await firestoreRestDeleteDoc("devices", devId, {
+              idToken,
+              timeoutMs: 4000,
+            });
+            if (restDevDel.ok) return;
+          }
+          await fetchWithTimeout(deleteDoc(doc(db, "devices", devId)).catch(() => null), 3000, null);
+        }),
       ]);
 
       setDeleteTargetUser(null);
@@ -1113,9 +1360,15 @@ export default function AdminPanel({
     (importedUsers: any[]) => {
       if (!importedUsers.length) return;
       importedUsers.forEach((u) => {
-        if (u.email) removeDeletedTenantEmail(u.email);
+        if (u.email) {
+          const clean = String(u.email).toLowerCase().trim();
+          removeDeletedTenantEmail(clean);
+          pendingDeletedEmailsRef.current.delete(clean);
+        }
       });
-      hubUsersRef.current = mergeDeduplicatedUsers([importedUsers, hubUsersRef.current]);
+      hubUsersRef.current = mergeDeduplicatedUsers({
+        authoritative: [...importedUsers, ...hubUsersRef.current],
+      });
       recomputeUsers();
     },
     [recomputeUsers]
@@ -1146,9 +1399,17 @@ export default function AdminPanel({
     hubDevicesRef.current = hubDevicesRef.current.filter((d) => d.deviceId !== deviceId);
     firestoreDevicesRef.current = firestoreDevicesRef.current.filter((d) => d.deviceId !== deviceId);
     recomputeDevices();
+    const activeFbUser = firebaseAuthUser || auth.currentUser;
+    const idToken = activeFbUser ? await activeFbUser.getIdToken(false).catch(() => null) : null;
     await Promise.all([
       deleteDeviceFromRealtimeHub(deviceId),
-      fetchWithTimeout(deleteDoc(doc(db, "devices", deviceId)).catch(() => null), 2500, null),
+      idToken
+        ? firestoreRestDeleteDoc("devices", deviceId, { idToken, timeoutMs: 4000 }).then((r) => {
+            if (!r.ok) {
+              return fetchWithTimeout(deleteDoc(doc(db, "devices", deviceId)).catch(() => null), 2500, null);
+            }
+          })
+        : fetchWithTimeout(deleteDoc(doc(db, "devices", deviceId)).catch(() => null), 2500, null),
     ]);
   };
 
@@ -1214,6 +1475,18 @@ export default function AdminPanel({
             </button>
           </div>
         </header>
+
+        {/* ADMIN CLOUD AUTH NOTICE (Shown only if Admin is on a local/offline session without Firebase Auth token) */}
+        {!firebaseAuthUser && (
+          <div className="rounded-xl px-4 py-3 text-xs font-medium flex flex-wrap items-center justify-between gap-3 border bg-amber-50 border-amber-300 text-amber-950">
+            <div className="flex items-start gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <span>
+                Sesi Admin saat ini belum terhubung ke autentikasi Google Cloud. Untuk melihat pengguna yang masuk dari HP, mode samaran (Incognito), atau browser lain secara real-time, silakan keluar lalu masuk kembali menggunakan <strong>email Google Admin utama</strong>.
+              </span>
+            </div>
+          </div>
+        )}
 
         {/* FIRESTORE SYNC WARNING BANNER (Only shown if cloud listener reports an issue) */}
         {firestoreSyncError && (

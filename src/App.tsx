@@ -304,6 +304,9 @@ export default function App() {
     refreshUserProfile,
     authError,
     setAuthError,
+    cloudSyncStatus,
+    cloudSyncError,
+    retryCloudRegistration,
     domainAuthInfo,
     recheckDomainAndSignIn,
     isDemo,
@@ -356,6 +359,7 @@ export default function App() {
   const [isRecheckingDomain, setIsRecheckingDomain] = useState(false);
   const [domainCopied, setDomainCopied] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
+  const [isRetryingCloudSync, setIsRetryingCloudSync] = useState(false);
   const [statusCheckFeedback, setStatusCheckFeedback] = useState<{ type: "info" | "success" | "error"; text: string } | null>(null);
   const [isSavingWaitingProfile, setIsSavingWaitingProfile] = useState(false);
   const [waitingProfileSavedMsg, setWaitingProfileSavedMsg] = useState<string | null>(null);
@@ -1619,6 +1623,27 @@ export default function App() {
     }
   };
 
+  const handleRetryCloudRegistration = async () => {
+    setIsRetryingCloudSync(true);
+    setStatusCheckFeedback(null);
+    try {
+      const ok = await retryCloudRegistration();
+      if (ok) {
+        setStatusCheckFeedback({
+          type: "success",
+          text: `Email ${user?.email || ""} berhasil dikirim dan tercatat otomatis di Panel Admin SISPERMBG.`,
+        });
+      } else {
+        setStatusCheckFeedback({
+          type: "error",
+          text: "Pengiriman ke Panel Admin belum berhasil. Pastikan koneksi internet stabil lalu coba lagi.",
+        });
+      }
+    } finally {
+      setIsRetryingCloudSync(false);
+    }
+  };
+
   const handleSaveWaitingIdentity = async (e: React.FormEvent) => {
     e.preventDefault();
     setWaitingProfileSavedMsg(null);
@@ -2075,9 +2100,44 @@ export default function App() {
                 <h2 className="text-base font-extrabold text-slate-900">
                   Hubungi Odhe Gizi Untuk ACC Akses Anda
                 </h2>
-                <p className="text-xs text-slate-700 leading-relaxed">
-                  Akun email <strong className="text-slate-900">{user.email}</strong> telah tercatat otomatis di Panel Admin SISPERMBG. Silakan hubungi <strong className="text-slate-900">Odhe Gizi</strong> melalui WhatsApp di bawah ini agar akses penuh dashboard pribadi Anda segera disetujui (ACC).
-                </p>
+                {cloudSyncStatus === "syncing" ? (
+                  <p className="text-xs text-slate-700 leading-relaxed flex items-center gap-2">
+                    <RefreshCw className="w-3.5 h-3.5 text-amber-600 animate-spin shrink-0" />
+                    <span>
+                      Sedang mencatat akun email <strong className="text-slate-900">{user.email}</strong> ke Panel Admin SISPERMBG...
+                    </span>
+                  </p>
+                ) : cloudSyncStatus === "error" ? (
+                  <div className="mt-1 bg-rose-50 border border-rose-200 rounded-xl p-3.5 space-y-2.5 text-xs text-rose-900">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                      <div className="space-y-1">
+                        <p className="font-bold text-rose-950">
+                          Pendaftaran email belum masuk ke Panel Admin Cloud
+                        </p>
+                        <p className="text-[11px] text-rose-800 leading-relaxed">
+                          {cloudSyncError ||
+                            "Koneksi ke server database sementara terganggu sehingga email Anda belum tercatat di Panel Admin."}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={isRetryingCloudSync}
+                      onClick={handleRetryCloudRegistration}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-rose-600 hover:bg-rose-700 text-white font-bold rounded-lg text-xs transition cursor-pointer disabled:opacity-60"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isRetryingCloudSync ? "animate-spin" : ""}`} />
+                      <span>
+                        {isRetryingCloudSync ? "Mengirim Ulang..." : "Kirim Ulang ke Panel Admin"}
+                      </span>
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-700 leading-relaxed">
+                    Akun email <strong className="text-slate-900">{user.email}</strong> telah tercatat otomatis di Panel Admin SISPERMBG. Silakan hubungi <strong className="text-slate-900">Odhe Gizi</strong> melalui WhatsApp di bawah ini agar akses penuh dashboard pribadi Anda segera disetujui (ACC).
+                  </p>
+                )}
                 {adminNoteText && (
                   <div className="mt-2 px-3 py-2 bg-white/90 border border-amber-200 rounded-xl text-xs text-slate-700">
                     <span className="font-bold text-amber-800">Keterangan Admin: </span>

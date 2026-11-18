@@ -1,5 +1,10 @@
 import { doc, setDoc, serverTimestamp } from "firebase/firestore";
-import { db, reportFirestoreWriteResult } from "./firebase.ts";
+import {
+  db,
+  firestoreRestUpsertDoc,
+  getActiveFirebaseIdToken,
+  reportFirestoreWriteResult,
+} from "./firebase.ts";
 
 export type DeviceSessionState = "guest" | "registering" | "active" | "demo";
 
@@ -234,7 +239,7 @@ export const fetchServerDeviceMeta = async (): Promise<{ ipAddress: string }> =>
   serverMetaPromise = (async () => {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3500);
+      const timeout = setTimeout(() => controller.abort(), 1200);
       const res = await fetch("/api/device/info", {
         method: "GET",
         signal: controller.signal,
@@ -353,8 +358,13 @@ export const syncDeviceToFirestore = async (
   try {
     const record = await buildDeviceRecord(context);
 
-    // 1. Always push to Express Real-Time Hub first so Mobile <-> Laptop Admin Panel updates in < 1 second
-    const syncedRecord = (await syncDeviceToRealtimeServer(record, Boolean(context.useBeacon))) || record;
+    // 1. Push to Express Real-Time Hub (non-blocking race so static/slow hosts never delay Cloud Firestore!)
+    const hubPromise = syncDeviceToRealtimeServer(record, Boolean(context.useBeacon));
+    const syncedRecord =
+      (await Promise.race([
+        hubPromise,
+        new Promise<DeviceRecord>((resolve) => setTimeout(() => resolve(record), 1500)),
+      ])) || record;
 
     try {
       localStorage.setItem(DEVICE_CACHE_KEY, JSON.stringify(syncedRecord));
@@ -369,7 +379,7 @@ export const syncDeviceToFirestore = async (
       return syncedRecord;
     }
 
-    // 2. Quota-smart Firestore sync: only write to Firestore when session/user changes, forced, or > 5 mins elapsed
+    // 2. Quota-smart Firestore sync: write immediately when session/user changes, forced, or > 5 mins elapsed
     const stateSig = `${syncedRecord.sessionState}|${syncedRecord.userUid || ""}|${syncedRecord.userEmail || ""}|${syncedRecord.statusPersetujuan || ""}|${syncedRecord.isOnline}`;
     const nowMs = Date.now();
     const shouldWriteFirestore =
@@ -381,23 +391,60 @@ export const syncDeviceToFirestore = async (
       lastFirestoreDeviceSig = stateSig;
       lastFirestoreDeviceWriteMs = nowMs;
 
-      const deviceDocRef = doc(db, "devices", syncedRecord.deviceId);
-      const firestorePayload = {
-        ...syncedRecord,
-        updatedAt: serverTimestamp(),
+      // Sanitize strictly to the 22 whitelisted keys in firestore.rules isValidDevicePayload
+      const restPayload: Record<string, unknown> = {
+        deviceId: syncedRecord.deviceId,
+        deviceType: syncedRecord.deviceType,
+        deviceModel: clampStr(syncedRecord.deviceModel, 100),
+        osName: clampStr(syncedRecord.osName, 80),
+        browserName: clampStr(syncedRecord.browserName, 80),
+        screenResolution: clampStr(syncedRecord.screenResolution, 40),
+        viewportSize: clampStr(syncedRecord.viewportSize, 40),
+        language: clampStr(syncedRecord.language, 32),
+        timezone: clampStr(syncedRecord.timezone, 80),
+        ipAddress: clampStr(syncedRecord.ipAddress, 64),
+        userAgent: clampStr(syncedRecord.userAgent, 320),
+        sessionState: syncedRecord.sessionState,
+        userUid: syncedRecord.userUid ? clampStr(syncedRecord.userUid, 128) : null,
+        userEmail: syncedRecord.userEmail ? clampStr(syncedRecord.userEmail.toLowerCase(), 256) : null,
+        userName: syncedRecord.userName ? clampStr(syncedRecord.userName, 160) : null,
+        namaSPPG: syncedRecord.namaSPPG ? clampStr(syncedRecord.namaSPPG, 160) : null,
+        peran: syncedRecord.peran ? clampStr(syncedRecord.peran, 32) : null,
+        statusPersetujuan: syncedRecord.statusPersetujuan
+          ? clampStr(syncedRecord.statusPersetujuan, 32)
+          : null,
+        isOnline: Boolean(syncedRecord.isOnline),
+        firstSeenAt: clampStr(syncedRecord.firstSeenAt, 64),
+        lastSeenAt: clampStr(syncedRecord.lastSeenAt, 64),
+        updatedAt: new Date(),
       };
 
-      const writeTask = setDoc(deviceDocRef, firestorePayload, { merge: true })
-        .then(() => reportFirestoreWriteResult(true))
-        .catch((err) => {
-          reportFirestoreWriteResult(false, err);
-          console.warn("Notice syncing device to /devices:", err);
-        });
+      // Dual-transport: Direct HTTPS Firestore REST (survives mobile tab switch via keepalive) + SDK fallback
+      const idToken = await getActiveFirebaseIdToken(false).catch(() => null);
+      const restRes = await firestoreRestUpsertDoc("devices", syncedRecord.deviceId, restPayload, {
+        idToken,
+        keepalive: true,
+        timeoutMs: 4500,
+      });
 
-      await Promise.race([
-        writeTask,
-        new Promise((resolve) => setTimeout(resolve, 3500)),
-      ]);
+      if (!restRes.ok) {
+        const deviceDocRef = doc(db, "devices", syncedRecord.deviceId);
+        const firestorePayload = {
+          ...restPayload,
+          updatedAt: serverTimestamp(),
+        };
+        const writeTask = setDoc(deviceDocRef, firestorePayload, { merge: true })
+          .then(() => reportFirestoreWriteResult(true))
+          .catch((err) => {
+            reportFirestoreWriteResult(false, err);
+            console.warn("Notice syncing device to /devices:", err);
+          });
+
+        await Promise.race([
+          writeTask,
+          new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]);
+      }
     }
 
     return syncedRecord;

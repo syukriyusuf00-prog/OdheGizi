@@ -26,6 +26,9 @@ import {
   checkFirebaseAuthorizedDomain,
   DomainAuthCheckResult,
   stripUndefinedDeep,
+  firestoreRestGetDoc,
+  firestoreRestUpsertDoc,
+  getActiveFirebaseIdToken,
 } from "../lib/firebase.ts";
 import { clearDriveSession, getIsDriveConnecting } from "../lib/googleDrive.ts";
 import {
@@ -35,7 +38,9 @@ import {
 } from "../lib/googleSheetsSync.ts";
 import {
   buildDeviceRecord,
+  detectClientDeviceInfo,
   formatDeviceShortLabel,
+  getOrCreateDeviceId,
   syncDeviceToFirestore,
   toCompactDeviceSummary,
 } from "../lib/deviceTracker.ts";
@@ -43,27 +48,32 @@ import {
 const lookupEmailInLinkedSpreadsheet = async (email: string): Promise<Record<string, any> | null> => {
   const cleanEmail = (email || "").toLowerCase().trim();
   if (!cleanEmail) return null;
-  try {
-    // Ensure server relay knows global spreadsheet config (in case server just restarted)
-    await loadGlobalSheetSyncConfig().catch(() => null);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(
-      `/api/sheets/lookup-email?email=${encodeURIComponent(cleanEmail)}`,
-      {
-        method: "GET",
-        cache: "no-store",
-        signal: controller.signal,
+  const runLookup = async (): Promise<Record<string, any> | null> => {
+    try {
+      await loadGlobalSheetSyncConfig().catch(() => null);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3000);
+      const res = await fetch(
+        `/api/sheets/lookup-email?email=${encodeURIComponent(cleanEmail)}`,
+        {
+          method: "GET",
+          cache: "no-store",
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timer);
+      if (!res.ok) return null;
+      const data = await res.json();
+      if (data?.found && data?.sheetUser) {
+        return data.sheetUser;
       }
-    );
-    clearTimeout(timer);
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (data?.found && data?.sheetUser) {
-      return data.sheetUser;
-    }
-  } catch {}
-  return null;
+    } catch {}
+    return null;
+  };
+  return Promise.race([
+    runLookup(),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
+  ]);
 };
 
 // Quota protection: deduplicate identical state writes so opening/refreshing never burns Firestore write units
@@ -106,96 +116,232 @@ const sanitizeUserProfileForFirestore = (raw: Record<string, any>): Record<strin
   });
 };
 
+const SELF_UPDATE_SAFE_FIELDS = [
+  "uid",
+  "id",
+  "email",
+  "namaLengkap",
+  "profesi",
+  "namaSPPG",
+  "noHp",
+  "authProvider",
+  "emailVerified",
+  "sumber",
+  "lastDevice",
+  "lastDeviceLabel",
+  "lastDeviceId",
+  "lastDeviceSeenAt",
+  "loginCount",
+  "updatedAt",
+  "loginTerakhir",
+];
+
+interface PersistProfileResult {
+  ok: boolean;
+  via?: "rest" | "sdk";
+  error?: string;
+}
+
 const persistUserProfileToFirestore = async (
   userId: string,
   profile: Record<string, any>,
   existingFirestoreDoc?: Record<string, any> | null,
-  options?: { isCreate?: boolean }
-): Promise<boolean> => {
-  if (!userId || userId === "demo_user_5min") return false;
-  const userRef = doc(db, "users", userId);
+  options?: { isCreate?: boolean; firebaseUser?: User | null }
+): Promise<PersistProfileResult> => {
+  if (!userId || userId === "demo_user_5min") {
+    return { ok: false, error: "Invalid user ID" };
+  }
+
   const baseSanitized = sanitizeUserProfileForFirestore({
     ...profile,
     uid: userId,
     id: userId,
   });
-  const writePayload = {
-    ...baseSanitized,
-    createdAt: existingFirestoreDoc?.createdAt || baseSanitized.createdAt || serverTimestamp(),
-    updatedAt: serverTimestamp(),
-    loginTerakhir: serverTimestamp(),
+  const isMainAdmin = isMainAdminEmail(baseSanitized.email);
+  const nowDate = new Date();
+
+  const buildRestCreatePayload = (safeMode = false): Record<string, any> => {
+    const payload: Record<string, any> = {
+      ...baseSanitized,
+      peran: isMainAdmin ? "ADMIN" : "USER",
+      statusPersetujuan:
+        isMainAdmin
+          ? "aktif"
+          : !safeMode &&
+            baseSanitized.statusPersetujuan === "aktif" &&
+            typeof baseSanitized.migratedFromDocId === "string" &&
+            baseSanitized.migratedFromDocId.startsWith("sheet_user_")
+          ? "aktif"
+          : "menunggu",
+      mulaiPada: isMainAdmin ? baseSanitized.mulaiPada || "" : "",
+      berakhirPada: "",
+      keterangan: isMainAdmin ? "Administrator Utama" : DEFAULT_WAITING_NOTE,
+      createdAt: nowDate,
+      updatedAt: nowDate,
+      loginTerakhir: nowDate,
+    };
+    if (safeMode || payload.statusPersetujuan !== "aktif") {
+      delete payload.migratedFromDocId;
+    }
+    return stripUndefinedDeep(payload);
   };
 
-  const attemptWrite = async (payload: Record<string, any>): Promise<void> => {
-    await setDoc(userRef, stripUndefinedDeep(payload), { merge: true });
-    reportFirestoreWriteResult(true);
+  const buildRestUpdatePayload = (serverDoc: Record<string, any>): { payload: Record<string, any>; maskFields?: string[] } => {
+    if (isMainAdmin || serverDoc.peran === "ADMIN") {
+      return {
+        payload: stripUndefinedDeep({
+          ...baseSanitized,
+          peran: "ADMIN",
+          statusPersetujuan: "aktif",
+          updatedAt: nowDate,
+          loginTerakhir: nowDate,
+        }),
+      };
+    }
+    const safeUpdate: Record<string, any> = stripUndefinedDeep({
+      uid: userId,
+      id: userId,
+      email: baseSanitized.email,
+      namaLengkap: baseSanitized.namaLengkap,
+      profesi: baseSanitized.profesi,
+      namaSPPG: baseSanitized.namaSPPG,
+      noHp: baseSanitized.noHp,
+      authProvider: baseSanitized.authProvider || "google",
+      emailVerified: true,
+      sumber: baseSanitized.sumber || "Login Google",
+      lastDevice: baseSanitized.lastDevice,
+      lastDeviceLabel: baseSanitized.lastDeviceLabel,
+      lastDeviceId: baseSanitized.lastDeviceId,
+      lastDeviceSeenAt: baseSanitized.lastDeviceSeenAt,
+      loginCount: baseSanitized.loginCount,
+      updatedAt: nowDate,
+      loginTerakhir: nowDate,
+    });
+    // Backfill legacy docs missing peran / statusPersetujuan so Admin Panel classifies them cleanly
+    const extraMask: string[] = [];
+    if (!serverDoc.peran) {
+      safeUpdate.peran = "USER";
+      extraMask.push("peran");
+    }
+    if (!serverDoc.statusPersetujuan || serverDoc.statusPersetujuan === "pending") {
+      safeUpdate.statusPersetujuan = "menunggu";
+      extraMask.push("statusPersetujuan");
+    }
+    return {
+      payload: safeUpdate,
+      maskFields: [...SELF_UPDATE_SAFE_FIELDS, ...extraMask],
+    };
   };
+
+  // STEP 1: Fast Authenticated Direct Cloud Firestore REST PATCH (completes in ~200ms on Mobile/Incognito & survives tab switch via keepalive)
+  const idToken =
+    (options?.firebaseUser ? await options.firebaseUser.getIdToken(false).catch(() => null) : null) ||
+    (await getActiveFirebaseIdToken(false).catch(() => null));
+
+  let restErrorMsg = "";
+  if (idToken) {
+    try {
+      const restAttempt = existingFirestoreDoc
+        ? buildRestUpdatePayload(existingFirestoreDoc)
+        : { payload: buildRestCreatePayload(false), maskFields: undefined };
+
+      let res = await firestoreRestUpsertDoc("users", userId, restAttempt.payload, {
+        idToken,
+        updateMaskFields: restAttempt.maskFields,
+        keepalive: true,
+        timeoutMs: 5500,
+      });
+
+      if (res.ok) {
+        return { ok: true, via: "rest" };
+      }
+
+      // If 403 PERMISSION_DENIED, check live server state and retry with exact rules-compliant create or masked update
+      if (res.permissionDenied) {
+        const liveCheck = await firestoreRestGetDoc("users", userId, { idToken, timeoutMs: 4000 });
+        if (liveCheck.ok && liveCheck.data) {
+          const retryUpd = buildRestUpdatePayload(liveCheck.data);
+          res = await firestoreRestUpsertDoc("users", userId, retryUpd.payload, {
+            idToken,
+            updateMaskFields: retryUpd.maskFields,
+            keepalive: true,
+            timeoutMs: 5500,
+          });
+        } else {
+          res = await firestoreRestUpsertDoc("users", userId, buildRestCreatePayload(true), {
+            idToken,
+            keepalive: true,
+            timeoutMs: 5500,
+          });
+        }
+        if (res.ok) {
+          return { ok: true, via: "rest" };
+        }
+      }
+
+      restErrorMsg = res.error || `HTTP ${res.status}`;
+    } catch (e: any) {
+      restErrorMsg = e?.message || String(e);
+    }
+  }
+
+  // STEP 2: Firestore JS SDK fallback
+  const userRef = doc(db, "users", userId);
+  const sdkPayload = existingFirestoreDoc
+    ? {
+        ...buildRestUpdatePayload(existingFirestoreDoc).payload,
+        updatedAt: serverTimestamp(),
+        loginTerakhir: serverTimestamp(),
+      }
+    : {
+        ...buildRestCreatePayload(false),
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        loginTerakhir: serverTimestamp(),
+      };
 
   try {
-    await attemptWrite(writePayload);
-    return true;
+    await setDoc(userRef, stripUndefinedDeep(sdkPayload), { merge: true });
+    reportFirestoreWriteResult(true);
+    return { ok: true, via: "sdk" };
   } catch (err: any) {
     const errCode = String(err?.code || "");
     const errMsg = String(err?.message || err || "");
 
-    // If permission-denied (e.g. sheet status 'aktif' without Firestore sheet_user_* doc, or legacy field mismatch),
-    // retry with a strictly rules-compliant payload so the user's email is STILL registered in Firestore for Admin Panel!
-    if (errCode === "permission-denied" || errMsg.includes("PERMISSION_DENIED") || errMsg.includes("Missing or insufficient permissions")) {
+    if (
+      errCode === "permission-denied" ||
+      errMsg.includes("PERMISSION_DENIED") ||
+      errMsg.includes("Missing or insufficient permissions")
+    ) {
       try {
-        const isMainAdmin = isMainAdminEmail(baseSanitized.email);
-        const safeFallback: Record<string, any> = existingFirestoreDoc
+        const safeSdkFallback = existingFirestoreDoc
           ? {
-              ...baseSanitized,
-              peran: existingFirestoreDoc.peran === "ADMIN" ? "ADMIN" : "USER",
-              statusPersetujuan:
-                existingFirestoreDoc.statusPersetujuan === "aktif" ||
-                existingFirestoreDoc.statusPersetujuan === "diblokir"
-                  ? existingFirestoreDoc.statusPersetujuan
-                  : "menunggu",
-              mulaiPada:
-                typeof existingFirestoreDoc.mulaiPada === "string"
-                  ? existingFirestoreDoc.mulaiPada
-                  : "",
-              berakhirPada:
-                typeof existingFirestoreDoc.berakhirPada === "string"
-                  ? existingFirestoreDoc.berakhirPada
-                  : "",
-              keterangan:
-                typeof existingFirestoreDoc.keterangan === "string"
-                  ? existingFirestoreDoc.keterangan
-                  : "",
-              createdAt: existingFirestoreDoc.createdAt || serverTimestamp(),
+              ...buildRestUpdatePayload(existingFirestoreDoc).payload,
               updatedAt: serverTimestamp(),
               loginTerakhir: serverTimestamp(),
             }
           : {
-              ...baseSanitized,
-              peran: isMainAdmin ? "ADMIN" : "USER",
-              statusPersetujuan: isMainAdmin ? "aktif" : "menunggu",
-              mulaiPada: "",
-              berakhirPada: "",
-              keterangan: isMainAdmin ? "Administrator Utama" : DEFAULT_WAITING_NOTE,
+              ...buildRestCreatePayload(true),
               createdAt: serverTimestamp(),
               updatedAt: serverTimestamp(),
               loginTerakhir: serverTimestamp(),
             };
-        delete safeFallback.migratedFromDocId;
-        await attemptWrite(safeFallback);
-        return true;
-      } catch (retryErr) {
+        await setDoc(userRef, stripUndefinedDeep(safeSdkFallback), { merge: true });
+        reportFirestoreWriteResult(true);
+        return { ok: true, via: "sdk" };
+      } catch (retryErr: any) {
         reportFirestoreWriteResult(false, retryErr);
         handleFirestoreError(
           retryErr,
           options?.isCreate ? OperationType.CREATE : OperationType.WRITE,
           `users/${userId}`
         );
-        return false;
+        return { ok: false, error: retryErr?.message || restErrorMsg || "Permission denied" };
       }
     }
 
     reportFirestoreWriteResult(false, err);
 
-    // Retry once automatically after 2.5s for transient mobile network / transport cold starts
     const isTransient =
       errCode === "unavailable" ||
       errCode === "deadline-exceeded" ||
@@ -204,10 +350,22 @@ const persistUserProfileToFirestore = async (
       errMsg.includes("network");
 
     if (isTransient) {
-      window.setTimeout(() => {
-        attemptWrite(writePayload).catch((bgErr) => {
-          reportFirestoreWriteResult(false, bgErr);
-        });
+      window.setTimeout(async () => {
+        const freshToken = await getActiveFirebaseIdToken(false).catch(() => null);
+        if (freshToken) {
+          const retryPayload = existingFirestoreDoc
+            ? buildRestUpdatePayload(existingFirestoreDoc)
+            : { payload: buildRestCreatePayload(true), maskFields: undefined };
+          const bgRest = await firestoreRestUpsertDoc("users", userId, retryPayload.payload, {
+            idToken: freshToken,
+            updateMaskFields: retryPayload.maskFields,
+            keepalive: true,
+          });
+          if (bgRest.ok) return;
+        }
+        setDoc(userRef, stripUndefinedDeep(sdkPayload), { merge: true })
+          .then(() => reportFirestoreWriteResult(true))
+          .catch((bgErr) => reportFirestoreWriteResult(false, bgErr));
       }, 2500);
     } else {
       handleFirestoreError(
@@ -216,7 +374,7 @@ const persistUserProfileToFirestore = async (
         `users/${userId}`
       );
     }
-    return false;
+    return { ok: false, error: restErrorMsg || errMsg };
   }
 };
 
@@ -402,6 +560,9 @@ interface AuthContextType {
   refreshUserProfile: () => Promise<any | null>;
   authError: string | null;
   setAuthError: (error: string | null) => void;
+  cloudSyncStatus: "idle" | "syncing" | "synced" | "error";
+  cloudSyncError: string | null;
+  retryCloudRegistration: () => Promise<boolean>;
   domainAuthInfo: DomainAuthCheckResult;
   recheckDomainAndSignIn: () => Promise<boolean>;
   simulateAdminLogin: () => void;
@@ -477,6 +638,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const [loading, setLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [cloudSyncStatus, setCloudSyncStatus] = useState<"idle" | "syncing" | "synced" | "error">("idle");
+  const [cloudSyncError, setCloudSyncError] = useState<string | null>(null);
   const [domainAuthInfo, setDomainAuthInfo] = useState<DomainAuthCheckResult>(() => ({
     currentHostname:
       typeof window !== "undefined" ? window.location.hostname.toLowerCase().trim() : "",
@@ -558,6 +721,23 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const userRef = doc(db, "users", uid);
       const mainAdminPhone = "082271095251";
       const nowIso = new Date().toISOString();
+      const idToken = await currentUser.getIdToken(false).catch(() => null);
+
+      // Build immediate synchronous device summary (0ms) so Cloud Firestore write NEVER blocks on /api/device/info
+      const quickClientInfo = detectClientDeviceInfo();
+      const quickDeviceId = getOrCreateDeviceId();
+      const quickCompactDev = {
+        deviceId: quickDeviceId,
+        deviceType: quickClientInfo.deviceType,
+        deviceModel: quickClientInfo.deviceModel,
+        osName: quickClientInfo.osName,
+        browserName: quickClientInfo.browserName,
+        ipAddress: "Terdeteksi",
+        screenResolution: quickClientInfo.screenResolution,
+        timezone: quickClientInfo.timezone,
+        lastSeenAt: nowIso,
+        isOnline: true,
+      };
 
       if (isMainAdmin) {
         const fallbackAdminProfile = {
@@ -575,12 +755,24 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           mulaiPada: "",
           berakhirPada: "",
           keterangan: "Administrator Utama",
+          lastDevice: quickCompactDev,
+          lastDeviceLabel: formatDeviceShortLabel(quickCompactDev),
+          lastDeviceId: quickDeviceId,
+          lastDeviceSeenAt: nowIso,
           updatedAt: nowIso,
           loginTerakhir: nowIso,
         };
         try {
-          const userSnap: any = await fetchWithTimeout(getDoc(userRef), 4000, null).catch(() => null);
-          const existingData = userSnap && userSnap.exists() ? userSnap.data() : null;
+          let existingData: any = null;
+          const restRes = idToken
+            ? await firestoreRestGetDoc("users", uid, { idToken, timeoutMs: 3000 })
+            : null;
+          if (restRes && restRes.ok) {
+            existingData = restRes.data;
+          } else {
+            const userSnap: any = await fetchWithTimeout(getDoc(userRef), 3000, null).catch(() => null);
+            existingData = userSnap && userSnap.exists() ? userSnap.data() : null;
+          }
           const adminFirstLogin =
             normalizeTimestampForRelay(existingData?.loginPertama) ||
             normalizeTimestampForRelay(existingData?.createdAt) ||
@@ -601,6 +793,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               typeof existingData?.keterangan === "string" && existingData.keterangan.trim()
                 ? existingData.keterangan
                 : "Administrator Utama",
+            lastDevice: quickCompactDev,
+            lastDeviceLabel: formatDeviceShortLabel(quickCompactDev),
+            lastDeviceId: quickDeviceId,
+            lastDeviceSeenAt: nowIso,
             loginPertama: adminFirstLogin,
             loginCount: (Number(existingData?.loginCount) || 0) + 1,
             updatedAt: nowIso,
@@ -608,88 +804,76 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           };
           updateSession(currentUser, mergedAdmin);
 
-          const devRecord = await buildDeviceRecord({
-            sessionState: "active",
-            userUid: uid,
-            userEmail: mergedAdmin.email,
-            userName: mergedAdmin.namaLengkap,
-            namaSPPG: mergedAdmin.namaSPPG,
-            peran: "ADMIN",
-            statusPersetujuan: "aktif",
-            isOnline: true,
-          });
-          const compactDev = toCompactDeviceSummary(devRecord);
-          const enrichedAdmin = {
-            ...mergedAdmin,
-            lastDevice: compactDev,
-            lastDeviceLabel: formatDeviceShortLabel(compactDev),
-            lastDeviceId: devRecord.deviceId,
-            lastDeviceSeenAt: nowIso,
-          };
-          updateSession(currentUser, enrichedAdmin);
-
-          const fsWritePromise = persistUserProfileToFirestore(uid, enrichedAdmin, existingData, {
+          const persistRes = await persistUserProfileToFirestore(uid, mergedAdmin, existingData, {
             isCreate: !existingData,
+            firebaseUser: currentUser,
           });
+          setCloudSyncStatus(persistRes.ok ? "synced" : "error");
+          setCloudSyncError(persistRes.ok ? null : persistRes.error || null);
 
-          await Promise.all([
-            syncUserToRealtimeHub(enrichedAdmin),
+          Promise.all([
+            syncUserToRealtimeHub(mergedAdmin),
             syncDeviceToFirestore({
               sessionState: "active",
               userUid: uid,
-              userEmail: enrichedAdmin.email,
-              userName: enrichedAdmin.namaLengkap,
-              namaSPPG: enrichedAdmin.namaSPPG,
+              userEmail: mergedAdmin.email,
+              userName: mergedAdmin.namaLengkap,
+              namaSPPG: mergedAdmin.namaSPPG,
               peran: "ADMIN",
               statusPersetujuan: "aktif",
               isOnline: true,
               forceFirestore: true,
             }),
-            fetchWithTimeout(fsWritePromise, 3500, false),
-          ]);
+          ]).catch(() => {});
         } catch (err) {
           console.warn("Notice setting up main admin profile:", err);
           updateSession(currentUser, fallbackAdminProfile);
           syncUserToRealtimeHub(fallbackAdminProfile).catch(() => {});
-          persistUserProfileToFirestore(uid, fallbackAdminProfile, null, { isCreate: true }).catch(() => {});
+          persistUserProfileToFirestore(uid, fallbackAdminProfile, null, {
+            isCreate: true,
+            firebaseUser: currentUser,
+          }).catch(() => {});
         }
         return;
       }
 
-      try {
-        // Check Firestore (by UID), Real-Time Hub (by UID/email), linked Google Spreadsheet, and pre-registered docs
-        const emailSlug = lowerEmail.replace(/[@.]/g, "_");
-        const sheetSlug = lowerEmail.replace(/[^a-z0-9]/g, "_");
-        const legacyUid = emailSlug ? `custom_user_${emailSlug}` : "";
-        const sheetDocUid = sheetSlug ? `sheet_user_${sheetSlug}` : "";
+      setCloudSyncStatus("syncing");
+      setCloudSyncError(null);
 
-        const [uidSnap, hubUser, sheetUser] = await Promise.all([
-          fetchWithTimeout(getDoc(userRef), 4500, null).catch(() => null),
-          fetchUserFromRealtimeHub(lowerEmail, uid).catch(() => null),
-          lookupEmailInLinkedSpreadsheet(lowerEmail).catch(() => null),
+      try {
+        // STEP 1 (FAST <300ms): Query authoritative Firestore doc via Direct REST + Real-Time Hub in parallel.
+        // NEVER block behind slow Spreadsheet lookups or /api/device/info before persisting the user's login!
+        const [restUserRes, hubUser] = await Promise.all([
+          idToken
+            ? firestoreRestGetDoc("users", uid, { idToken, timeoutMs: 3200 })
+            : Promise.resolve({ ok: false, status: 0, data: null } as const),
+          fetchWithTimeout(fetchUserFromRealtimeHub(lowerEmail, uid).catch(() => null), 1800, null),
         ]);
 
-        const directFirestoreData: any = uidSnap && uidSnap.exists() ? uidSnap.data() : null;
+        let directFirestoreData: any = null;
+        if (restUserRes.ok) {
+          directFirestoreData = restUserRes.data || null;
+        } else {
+          // Fallback to SDK getDoc only if REST GET could not connect
+          const uidSnap: any = await fetchWithTimeout(getDoc(userRef), 2800, null).catch(() => null);
+          directFirestoreData = uidSnap && uidSnap.exists() ? uidSnap.data() : null;
+        }
+
+        // Check pre-registered sheet_user_* doc ONLY if user does not yet have a Firestore UID doc (fast 2s REST read)
+        const sheetSlug = lowerEmail.replace(/[^a-z0-9]/g, "_");
+        const sheetDocUid = sheetSlug ? `sheet_user_${sheetSlug}` : "";
         let firestoreData: any = directFirestoreData;
         let migratedFromSheetDocId = "";
 
-        // Migrate seamlessly if pre-registered via Spreadsheet (sheet_user_<slug>) or legacy custom_user_<slug>
-        if (!directFirestoreData && sheetDocUid) {
-          try {
-            const sheetSnap: any = await fetchWithTimeout(getDoc(doc(db, "users", sheetDocUid)), 3000, null).catch(() => null);
-            if (sheetSnap && sheetSnap.exists()) {
-              firestoreData = sheetSnap.data();
-              migratedFromSheetDocId = sheetDocUid;
-            }
-          } catch {}
-        }
-        if (!firestoreData && !hubUser && legacyUid) {
-          try {
-            const legacySnap: any = await fetchWithTimeout(getDoc(doc(db, "users", legacyUid)), 2500, null).catch(() => null);
-            if (legacySnap && legacySnap.exists()) {
-              firestoreData = legacySnap.data();
-            }
-          } catch {}
+        if (!directFirestoreData && sheetDocUid && idToken) {
+          const sheetDocRes = await firestoreRestGetDoc("users", sheetDocUid, {
+            idToken,
+            timeoutMs: 2000,
+          }).catch(() => null);
+          if (sheetDocRes && sheetDocRes.ok && sheetDocRes.data) {
+            firestoreData = sheetDocRes.data;
+            migratedFromSheetDocId = sheetDocUid;
+          }
         }
 
         // Pick the freshest authoritative profile between Firestore and Real-Time Hub
@@ -697,14 +881,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (firestoreData && hubUser) {
           const fsMs = Math.max(getRecordTimeMs(firestoreData.updatedAt), getRecordTimeMs(firestoreData.loginTerakhir));
           const hubMs = Math.max(getRecordTimeMs(hubUser.updatedAt), getRecordTimeMs(hubUser.loginTerakhir));
-          resolvedProfile = hubMs >= fsMs
-            ? { ...firestoreData, ...hubUser }
-            : { ...hubUser, ...firestoreData };
+          resolvedProfile =
+            hubMs > fsMs
+              ? { ...firestoreData, ...hubUser }
+              : { ...hubUser, ...firestoreData };
         } else {
           resolvedProfile = firestoreData || hubUser;
         }
 
-        // Fallback to local offline cache only if both network sources returned nothing
+        // Fallback to local offline cache only if both remote sources returned nothing
         if (!resolvedProfile) {
           try {
             const cached = localStorage.getItem(`offline_user_${uid}`);
@@ -717,43 +902,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           } catch {}
         }
 
-        // Apply automatic registration / approval if email exists directly in the linked Google Spreadsheet
-        const isFromSpreadsheet = Boolean(sheetUser);
-        if (sheetUser) {
-          if (!resolvedProfile) {
-            resolvedProfile = {
-              ...sheetUser,
-              registeredViaSpreadsheet: true,
-              sumber: sheetUser.sumber || "Spreadsheet",
-            };
-          } else {
-            const shouldPromoteFromSheet =
-              resolvedProfile.statusPersetujuan === "menunggu" && sheetUser.statusPersetujuan === "aktif";
-            resolvedProfile = {
-              ...resolvedProfile,
-              namaLengkap: resolvedProfile.namaLengkap || sheetUser.namaLengkap,
-              profesi: resolvedProfile.profesi || sheetUser.profesi,
-              namaSPPG: resolvedProfile.namaSPPG || sheetUser.namaSPPG,
-              noHp: resolvedProfile.noHp || sheetUser.noHp,
-              mulaiPada:
-                resolvedProfile.mulaiPada !== undefined ? resolvedProfile.mulaiPada : sheetUser.mulaiPada ?? "",
-              berakhirPada:
-                resolvedProfile.berakhirPada !== undefined
-                  ? resolvedProfile.berakhirPada
-                  : sheetUser.berakhirPada ?? "",
-              keterangan:
-                resolvedProfile.keterangan !== undefined && resolvedProfile.keterangan !== ""
-                  ? resolvedProfile.keterangan
-                  : sheetUser.keterangan ?? "",
-              statusPersetujuan: shouldPromoteFromSheet
-                ? "aktif"
-                : resolvedProfile.statusPersetujuan || sheetUser.statusPersetujuan,
-              registeredViaSpreadsheet: true,
-              sumber: resolvedProfile.sumber || "Spreadsheet",
-            };
-          }
-        }
-
         const isNewTenant = !resolvedProfile;
         const resolvedRole = !isNewTenant && resolvedProfile.peran === "ADMIN" ? "ADMIN" : "USER";
         const resolvedStatus = isNewTenant
@@ -763,18 +911,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           : "menunggu";
         const resolvedSessionState = resolvedStatus === "aktif" ? "active" : "registering";
 
-        const devRecord = await buildDeviceRecord({
-          sessionState: resolvedSessionState,
-          userUid: uid,
-          userEmail: lowerEmail,
-          userName: resolvedProfile?.namaLengkap || currentUser.displayName || lowerEmail.split("@")[0] || "Pengguna Baru",
-          namaSPPG: resolvedProfile?.namaSPPG || "",
-          peran: resolvedRole,
-          statusPersetujuan: resolvedStatus,
-          isOnline: true,
-        });
-        const compactDev = toCompactDeviceSummary(devRecord);
-
         const resolvedFirstLogin =
           normalizeTimestampForRelay(resolvedProfile?.loginPertama) ||
           normalizeTimestampForRelay(resolvedProfile?.createdAt) ||
@@ -783,9 +919,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const resolvedMulaiPada =
           typeof resolvedProfile?.mulaiPada === "string" ? resolvedProfile.mulaiPada.trim() : "";
         const resolvedBerakhirPada =
-          typeof resolvedProfile?.berakhirPada === "string"
-            ? resolvedProfile.berakhirPada.trim()
-            : "";
+          typeof resolvedProfile?.berakhirPada === "string" ? resolvedProfile.berakhirPada.trim() : "";
         const resolvedKeterangan =
           typeof resolvedProfile?.keterangan === "string" && resolvedProfile.keterangan.trim() !== ""
             ? resolvedProfile.keterangan.trim()
@@ -815,11 +949,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           keterangan: resolvedKeterangan,
           authProvider: "google",
           emailVerified: true,
-          registeredViaSpreadsheet: Boolean(isFromSpreadsheet || resolvedProfile?.registeredViaSpreadsheet),
-          sumber: resolvedProfile?.sumber || (isFromSpreadsheet ? "Spreadsheet" : "Login Google"),
-          lastDevice: compactDev,
-          lastDeviceLabel: formatDeviceShortLabel(compactDev),
-          lastDeviceId: devRecord.deviceId,
+          registeredViaSpreadsheet: Boolean(resolvedProfile?.registeredViaSpreadsheet),
+          sumber: resolvedProfile?.sumber || "Login Google",
+          lastDevice: quickCompactDev,
+          lastDeviceLabel: formatDeviceShortLabel(quickCompactDev),
+          lastDeviceId: quickDeviceId,
           lastDeviceSeenAt: nowIso,
           loginPertama: resolvedFirstLogin,
           loginCount: previousLoginCount + 1,
@@ -833,22 +967,15 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         delete finalProfile.isNotRegistered;
         delete finalProfile._allIds;
 
-        // Clear deleted-email blocklist marker if user is signing in cleanly
         removeDeletedTenantEmail(lowerEmail);
-
-        // Update session immediately so UI transitions without waiting for slow mobile networks
         updateSession(currentUser, finalProfile);
 
-        // Persist simultaneously to Firestore (authoritative cross-device DB), Express Real-Time Hub, and Device Registry.
-        // Do NOT cancel the Firestore write on timeout — only bound the UI wait so registration ALWAYS finishes saving!
-        const firestorePersistPromise = persistUserProfileToFirestore(
-          uid,
-          finalProfile,
-          directFirestoreData,
-          { isCreate: !directFirestoreData }
-        );
-
-        await Promise.all([
+        // STEP 2 (IMMEDIATE PERSISTENCE): Write to Cloud Firestore (Direct REST + SDK), Real-Time Hub, and /devices in parallel!
+        const [persistRes] = await Promise.all([
+          persistUserProfileToFirestore(uid, finalProfile, directFirestoreData, {
+            isCreate: !directFirestoreData,
+            firebaseUser: currentUser,
+          }),
           syncUserToRealtimeHub(finalProfile),
           syncDeviceToFirestore({
             sessionState: resolvedSessionState,
@@ -861,18 +988,64 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             isOnline: true,
             forceFirestore: true,
           }),
-          fetchWithTimeout(firestorePersistPromise, 4000, false),
         ]);
+
+        if (persistRes.ok) {
+          setCloudSyncStatus("synced");
+          setCloudSyncError(null);
+        } else {
+          setCloudSyncStatus("error");
+          setCloudSyncError(
+            persistRes.error || "Koneksi ke database cloud sedang tertunda. Klik Kirim Ulang untuk menyinkronkan."
+          );
+        }
 
         if (isNewTenant) {
           try {
             window.dispatchEvent(new CustomEvent("sisper_user_registered", { detail: finalProfile }));
           } catch {}
         }
-      } catch (err) {
+
+        // STEP 3 (NON-BLOCKING): Check linked Google Spreadsheet asynchronously without delaying Panel Admin visibility!
+        if (finalProfile.statusPersetujuan === "menunggu") {
+          lookupEmailInLinkedSpreadsheet(lowerEmail)
+            .then((sheetUser) => {
+              if (!sheetUser) return;
+              const shouldPromote = sheetUser.statusPersetujuan === "aktif";
+              const upgraded: Record<string, any> = {
+                ...finalProfile,
+                namaLengkap: finalProfile.namaLengkap || sheetUser.namaLengkap,
+                profesi: finalProfile.profesi || sheetUser.profesi,
+                namaSPPG: finalProfile.namaSPPG || sheetUser.namaSPPG,
+                noHp: finalProfile.noHp || sheetUser.noHp,
+                mulaiPada: finalProfile.mulaiPada || sheetUser.mulaiPada || "",
+                berakhirPada: finalProfile.berakhirPada || sheetUser.berakhirPada || "",
+                keterangan: finalProfile.keterangan || sheetUser.keterangan || "",
+                statusPersetujuan: shouldPromote ? "aktif" : finalProfile.statusPersetujuan,
+                registeredViaSpreadsheet: true,
+                sumber: "Spreadsheet",
+                updatedAt: new Date().toISOString(),
+              };
+              updateSession(currentUser, upgraded);
+              syncUserToRealtimeHub(upgraded).catch(() => {});
+              if (shouldPromote) {
+                syncDeviceToFirestore({
+                  sessionState: "active",
+                  userUid: uid,
+                  userEmail: lowerEmail,
+                  userName: upgraded.namaLengkap,
+                  namaSPPG: upgraded.namaSPPG,
+                  peran: upgraded.peran,
+                  statusPersetujuan: "aktif",
+                  isOnline: true,
+                  forceFirestore: true,
+                }).catch(() => {});
+              }
+            })
+            .catch(() => {});
+        }
+      } catch (err: any) {
         console.error("Error fetching user profile:", err);
-        // Safe fallback: never grant active/admin access on unexpected error — keep user in waiting-for-ACC state
-        // AND still persist to BOTH Firestore and Real-Time Hub so Admin Panel ALWAYS sees the signing-in email!
         const fallbackPending = {
           uid,
           id: uid,
@@ -889,6 +1062,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           authProvider: "google",
           emailVerified: true,
           sumber: "Login Google",
+          lastDevice: quickCompactDev,
+          lastDeviceLabel: formatDeviceShortLabel(quickCompactDev),
+          lastDeviceId: quickDeviceId,
+          lastDeviceSeenAt: nowIso,
           loginPertama: nowIso,
           loginCount: 1,
           createdAt: nowIso,
@@ -897,7 +1074,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         };
         updateSession(currentUser, fallbackPending);
         syncUserToRealtimeHub(fallbackPending).catch(() => {});
-        persistUserProfileToFirestore(uid, fallbackPending, null, { isCreate: true }).catch(() => {});
+        const fallbackRes = await persistUserProfileToFirestore(uid, fallbackPending, null, {
+          isCreate: true,
+          firebaseUser: currentUser,
+        });
+        setCloudSyncStatus(fallbackRes.ok ? "synced" : "error");
+        setCloudSyncError(fallbackRes.ok ? null : fallbackRes.error || err?.message || null);
       }
     };
 
@@ -1164,9 +1346,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         async (snap) => {
           if (snap.exists()) {
             firestoreDocPreviouslyExisted = true;
+            setCloudSyncStatus("synced");
+            setCloudSyncError(null);
             applyAuthoritativeUpdate(snap.data());
           } else if (firestoreDocPreviouslyExisted) {
-            // Confirm deletion via Real-Time Hub before signing out so quota lag never causes false logout
+            // Confirm deletion via Direct Firestore REST & Hub before signing out so transport lag never causes false logout
+            const restCheck = await firestoreRestGetDoc("users", activeUid, { timeoutMs: 3500 }).catch(() => null);
+            if (restCheck && restCheck.ok && restCheck.data) {
+              applyAuthoritativeUpdate(restCheck.data);
+              return;
+            }
             const stillInHub = await fetchUserFromRealtimeHub(activeEmail, activeUid).catch(() => null);
             if (!stillInHub) {
               signOutUser();
@@ -1174,11 +1363,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             }
           } else if (
             !hasAttemptedMissingDocSelfHeal &&
+            !inFlightProfileFetchMap.has(activeUid) &&
             auth.currentUser &&
             auth.currentUser.uid === activeUid &&
             activeEmail
           ) {
-            // Self-heal: user is actively signed in with Firebase Auth yet their doc hasn't landed in Firestore yet
+            // Self-heal: user is actively signed in with Firebase Auth yet their doc hasn't landed in Firestore
             hasAttemptedMissingDocSelfHeal = true;
             const nowHealIso = new Date().toISOString();
             const healProfile = {
@@ -1207,7 +1397,17 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
               updatedAt: nowHealIso,
               loginTerakhir: nowHealIso,
             };
-            persistUserProfileToFirestore(activeUid, healProfile, null, { isCreate: true }).catch(() => {});
+            persistUserProfileToFirestore(activeUid, healProfile, null, {
+              isCreate: true,
+              firebaseUser: auth.currentUser,
+            })
+              .then((res) => {
+                if (res.ok) {
+                  setCloudSyncStatus("synced");
+                  setCloudSyncError(null);
+                }
+              })
+              .catch(() => {});
             syncUserToRealtimeHub(healProfile).catch(() => {});
           }
         },
@@ -1219,7 +1419,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.warn("Could not attach user profile onSnapshot:", err);
     }
 
-    // Channel B: Server SSE Real-Time Hub listener (instant unlock on Admin ACC even when Firestore write quota is capped)
+    // Channel B: Server SSE Real-Time Hub listener (instant unlock on same host)
     let eventSource: EventSource | null = null;
     try {
       eventSource = new EventSource("/api/realtime/stream");
@@ -1268,21 +1468,75 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
     } catch {}
 
-    // Channel C: Lightweight 8-second safety poll while waiting/blocked so mobile networks with buffered SSE still unlock automatically
-    const pollTimer = window.setInterval(async () => {
+    // Channel C: Authoritative Cloud Firestore + Hub 8-second safety poll (works across HP/Incognito/separate origins!)
+    const pollCloudAndHub = async () => {
       if (document.visibilityState !== "visible") return;
       try {
-        const hubUser = await fetchUserFromRealtimeHub(activeEmail, activeUid);
+        const fbUser = auth.currentUser;
+        const idToken = fbUser && fbUser.uid === activeUid ? await fbUser.getIdToken(false).catch(() => null) : null;
+        const [restRes, hubUser] = await Promise.all([
+          idToken
+            ? firestoreRestGetDoc("users", activeUid, { idToken, timeoutMs: 3500 })
+            : Promise.resolve(null),
+          fetchUserFromRealtimeHub(activeEmail, activeUid).catch(() => null),
+        ]);
+
+        if (restRes && restRes.ok && restRes.data) {
+          firestoreDocPreviouslyExisted = true;
+          setCloudSyncStatus("synced");
+          setCloudSyncError(null);
+          applyAuthoritativeUpdate(restRes.data);
+          return;
+        }
+
+        // If doc is still missing on Cloud Firestore while user is signed in, self-heal immediately!
+        if (restRes && restRes.notFound && !firestoreDocPreviouslyExisted && fbUser && fbUser.uid === activeUid && activeEmail) {
+          const healRes = await persistUserProfileToFirestore(
+            activeUid,
+            {
+              uid: activeUid,
+              id: activeUid,
+              email: activeEmail,
+              namaLengkap: fbUser.displayName || activeEmail.split("@")[0] || "Pengguna Baru",
+              profesi: "Ahli Gizi / Pengelola SPPG",
+              namaSPPG: "",
+              noHp: "",
+              peran: "USER",
+              statusPersetujuan: "menunggu",
+              mulaiPada: "",
+              berakhirPada: "",
+              keterangan: DEFAULT_WAITING_NOTE,
+              authProvider: "google",
+              emailVerified: true,
+              sumber: "Login Google",
+              loginCount: 1,
+            },
+            null,
+            { isCreate: true, firebaseUser: fbUser }
+          );
+          if (healRes.ok) {
+            setCloudSyncStatus("synced");
+            setCloudSyncError(null);
+          }
+        }
+
         if (hubUser) {
           applyAuthoritativeUpdate(hubUser);
         }
       } catch {}
-    }, 8_000);
+    };
+
+    const pollTimer = window.setInterval(pollCloudAndHub, 8_000);
+    const handleFocusPoll = () => {
+      pollCloudAndHub();
+    };
+    window.addEventListener("focus", handleFocusPoll);
 
     return () => {
       if (unsubFirestore) unsubFirestore();
       if (eventSource) eventSource.close();
       window.clearInterval(pollTimer);
+      window.removeEventListener("focus", handleFocusPoll);
     };
   }, [userProfile?.uid, user?.uid, user?.email]);
 
@@ -1442,8 +1696,6 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     noHp: string;
   }) => {
     if (!user) throw new Error("Akun belum masuk.");
-    const userRef = doc(db, "users", user.uid);
-    const path = `users/${user.uid}`;
     const nowIso = new Date().toISOString();
     const lowerEmail = (user.email || "").toLowerCase().trim();
     const isMainAdmin = isMainAdminEmail(lowerEmail);
@@ -1509,9 +1761,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     updateSession(user, profileData);
 
-    const persistPromise = persistUserProfileToFirestore(user.uid, profileData, userProfile || null);
+    const persistPromise = persistUserProfileToFirestore(user.uid, profileData, userProfile || null, {
+      firebaseUser: auth.currentUser || user,
+    });
 
-    await Promise.all([
+    const [, , persistRes] = await Promise.all([
       syncUserToRealtimeHub(profileData),
       syncDeviceToFirestore({
         sessionState: currentStatus === "aktif" ? "active" : "registering",
@@ -1524,8 +1778,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isOnline: true,
         forceFirestore: true,
       }),
-      fetchWithTimeout(persistPromise, 4000, false),
+      fetchWithTimeout(persistPromise, 5000, { ok: false, error: "Timeout" }),
     ]);
+
+    if (persistRes && persistRes.ok) {
+      setCloudSyncStatus("synced");
+      setCloudSyncError(null);
+    }
   };
 
   const registerUser = updateOwnProfileDetails;
@@ -2371,24 +2630,39 @@ const removeDeletedTenantEmail = (email: string) => {
     if (!activeUid || activeUid === DEMO_UID) return userProfile;
 
     try {
-      const [snap, hubUser, sheetUser] = await Promise.all([
-        fetchWithTimeout(getDoc(doc(db, "users", activeUid)), 3500, null).catch(() => null),
+      const fbUser = auth.currentUser;
+      const idToken =
+        fbUser && fbUser.uid === activeUid
+          ? await fbUser.getIdToken(false).catch(() => null)
+          : null;
+
+      const [restRes, hubUser, sheetUser] = await Promise.all([
+        idToken
+          ? firestoreRestGetDoc("users", activeUid, { idToken, timeoutMs: 3500 })
+          : Promise.resolve(null),
         fetchUserFromRealtimeHub(activeEmail, activeUid).catch(() => null),
         lookupEmailInLinkedSpreadsheet(activeEmail).catch(() => null),
       ]);
 
-      const fsData = snap && snap.exists() ? snap.data() : null;
+      let fsData: any = null;
+      if (restRes && restRes.ok) {
+        fsData = restRes.data || null;
+      } else {
+        const snap: any = await fetchWithTimeout(getDoc(doc(db, "users", activeUid)), 3000, null).catch(() => null);
+        fsData = snap && snap.exists() ? snap.data() : null;
+      }
+
       let latest: any = null;
       if (fsData && hubUser) {
         const fsMs = Math.max(getRecordTimeMs(fsData.updatedAt), getRecordTimeMs(fsData.loginTerakhir));
         const hubMs = Math.max(getRecordTimeMs(hubUser.updatedAt), getRecordTimeMs(hubUser.loginTerakhir));
-        latest = hubMs >= fsMs ? { ...fsData, ...hubUser } : { ...hubUser, ...fsData };
+        latest = hubMs > fsMs ? { ...fsData, ...hubUser } : { ...hubUser, ...fsData };
       } else {
         latest = fsData || hubUser;
       }
 
-      // Self-heal: if user clicks "Cek Status ACC Sekarang" and their Firestore doc is still missing, write it now
-      if (!fsData && auth.currentUser && auth.currentUser.uid === activeUid && activeEmail) {
+      // Self-heal: if user clicks "Periksa Status ACC Sekarang" and their Firestore doc is still missing, write it now
+      if (!fsData && fbUser && fbUser.uid === activeUid && activeEmail) {
         const nowRefreshIso = new Date().toISOString();
         const ensureProfile = {
           ...(userProfile || {}),
@@ -2399,7 +2673,7 @@ const removeDeletedTenantEmail = (email: string) => {
           namaLengkap:
             latest?.namaLengkap ||
             userProfile?.namaLengkap ||
-            auth.currentUser.displayName ||
+            fbUser.displayName ||
             activeEmail.split("@")[0] ||
             "Pengguna Baru",
           profesi: latest?.profesi || userProfile?.profesi || "Ahli Gizi / Pengelola SPPG",
@@ -2418,8 +2692,27 @@ const removeDeletedTenantEmail = (email: string) => {
           updatedAt: nowRefreshIso,
           loginTerakhir: nowRefreshIso,
         };
-        persistUserProfileToFirestore(activeUid, ensureProfile, null, { isCreate: true }).catch(() => {});
+        const res = await persistUserProfileToFirestore(activeUid, ensureProfile, null, {
+          isCreate: true,
+          firebaseUser: fbUser,
+        });
+        setCloudSyncStatus(res.ok ? "synced" : "error");
+        setCloudSyncError(res.ok ? null : res.error || null);
         syncUserToRealtimeHub(ensureProfile).catch(() => {});
+        syncDeviceToFirestore({
+          sessionState: ensureProfile.statusPersetujuan === "aktif" ? "active" : "registering",
+          userUid: activeUid,
+          userEmail: activeEmail,
+          userName: ensureProfile.namaLengkap,
+          namaSPPG: ensureProfile.namaSPPG,
+          peran: ensureProfile.peran,
+          statusPersetujuan: ensureProfile.statusPersetujuan,
+          isOnline: true,
+          forceFirestore: true,
+        }).catch(() => {});
+      } else if (fsData) {
+        setCloudSyncStatus("synced");
+        setCloudSyncError(null);
       }
 
       // If email was just added/approved directly in the linked Google Spreadsheet, unlock immediately
@@ -2439,7 +2732,10 @@ const removeDeletedTenantEmail = (email: string) => {
             updatedAt: new Date().toISOString(),
           };
           syncUserToRealtimeHub(latest).catch(() => {});
-          persistUserProfileToFirestore(activeUid, latest, fsData, { isCreate: !fsData }).catch(() => {});
+          persistUserProfileToFirestore(activeUid, latest, fsData, {
+            isCreate: !fsData,
+            firebaseUser: fbUser,
+          }).catch(() => {});
         }
       }
 
@@ -2459,6 +2755,79 @@ const removeDeletedTenantEmail = (email: string) => {
       console.warn("Notice refreshing user profile:", e);
     }
     return userProfile;
+  };
+
+  const retryCloudRegistration = async (): Promise<boolean> => {
+    const fbUser = auth.currentUser;
+    const activeUid = fbUser?.uid || user?.uid || userProfile?.uid;
+    const activeEmail = (fbUser?.email || user?.email || userProfile?.email || "").toLowerCase().trim();
+    if (!activeUid || !activeEmail || activeUid === DEMO_UID) return false;
+
+    setCloudSyncStatus("syncing");
+    setCloudSyncError(null);
+    const nowIso = new Date().toISOString();
+    const idToken = fbUser ? await fbUser.getIdToken(true).catch(() => null) : null;
+    const liveCheck = idToken
+      ? await firestoreRestGetDoc("users", activeUid, { idToken, timeoutMs: 4000 }).catch(() => null)
+      : null;
+    const existingDoc = liveCheck && liveCheck.ok ? liveCheck.data : null;
+
+    const payload = {
+      ...(userProfile || {}),
+      uid: activeUid,
+      id: activeUid,
+      email: activeEmail,
+      namaLengkap:
+        userProfile?.namaLengkap ||
+        fbUser?.displayName ||
+        activeEmail.split("@")[0] ||
+        "Pengguna Baru",
+      profesi: userProfile?.profesi || "Ahli Gizi / Pengelola SPPG",
+      namaSPPG: userProfile?.namaSPPG || "",
+      noHp: userProfile?.noHp || "",
+      peran: isMainAdminEmail(activeEmail) ? "ADMIN" : existingDoc?.peran || "USER",
+      statusPersetujuan: isMainAdminEmail(activeEmail)
+        ? "aktif"
+        : existingDoc?.statusPersetujuan || "menunggu",
+      mulaiPada: existingDoc?.mulaiPada || "",
+      berakhirPada: existingDoc?.berakhirPada || "",
+      keterangan: existingDoc?.keterangan || userProfile?.keterangan || DEFAULT_WAITING_NOTE,
+      authProvider: "google",
+      emailVerified: true,
+      sumber: userProfile?.sumber || "Login Google",
+      loginPertama: userProfile?.loginPertama || nowIso,
+      loginCount: Number(userProfile?.loginCount) || 1,
+      updatedAt: nowIso,
+      loginTerakhir: nowIso,
+    };
+
+    const [res] = await Promise.all([
+      persistUserProfileToFirestore(activeUid, payload, existingDoc, {
+        isCreate: !existingDoc,
+        firebaseUser: fbUser,
+      }),
+      syncUserToRealtimeHub(payload),
+      syncDeviceToFirestore({
+        sessionState: payload.statusPersetujuan === "aktif" ? "active" : "registering",
+        userUid: activeUid,
+        userEmail: activeEmail,
+        userName: payload.namaLengkap,
+        namaSPPG: payload.namaSPPG,
+        peran: payload.peran,
+        statusPersetujuan: payload.statusPersetujuan,
+        isOnline: true,
+        forceFirestore: true,
+      }),
+    ]);
+
+    if (res.ok) {
+      setCloudSyncStatus("synced");
+      setCloudSyncError(null);
+      return true;
+    }
+    setCloudSyncStatus("error");
+    setCloudSyncError(res.error || "Gagal menghubungi database cloud. Periksa koneksi internet Anda lalu coba lagi.");
+    return false;
   };
 
   const saveStateToCloud = async (key: string, data: any) => {
@@ -2549,6 +2918,9 @@ const removeDeletedTenantEmail = (email: string) => {
       refreshUserProfile,
       authError,
       setAuthError,
+      cloudSyncStatus,
+      cloudSyncError,
+      retryCloudRegistration,
       domainAuthInfo,
       recheckDomainAndSignIn,
       simulateAdminLogin,
