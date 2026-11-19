@@ -571,6 +571,8 @@ interface AuthContextType {
   demoNotice: string | null;
   clearDemoNotice: () => void;
   loginDemoAccount: () => void;
+  forceCancelLoading: () => void;
+  resetStuckSession: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -607,11 +609,53 @@ const getDefaultExpirationDate = () => {
   return `${nextYear.getFullYear()}-${String(nextYear.getMonth() + 1).padStart(2, "0")}-${String(nextYear.getDate()).padStart(2, "0")}`;
 };
 
+const safeStorageGet = (key: string): string | null => {
+  try {
+    return typeof localStorage !== "undefined" ? localStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+};
+
+const safeStorageSet = (key: string, value: string): void => {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(key, value);
+    }
+  } catch {}
+};
+
+const safeStorageRemove = (key: string): void => {
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.removeItem(key);
+    }
+  } catch {}
+};
+
+const readCachedUserProfile = (uid: string, email?: string | null): any | null => {
+  if (!uid) return null;
+  const lowerEmail = (email || "").toLowerCase().trim();
+  const raw = safeStorageGet(`offline_user_${uid}`) || safeStorageGet("sisper_user_profile");
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || parsed.isNotRegistered) return null;
+    const cachedUid = String(parsed.uid || parsed.id || "").trim();
+    const cachedEmail = String(parsed.email || "").toLowerCase().trim();
+    if (cachedUid && cachedUid !== uid) return null;
+    if (lowerEmail && cachedEmail && cachedEmail !== lowerEmail) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+};
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<User | null>(() => {
-    const customUid = localStorage.getItem("custom_logged_in_uid");
+    const customUid = safeStorageGet("custom_logged_in_uid");
     if (customUid === DEMO_UID) {
-      const rawExp = localStorage.getItem(DEMO_EXPIRES_KEY);
+      const rawExp = safeStorageGet(DEMO_EXPIRES_KEY);
       if (rawExp && Date.now() < Number(rawExp)) {
         const demoProf = buildDemoProfile();
         return {
@@ -626,9 +670,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   });
 
   const [userProfile, setUserProfile] = useState<any | null>(() => {
-    const customUid = localStorage.getItem("custom_logged_in_uid");
+    const customUid = safeStorageGet("custom_logged_in_uid");
     if (customUid === DEMO_UID) {
-      const rawExp = localStorage.getItem(DEMO_EXPIRES_KEY);
+      const rawExp = safeStorageGet(DEMO_EXPIRES_KEY);
       if (rawExp && Date.now() < Number(rawExp)) {
         return buildDemoProfile();
       }
@@ -650,7 +694,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }));
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
   const [demoSecondsLeft, setDemoSecondsLeft] = useState<number | null>(() => {
-    const rawExp = localStorage.getItem(DEMO_EXPIRES_KEY);
+    const rawExp = safeStorageGet(DEMO_EXPIRES_KEY);
     if (!rawExp) return null;
     const rem = Math.ceil((Number(rawExp) - Date.now()) / 1000);
     return rem > 0 ? rem : 0;
@@ -686,18 +730,21 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         currentUser.uid.startsWith("custom_user_") ||
         currentUser.uid.startsWith("admin_");
       if (isLocalCustomSession) {
-        localStorage.setItem("custom_logged_in_uid", currentUser.uid);
+        safeStorageSet("custom_logged_in_uid", currentUser.uid);
       } else {
         // Real Firebase Auth session persists natively via onAuthStateChanged
-        localStorage.removeItem("custom_logged_in_uid");
+        safeStorageRemove("custom_logged_in_uid");
       }
-      localStorage.setItem("sisper_user_profile", JSON.stringify(profile));
-      if (currentUser.uid !== DEMO_UID) {
-        localStorage.setItem(`offline_user_${currentUser.uid}`, JSON.stringify(profile));
-      }
+      try {
+        const serialized = JSON.stringify(profile);
+        safeStorageSet("sisper_user_profile", serialized);
+        if (currentUser.uid !== DEMO_UID) {
+          safeStorageSet(`offline_user_${currentUser.uid}`, serialized);
+        }
+      } catch {}
     } else {
-      localStorage.removeItem("custom_logged_in_uid");
-      localStorage.removeItem("sisper_user_profile");
+      safeStorageRemove("custom_logged_in_uid");
+      safeStorageRemove("sisper_user_profile");
     }
   };
 
@@ -708,7 +755,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Deduplicate concurrent signInWithPopup + onAuthStateChanged calls for the same UID
     const existingPromise = inFlightProfileFetchMap.get(uid);
     if (existingPromise) {
-      return existingPromise;
+      return fetchWithTimeout(existingPromise, 4500, undefined);
     }
     const lastCompletedAt = recentProfileFetchAt.get(uid) || 0;
     if (!options?.force && Date.now() - lastCompletedAt < 1800) {
@@ -721,7 +768,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const userRef = doc(db, "users", uid);
       const mainAdminPhone = "082271095251";
       const nowIso = new Date().toISOString();
-      const idToken = await currentUser.getIdToken(false).catch(() => null);
+      const idToken = await fetchWithTimeout(
+        currentUser.getIdToken(false).catch(() => null),
+        1800,
+        null
+      );
 
       // Build immediate synchronous device summary (0ms) so Cloud Firestore write NEVER blocks on /api/device/info
       const quickClientInfo = detectClientDeviceInfo();
@@ -804,12 +855,16 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           };
           updateSession(currentUser, mergedAdmin);
 
-          const persistRes = await persistUserProfileToFirestore(uid, mergedAdmin, existingData, {
+          // Non-blocking background persistence so Main Admin boot NEVER stalls on slow cloud writes
+          persistUserProfileToFirestore(uid, mergedAdmin, existingData, {
             isCreate: !existingData,
             firebaseUser: currentUser,
-          });
-          setCloudSyncStatus(persistRes.ok ? "synced" : "error");
-          setCloudSyncError(persistRes.ok ? null : persistRes.error || null);
+          })
+            .then((persistRes) => {
+              setCloudSyncStatus(persistRes.ok ? "synced" : "error");
+              setCloudSyncError(persistRes.ok ? null : persistRes.error || null);
+            })
+            .catch(() => {});
 
           Promise.all([
             syncUserToRealtimeHub(mergedAdmin),
@@ -970,12 +1025,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         removeDeletedTenantEmail(lowerEmail);
         updateSession(currentUser, finalProfile);
 
-        // STEP 2 (IMMEDIATE PERSISTENCE): Write to Cloud Firestore (Direct REST + SDK), Real-Time Hub, and /devices in parallel!
-        const [persistRes] = await Promise.all([
-          persistUserProfileToFirestore(uid, finalProfile, directFirestoreData, {
-            isCreate: !directFirestoreData,
-            firebaseUser: currentUser,
-          }),
+        // STEP 2 (IMMEDIATE PARALLEL PERSISTENCE — NON-BLOCKING FOR BOOT):
+        // Fire Firestore + Real-Time Hub + /devices immediately so Panel Admin sees every login right away,
+        // without EVER holding the splash loader hostage on slow cellular/offline networks!
+        persistUserProfileToFirestore(uid, finalProfile, directFirestoreData, {
+          isCreate: !directFirestoreData,
+          firebaseUser: currentUser,
+        })
+          .then((persistRes) => {
+            if (persistRes.ok) {
+              setCloudSyncStatus("synced");
+              setCloudSyncError(null);
+            } else {
+              setCloudSyncStatus("error");
+              setCloudSyncError(
+                persistRes.error || "Koneksi ke database cloud sedang tertunda. Klik Kirim Ulang untuk menyinkronkan."
+              );
+            }
+          })
+          .catch((persistErr: any) => {
+            setCloudSyncStatus("error");
+            setCloudSyncError(
+              persistErr?.message || "Koneksi ke database cloud sedang tertunda. Klik Kirim Ulang untuk menyinkronkan."
+            );
+          });
+
+        Promise.all([
           syncUserToRealtimeHub(finalProfile),
           syncDeviceToFirestore({
             sessionState: resolvedSessionState,
@@ -988,17 +1063,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
             isOnline: true,
             forceFirestore: true,
           }),
-        ]);
-
-        if (persistRes.ok) {
-          setCloudSyncStatus("synced");
-          setCloudSyncError(null);
-        } else {
-          setCloudSyncStatus("error");
-          setCloudSyncError(
-            persistRes.error || "Koneksi ke database cloud sedang tertunda. Klik Kirim Ulang untuk menyinkronkan."
-          );
-        }
+        ]).catch(() => {});
 
         if (isNewTenant) {
           try {
@@ -1074,12 +1139,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         };
         updateSession(currentUser, fallbackPending);
         syncUserToRealtimeHub(fallbackPending).catch(() => {});
-        const fallbackRes = await persistUserProfileToFirestore(uid, fallbackPending, null, {
+        persistUserProfileToFirestore(uid, fallbackPending, null, {
           isCreate: true,
           firebaseUser: currentUser,
-        });
-        setCloudSyncStatus(fallbackRes.ok ? "synced" : "error");
-        setCloudSyncError(fallbackRes.ok ? null : fallbackRes.error || err?.message || null);
+        })
+          .then((fallbackRes) => {
+            setCloudSyncStatus(fallbackRes.ok ? "synced" : "error");
+            setCloudSyncError(fallbackRes.ok ? null : fallbackRes.error || err?.message || null);
+          })
+          .catch(() => {
+            setCloudSyncStatus("error");
+            setCloudSyncError(err?.message || "Sinkronisasi cloud tertunda.");
+          });
       }
     };
 
@@ -1092,8 +1163,34 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   useEffect(() => {
-    const initAuth = async () => {
-      const simulatedEmail = localStorage.getItem("simulated_user_email");
+    let active = true;
+    let bootSettled = false;
+
+    const settleBoot = () => {
+      if (!active || bootSettled) return;
+      bootSettled = true;
+      setLoading(false);
+    };
+
+    // Hard boot watchdog (3.5s): guarantees the app can NEVER remain stuck on "Memuat Sistem GiziSync..."
+    // even if IndexedDB is locked, network is offline, or Firebase Auth init stalls in Incognito/Safari/WebView.
+    const bootWatchdogTimer = window.setTimeout(() => {
+      if (!active || bootSettled) return;
+      const existingFbUser = auth.currentUser;
+      if (existingFbUser) {
+        const cached = readCachedUserProfile(existingFbUser.uid, existingFbUser.email);
+        if (cached) {
+          updateSession(existingFbUser, cached);
+        } else {
+          setUser(existingFbUser);
+        }
+        fetchUserProfile(existingFbUser).catch(() => {});
+      }
+      settleBoot();
+    }, 3500);
+
+    try {
+      const simulatedEmail = safeStorageGet("simulated_user_email");
       if (simulatedEmail === "syukriyusuf82@gmail.com" || simulatedEmail === "sukriyusuf82@gmail.com") {
         updateSession({
           uid: "admin_sukriyusuf82",
@@ -1111,25 +1208,31 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           statusPersetujuan: "aktif",
           berakhirPada: "2035-12-31"
         });
-        setLoading(false);
-        return;
+        settleBoot();
+        return () => {
+          active = false;
+          window.clearTimeout(bootWatchdogTimer);
+        };
       }
 
-      const customUid = localStorage.getItem("custom_logged_in_uid");
+      const customUid = safeStorageGet("custom_logged_in_uid");
 
       // Check 5-minute Demo session expiration on startup
       if (customUid === DEMO_UID) {
-        const rawExp = localStorage.getItem(DEMO_EXPIRES_KEY);
+        const rawExp = safeStorageGet(DEMO_EXPIRES_KEY);
         const expiresAt = rawExp ? Number(rawExp) : 0;
         if (!expiresAt || Date.now() >= expiresAt) {
-          localStorage.removeItem(DEMO_EXPIRES_KEY);
-          localStorage.removeItem("custom_logged_in_uid");
-          localStorage.removeItem("sisper_user_profile");
+          safeStorageRemove(DEMO_EXPIRES_KEY);
+          safeStorageRemove("custom_logged_in_uid");
+          safeStorageRemove("sisper_user_profile");
           updateSession(null, null);
           setDemoSecondsLeft(null);
           setDemoNotice("Sesi Masuk Demo 5 menit telah berakhir. Akun Demo telah keluar secara otomatis.");
-          setLoading(false);
-          return;
+          settleBoot();
+          return () => {
+            active = false;
+            window.clearTimeout(bootWatchdogTimer);
+          };
         }
         const demoProf = buildDemoProfile();
         updateSession({
@@ -1139,43 +1242,81 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           emailVerified: true
         } as any, demoProf);
         setDemoSecondsLeft(Math.max(1, Math.ceil((expiresAt - Date.now()) / 1000)));
-        setLoading(false);
-        return;
+        settleBoot();
+        return () => {
+          active = false;
+          window.clearTimeout(bootWatchdogTimer);
+        };
       }
 
       // Clean up any stale non-demo custom_logged_in_uid so Google Firebase Auth handles session cleanly
       if (customUid && customUid !== DEMO_UID) {
-        localStorage.removeItem("custom_logged_in_uid");
+        safeStorageRemove("custom_logged_in_uid");
       }
+    } catch (initErr) {
+      console.warn("Notice initializing local session cache:", initErr);
+    }
 
-      const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-        if (getIsDriveConnecting() || getIsSheetsConnecting()) {
-          return;
-        }
-        if (localStorage.getItem("custom_logged_in_uid") === DEMO_UID) {
-          setLoading(false);
-          return;
-        }
-        if (currentUser) {
-          setUser(currentUser);
-          await fetchUserProfile(currentUser);
-        } else {
-          clearDriveSession();
-          clearSheetsSession();
-          updateSession(null, null);
-        }
-        setLoading(false);
-      });
-      return unsubscribe;
-    };
+    let unsubscribe: (() => void) | null = null;
+    try {
+      unsubscribe = onAuthStateChanged(
+        auth,
+        async (currentUser) => {
+          if (!active) return;
+          if (getIsDriveConnecting() || getIsSheetsConnecting()) {
+            settleBoot();
+            return;
+          }
+          if (safeStorageGet("custom_logged_in_uid") === DEMO_UID) {
+            settleBoot();
+            return;
+          }
+          try {
+            if (currentUser) {
+              // Warm-boot fast path: if valid local cache exists, hydrate immediately (<50ms) and refresh in background
+              const cachedProfile = readCachedUserProfile(currentUser.uid, currentUser.email);
+              if (cachedProfile) {
+                updateSession(currentUser, cachedProfile);
+                settleBoot();
+                fetchUserProfile(currentUser).catch(() => {});
+                return;
+              }
 
-    let unsub: any;
-    initAuth().then((fn) => {
-      unsub = fn;
-    });
+              setUser(currentUser);
+              await fetchWithTimeout(
+                fetchUserProfile(currentUser).catch((err) => {
+                  console.warn("Background profile fetch notice:", err);
+                }),
+                3200,
+                undefined
+              );
+            } else {
+              clearDriveSession();
+              clearSheetsSession();
+              updateSession(null, null);
+            }
+          } catch (authCbErr) {
+            console.warn("Auth state handler notice:", authCbErr);
+          } finally {
+            settleBoot();
+          }
+        },
+        (listenerErr) => {
+          console.warn("Firebase onAuthStateChanged error notice:", listenerErr);
+          settleBoot();
+        }
+      );
+    } catch (subErr) {
+      console.warn("Failed attaching onAuthStateChanged:", subErr);
+      settleBoot();
+    }
 
     return () => {
-      if (typeof unsub === "function") unsub();
+      active = false;
+      window.clearTimeout(bootWatchdogTimer);
+      if (typeof unsubscribe === "function") {
+        unsubscribe();
+      }
     };
   }, []);
 
@@ -1588,22 +1729,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signInWithGoogle = async () => {
     try {
-      setLoading(true);
+      // IMPORTANT: Do NOT set full-screen loading=true before signInWithPopup!
+      // Keeping the Login screen mounted with its inline button spinner prevents trapping users
+      // on the dark splash loader if the Google popup is blocked, slow, or closed silently on mobile/iframe.
       clearDriveSession();
       clearPerUserWorksheetStorage();
-      localStorage.removeItem(DEMO_EXPIRES_KEY);
-      localStorage.removeItem("custom_logged_in_uid");
+      safeStorageRemove(DEMO_EXPIRES_KEY);
+      safeStorageRemove("custom_logged_in_uid");
       setDemoNotice(null);
       setAuthError(null);
       const cred = await signInWithPopup(auth, googleAuthProvider);
       if (cred?.user) {
-        setUser(cred.user);
-        await fetchUserProfile(cred.user);
+        const cached = readCachedUserProfile(cred.user.uid, cred.user.email);
+        if (cached) {
+          updateSession(cred.user, cached);
+          fetchUserProfile(cred.user, { force: true }).catch(() => {});
+        } else {
+          setUser(cred.user);
+          await fetchWithTimeout(
+            fetchUserProfile(cred.user, { force: true }).catch(() => {}),
+            3500,
+            undefined
+          );
+        }
       }
-      setLoading(false);
     } catch (error: any) {
       console.error("Google Sign-In failed:", error);
-      setLoading(false);
       const code = error?.code || "";
       const rawMsg = error?.message || String(error);
       let friendlyError = rawMsg;
@@ -1638,6 +1789,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         friendlyError = "IFRAME_BLOCKED";
       }
       setAuthError(friendlyError);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -1653,24 +1806,56 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return true;
   };
 
-  const signOutUser = async () => {
+  const forceCancelLoading = () => {
+    const existingFbUser = auth.currentUser;
+    if (existingFbUser && !userProfile) {
+      const cached = readCachedUserProfile(existingFbUser.uid, existingFbUser.email);
+      if (cached) {
+        updateSession(existingFbUser, cached);
+      } else {
+        setUser(existingFbUser);
+      }
+      fetchUserProfile(existingFbUser).catch(() => {});
+    }
+    setLoading(false);
+  };
+
+  const resetStuckSession = async () => {
     try {
-      setLoading(true);
       clearDriveSession();
       clearSheetsSession();
-      localStorage.removeItem(DEMO_EXPIRES_KEY);
-      localStorage.removeItem("simulated_user_email");
-      localStorage.removeItem("custom_logged_in_uid");
-      localStorage.removeItem("sisper_user_profile");
+      safeStorageRemove(DEMO_EXPIRES_KEY);
+      safeStorageRemove("simulated_user_email");
+      safeStorageRemove("custom_logged_in_uid");
+      safeStorageRemove("sisper_user_profile");
       setDemoSecondsLeft(null);
       setAuthError(null);
-      try {
-        await signOut(auth);
-      } catch (authErr) {
-        console.warn("Gagal melakukan Firebase auth signout:", authErr);
-      }
+      await fetchWithTimeout(signOut(auth).catch(() => null), 1500, null);
+      updateSession(null, null);
+    } catch {} finally {
+      setLoading(false);
+    }
+  };
+
+  const signOutUser = async () => {
+    try {
+      clearDriveSession();
+      clearSheetsSession();
+      safeStorageRemove(DEMO_EXPIRES_KEY);
+      safeStorageRemove("simulated_user_email");
+      safeStorageRemove("custom_logged_in_uid");
+      safeStorageRemove("sisper_user_profile");
+      setDemoSecondsLeft(null);
+      setAuthError(null);
       updateSession(null, null);
       clearPerUserWorksheetStorage();
+      await fetchWithTimeout(
+        signOut(auth).catch((authErr) => {
+          console.warn("Gagal melakukan Firebase auth signout:", authErr);
+        }),
+        2000,
+        null
+      );
       syncDeviceToFirestore({
         sessionState: "guest",
         userUid: null,
@@ -1681,11 +1866,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         statusPersetujuan: null,
         isOnline: true,
       }).catch(() => {});
-      setLoading(false);
     } catch (error) {
       console.error("Sign-out failed:", error);
-      setLoading(false);
       throw error;
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -2476,17 +2661,35 @@ const removeDeletedTenantEmail = (email: string) => {
       }
 
       const loginNowIso = new Date().toISOString();
-      const loginDeviceRecord = await buildDeviceRecord({
-        sessionState: "active",
-        userUid: customUid,
-        userEmail: data.email,
-        userName: data.namaLengkap,
-        namaSPPG: data.namaSPPG,
-        peran: data.peran || "USER",
-        statusPersetujuan: data.statusPersetujuan || "aktif",
-        isOnline: true,
-      });
-      const loginCompactDevice = toCompactDeviceSummary(loginDeviceRecord);
+      const quickInfo = detectClientDeviceInfo();
+      const quickId = getOrCreateDeviceId();
+      const loginDeviceRecord =
+        (await fetchWithTimeout(
+          buildDeviceRecord({
+            sessionState: "active",
+            userUid: customUid,
+            userEmail: data.email,
+            userName: data.namaLengkap,
+            namaSPPG: data.namaSPPG,
+            peran: data.peran || "USER",
+            statusPersetujuan: data.statusPersetujuan || "aktif",
+            isOnline: true,
+          }).catch(() => null),
+          2000,
+          null
+        )) || {
+          deviceId: quickId,
+          deviceType: quickInfo.deviceType,
+          deviceModel: quickInfo.deviceModel,
+          osName: quickInfo.osName,
+          browserName: quickInfo.browserName,
+          ipAddress: "Terdeteksi",
+          screenResolution: quickInfo.screenResolution,
+          timezone: quickInfo.timezone,
+          lastSeenAt: loginNowIso,
+          isOnline: true,
+        };
+      const loginCompactDevice = toCompactDeviceSummary(loginDeviceRecord as any);
 
       const enrichedLoginData = {
         ...data,
@@ -2499,7 +2702,7 @@ const removeDeletedTenantEmail = (email: string) => {
         lastDeviceSeenAt: loginNowIso,
       };
 
-      localStorage.setItem(`offline_user_${customUid}`, JSON.stringify(enrichedLoginData));
+      safeStorageSet(`offline_user_${customUid}`, JSON.stringify(enrichedLoginData));
 
       updateSession({
         uid: customUid,
@@ -2508,8 +2711,8 @@ const removeDeletedTenantEmail = (email: string) => {
         emailVerified: true
       } as any, enrichedLoginData);
 
-      // Push immediately to Real-Time Sync Hub so mobile login appears on laptop Admin Panel in <1s
-      await Promise.all([
+      // Push immediately to Real-Time Sync Hub in parallel without stalling login completion
+      Promise.all([
         syncUserToRealtimeHub(enrichedLoginData),
         syncDeviceToFirestore({
           sessionState: "active",
@@ -2522,7 +2725,7 @@ const removeDeletedTenantEmail = (email: string) => {
           isOnline: true,
           forceFirestore: true,
         }),
-      ]);
+      ]).catch(() => {});
 
       // Persist timestamp + device to Firestore (with short timeout so mobile login never stalls)
       fetchWithTimeout(
@@ -2928,7 +3131,9 @@ const removeDeletedTenantEmail = (email: string) => {
       demoSecondsLeft,
       demoNotice,
       clearDemoNotice,
-      loginDemoAccount
+      loginDemoAccount,
+      forceCancelLoading,
+      resetStuckSession
     }}>
       {children}
     </AuthContext.Provider>

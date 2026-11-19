@@ -123,10 +123,18 @@ const sanitizeKopLogoUrl = (url?: string | null): string => {
   return url;
 };
 
+const safeReadStorage = (key: string): string | null => {
+  try {
+    return typeof localStorage !== "undefined" ? localStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+};
+
 const readCachedGlobalAppLogo = (): string => {
   try {
-    if (localStorage.getItem(GLOBAL_LOGO_VERSION_KEY) === String(GLOBAL_LOGO_SCHEMA_VERSION)) {
-      return normalizeAppLogoUrl(localStorage.getItem("sisper_global_app_logo"));
+    if (safeReadStorage(GLOBAL_LOGO_VERSION_KEY) === String(GLOBAL_LOGO_SCHEMA_VERSION)) {
+      return normalizeAppLogoUrl(safeReadStorage("sisper_global_app_logo"));
     }
   } catch {}
   return DEFAULT_FALLBACK_LOGO;
@@ -135,7 +143,7 @@ const readCachedGlobalAppLogo = (): string => {
 export default function App() {
   // Load initial state from LocalStorage only when logged in; otherwise start completely empty
   const [profile, setProfile] = useState<SPPGProfile>(() => {
-    const saved = localStorage.getItem("sisper_profile");
+    const saved = safeReadStorage("sisper_profile");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -143,7 +151,7 @@ export default function App() {
   });
 
   const [sekolahPM, setSekolahPM] = useState<SekolahPM[]>(() => {
-    const saved = localStorage.getItem("sisper_sekolah");
+    const saved = safeReadStorage("sisper_sekolah");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -151,7 +159,7 @@ export default function App() {
   });
 
   const [tigaBPM, setTigaBPM] = useState<TigaBPM[]>(() => {
-    const saved = localStorage.getItem("sisper_tigab");
+    const saved = safeReadStorage("sisper_tigab");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -159,7 +167,7 @@ export default function App() {
   });
 
   const [harianPM, setHarianPM] = useState<HariPM[]>(() => {
-    const saved = localStorage.getItem("sisper_harian_pm");
+    const saved = safeReadStorage("sisper_harian_pm");
     if (saved) {
       try {
         return JSON.parse(saved);
@@ -171,7 +179,7 @@ export default function App() {
   });
 
   const [masterMenu, setMasterMenu] = useState<MasterMenu>(() => {
-    const saved = localStorage.getItem("sisper_menu");
+    const saved = safeReadStorage("sisper_menu");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -179,7 +187,7 @@ export default function App() {
   });
 
   const [foodCostDays, setFoodCostDays] = useState<FoodCostDay[]>(() => {
-    const saved = localStorage.getItem("sisper_food_cost");
+    const saved = safeReadStorage("sisper_food_cost");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -201,10 +209,10 @@ export default function App() {
   };
 
   const [tkpiList, setTkpiList] = useState<TKPIItem[]>(() => {
-    if (localStorage.getItem("sisper_tkpi_cleared") === "true") {
+    if (safeReadStorage("sisper_tkpi_cleared") === "true") {
       return [];
     }
-    const saved = localStorage.getItem("sisper_tkpi_list");
+    const saved = safeReadStorage("sisper_tkpi_list");
     if (saved) {
       try {
         return mergeWithTkpi2020(JSON.parse(saved));
@@ -220,12 +228,14 @@ export default function App() {
   };
 
   const [activeTab, setActiveTab] = useState<string>(() => {
-    return localStorage.getItem("sisper_active_tab") || "dashboard";
+    return safeReadStorage("sisper_active_tab") || "dashboard";
   });
 
   useEffect(() => {
     if (activeTab) {
-      localStorage.setItem("sisper_active_tab", activeTab);
+      try {
+        localStorage.setItem("sisper_active_tab", activeTab);
+      } catch {}
     }
   }, [activeTab]);
   const [tkpiSearchQuery, setTkpiSearchQuery] = useState<string>("");
@@ -233,7 +243,7 @@ export default function App() {
   // Global App Brand Logo (Header & Login screen) — strictly controlled by Admin only, NEVER altered by Profil SPPG KOP settings
   const [globalAppLogo, setGlobalAppLogo] = useState<string>(() => readCachedGlobalAppLogo());
 
-  const [customLogo, setCustomLogo] = useState<string>(() => sanitizeKopLogoUrl(localStorage.getItem("kop_left_logo")));
+  const [customLogo, setCustomLogo] = useState<string>(() => sanitizeKopLogoUrl(safeReadStorage("kop_left_logo")));
 
   // State untuk penyesuaian/pemotongan logo header aplikasi (Khusus Admin)
   const [isCropModalOpen, setIsCropModalOpen] = useState(false);
@@ -246,30 +256,42 @@ export default function App() {
   const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
 
   // Synchronized KOP Surat, Logos, Logo Crop & Paper Size (Per-user SPPG KOP — completely independent from Header App Brand Logo)
-  const [kopLine1, setKopLine1] = useState(() => localStorage.getItem("kop_line1") || "BADAN GIZI NASIONAL");
-  const [kopLine2, setKopLine2] = useState(() => localStorage.getItem("kop_line2") || "SATUAN PELAYANAN PEMENUHAN GIZI");
-  const [kopLine3, setKopLine3] = useState(() => localStorage.getItem("kop_line3") || "");
-  const [kopLine4, setKopLine4] = useState(() => localStorage.getItem("kop_line4") || "");
-  const [kopLeftLogo, setKopLeftLogo] = useState(() => sanitizeKopLogoUrl(localStorage.getItem("kop_left_logo")));
-  const [kopRightLogo, setKopRightLogo] = useState(() => sanitizeKopLogoUrl(localStorage.getItem("kop_right_logo")));
+  const [kopLine1, setKopLine1] = useState(() => safeReadStorage("kop_line1") || "BADAN GIZI NASIONAL");
+  const [kopLine2, setKopLine2] = useState(() => safeReadStorage("kop_line2") || "SATUAN PELAYANAN PEMENUHAN GIZI");
+  const [kopLine3, setKopLine3] = useState(() => safeReadStorage("kop_line3") || "");
+  const [kopLine4, setKopLine4] = useState(() => safeReadStorage("kop_line4") || "");
+  const [kopLeftLogo, setKopLeftLogo] = useState(() => sanitizeKopLogoUrl(safeReadStorage("kop_left_logo")));
+  const [kopRightLogo, setKopRightLogo] = useState(() => sanitizeKopLogoUrl(safeReadStorage("kop_right_logo")));
   
   const [leftLogoCrop, setLeftLogoCrop] = useState(() => {
-    const saved = localStorage.getItem("kop_left_logo_crop");
-    return saved ? JSON.parse(saved) : { top: 0, bottom: 0, left: 0, right: 0 };
+    try {
+      const saved = safeReadStorage("kop_left_logo_crop");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === "object") return parsed;
+      }
+    } catch {}
+    return { top: 0, bottom: 0, left: 0, right: 0 };
   });
 
   const [rightLogoCrop, setRightLogoCrop] = useState(() => {
-    const saved = localStorage.getItem("kop_right_logo_crop");
-    return saved ? JSON.parse(saved) : { top: 0, bottom: 0, left: 0, right: 0 };
+    try {
+      const saved = safeReadStorage("kop_right_logo_crop");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === "object") return parsed;
+      }
+    } catch {}
+    return { top: 0, bottom: 0, left: 0, right: 0 };
   });
 
   const [paperSize, setPaperSize] = useState<"A4" | "F4">(() => {
-    return (localStorage.getItem("kop_paper_size") as "A4" | "F4") || "A4";
+    return (safeReadStorage("kop_paper_size") as "A4" | "F4") || "A4";
   });
 
   // Synchronized Sandbox Gizi (Cek Gizi) items (empty by default for new users)
   const [cekGiziItems, setCekGiziItems] = useState<any[]>(() => {
-    const saved = localStorage.getItem("sisper_cek_gizi_items");
+    const saved = safeReadStorage("sisper_cek_gizi_items");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -278,7 +300,7 @@ export default function App() {
 
   // Sistem Manajemen Multi-Periode & Riwayat Perencanaan
   const [savedPeriods, setSavedPeriods] = useState<any[]>(() => {
-    const saved = localStorage.getItem("sisper_saved_periods");
+    const saved = safeReadStorage("sisper_saved_periods");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -287,7 +309,7 @@ export default function App() {
 
   // Pengaturan Target Harga & Klasifikasi Sasaran PM
   const [pmSettings, setPmSettings] = useState<any>(() => {
-    const saved = localStorage.getItem("sisper_pm_settings");
+    const saved = safeReadStorage("sisper_pm_settings");
     if (saved) {
       try { return JSON.parse(saved); } catch (e) {}
     }
@@ -418,7 +440,9 @@ export default function App() {
     demoSecondsLeft,
     demoNotice,
     clearDemoNotice,
-    loginDemoAccount
+    loginDemoAccount,
+    forceCancelLoading,
+    resetStuckSession
   } = useAuth();
 
   const isDemoUser = Boolean(
@@ -461,6 +485,9 @@ export default function App() {
 
   // Google Email Sign-In & Waiting-for-ACC UI states
   const [isGoogleSigningIn, setIsGoogleSigningIn] = useState(false);
+  const [splashElapsedSec, setSplashElapsedSec] = useState(0);
+  const [googleSignInElapsedSec, setGoogleSignInElapsedSec] = useState(0);
+  const [isResettingSplashSession, setIsResettingSplashSession] = useState(false);
   const [isRecheckingDomain, setIsRecheckingDomain] = useState(false);
   const [domainCopied, setDomainCopied] = useState(false);
   const [isCheckingStatus, setIsCheckingStatus] = useState(false);
@@ -468,6 +495,30 @@ export default function App() {
   const [statusCheckFeedback, setStatusCheckFeedback] = useState<{ type: "info" | "success" | "error"; text: string } | null>(null);
   const [isSavingWaitingProfile, setIsSavingWaitingProfile] = useState(false);
   const [waitingProfileSavedMsg, setWaitingProfileSavedMsg] = useState<string | null>(null);
+
+  // Track elapsed loading seconds so the splash screen never leaves users stranded
+  useEffect(() => {
+    if (!loading) {
+      setSplashElapsedSec(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setSplashElapsedSec((prev) => prev + 1);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [loading]);
+
+  // Track elapsed Google popup seconds so users can cancel cleanly if mobile/browser swallows popup close
+  useEffect(() => {
+    if (!isGoogleSigningIn) {
+      setGoogleSignInElapsedSec(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setGoogleSignInElapsedSec((prev) => prev + 1);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isGoogleSigningIn]);
 
   // Tenant identity fields (optional quick-fill on Waiting ACC screen so Admin immediately sees SPPG details)
   const [regNama, setRegNama] = useState("");
@@ -1868,10 +1919,60 @@ export default function App() {
   }, [selectedCategoryFilter, tkpiSearchQuery, tkpiItemsPerPage]);
 
   if (loading) {
+    const showRecoveryActions = splashElapsedSec >= 4;
+    const handleResetFromSplash = async () => {
+      setIsResettingSplashSession(true);
+      try {
+        await resetStuckSession();
+      } finally {
+        setIsResettingSplashSession(false);
+      }
+    };
+
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-6 relative font-sans">
-        <div className="animate-spin rounded-full h-10 w-10 border-b-2 border-emerald-400"></div>
-        <p className="mt-4 text-xs font-semibold text-slate-400">Memuat Sistem GiziSync...</p>
+        <div className="flex flex-col items-center max-w-sm w-full text-center">
+          <div className="animate-spin rounded-full h-10 w-10 border-2 border-slate-800 border-t-emerald-400"></div>
+          <p className="mt-4 text-xs font-semibold text-slate-300">
+            Memuat Sistem GiziSync...
+          </p>
+          {splashElapsedSec >= 2 && (
+            <p className="mt-1.5 text-[11px] text-slate-400 leading-relaxed">
+              {showRecoveryActions
+                ? "Koneksi autentikasi membutuhkan waktu lebih lama dari biasanya."
+                : "Memeriksa sesi autentikasi & koneksi server..."}
+            </p>
+          )}
+
+          {showRecoveryActions && (
+            <div className="mt-6 w-full bg-slate-900/90 border border-slate-800 rounded-2xl p-4 space-y-2.5 shadow-xl">
+              <button
+                type="button"
+                onClick={forceCancelLoading}
+                className="w-full py-2.5 px-4 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-xl text-xs transition cursor-pointer"
+              >
+                Lanjutkan ke Halaman Masuk
+              </button>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => window.location.reload()}
+                  className="py-2 px-3 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-xl text-[11px] border border-slate-700 transition cursor-pointer"
+                >
+                  Muat Ulang
+                </button>
+                <button
+                  type="button"
+                  disabled={isResettingSplashSession}
+                  onClick={handleResetFromSplash}
+                  className="py-2 px-3 bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold rounded-xl text-[11px] border border-slate-700 transition cursor-pointer disabled:opacity-60"
+                >
+                  {isResettingSplashSession ? "Mereset..." : "Reset Sesi Lokal"}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     );
   }
@@ -2244,6 +2345,23 @@ export default function App() {
                     </>
                   )}
                 </button>
+                {isGoogleSigningIn && googleSignInElapsedSec >= 7 && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-xl px-3.5 py-2.5 flex flex-wrap items-center justify-between gap-2 text-[11px] text-amber-900">
+                    <span className="font-medium">
+                      Jendela pemilihan akun Google belum muncul atau sudah ditutup?
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsGoogleSigningIn(false);
+                        setGoogleSignInElapsedSec(0);
+                      }}
+                      className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded-lg text-[11px] transition cursor-pointer shrink-0"
+                    >
+                      Batalkan &amp; Coba Lagi
+                    </button>
+                  </div>
+                )}
                 <p className="text-[11px] text-slate-500 text-center">
                   Pilih akun Gmail pribadi Anda — tanpa perlu membuat atau mengingat kata sandi.
                 </p>
@@ -2363,6 +2481,45 @@ export default function App() {
 
   const adminNoteText =
     typeof userProfile?.keterangan === "string" ? userProfile.keterangan.trim() : "";
+
+  // If user is authenticated via Firebase but profile has not yet arrived (e.g. ultra-slow/offline cold boot)
+  if (!isDemoUser && !isMainAdminAccount && !userProfile) {
+    return (
+      <div className="min-h-screen bg-[#F1F3F9] text-slate-800 flex items-center justify-center p-4 md:p-8 font-sans">
+        <div className="w-full max-w-md bg-white rounded-3xl shadow-xl border border-slate-200 p-6 md:p-8 text-center space-y-5">
+          <div className="mx-auto w-12 h-12 rounded-2xl bg-[#112461]/10 flex items-center justify-center">
+            <RefreshCw className="w-6 h-6 text-[#112461] animate-spin" />
+          </div>
+          <div className="space-y-1.5">
+            <h2 className="text-lg font-extrabold text-slate-900">
+              Menghubungkan Profil Akun Anda
+            </h2>
+            <p className="text-xs text-slate-600 leading-relaxed">
+              Email <strong className="text-slate-900 font-mono">{user.email}</strong> terdeteksi. Sedang memuat status akses dari server SISPERMBG...
+            </p>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2.5 pt-1">
+            <button
+              type="button"
+              disabled={isCheckingStatus}
+              onClick={handleManualStatusCheck}
+              className="flex-1 py-2.5 px-4 bg-[#112461] hover:bg-[#193382] text-white font-bold rounded-xl text-xs transition cursor-pointer disabled:opacity-60 inline-flex items-center justify-center gap-2"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isCheckingStatus ? "animate-spin" : ""}`} />
+              <span>{isCheckingStatus ? "Memeriksa..." : "Coba Hubungkan Ulang"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => resetStuckSession()}
+              className="py-2.5 px-4 bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold rounded-xl text-xs transition cursor-pointer"
+            >
+              Kembali ke Masuk
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   // If non-admin tenant is waiting for Admin ACC -> Direct immediately to Hubungi Odhe Gizi Untuk ACC Akses Anda
   if (
