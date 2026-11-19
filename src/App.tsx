@@ -980,9 +980,14 @@ export default function App() {
     }
   }, [canAutoSyncCloud, user?.uid]);
 
-  const scheduleCloudSaveIfChanged = (key: string, value: any) => {
+  const scheduleCloudSaveIfChanged = (key: string, value: any, preSerialized?: string) => {
     if (!canAutoSyncCloud || !user?.uid || lastBaselineUidRef.current !== user.uid) return null;
-    const serialized = typeof value === "string" ? value : JSON.stringify(value);
+    const serialized =
+      preSerialized !== undefined
+        ? preSerialized
+        : typeof value === "string"
+        ? value
+        : JSON.stringify(value);
     if (syncedBaselineRef.current[key] === serialized) return null;
     return setTimeout(() => {
       syncedBaselineRef.current[key] = serialized;
@@ -1139,14 +1144,22 @@ export default function App() {
 
   useEffect(() => {
     if (!user) return;
-    try {
-      const serialized = JSON.stringify(ikssData);
-      localStorage.setItem("sisper_ikss_data", serialized);
-      if (serialized.length < 900000) {
-        const timer = scheduleCloudSaveIfChanged("ikssData", ikssData);
-        return () => { if (timer) clearTimeout(timer); };
-      }
-    } catch {}
+    let cloudTimer: ReturnType<typeof setTimeout> | null = null;
+    const localTimer = setTimeout(() => {
+      try {
+        const serialized = JSON.stringify(ikssData);
+        if (serialized.length < 1_500_000) {
+          localStorage.setItem("sisper_ikss_data", serialized);
+        }
+        if (serialized.length < 900_000) {
+          cloudTimer = scheduleCloudSaveIfChanged("ikssData", ikssData, serialized);
+        }
+      } catch {}
+    }, 320);
+    return () => {
+      clearTimeout(localTimer);
+      if (cloudTimer) clearTimeout(cloudTimer);
+    };
   }, [user, ikssData, canAutoSyncCloud]);
 
   useEffect(() => {
@@ -3181,6 +3194,8 @@ export default function App() {
             kopConfig={kopConfig}
             paperSize={paperSize}
             bumbuPct={bumbuPct}
+            cloudUserId={user?.uid || "local"}
+            isCloudActive={canAutoSyncCloud}
           />
         )}
 

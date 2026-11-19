@@ -16,7 +16,7 @@ import {
 import {
   exportToPDF,
   downloadElementAsImage,
-  sanitizeOklchString,
+  getCachedSanitizedDocumentStyles,
   detectOptimalPrintLayout,
   convertFormControlsToStaticText,
 } from "../lib/printUtils";
@@ -120,26 +120,8 @@ export const PrintPreviewModal: React.FC<PrintPreviewModalProps> = ({
       orientationMode === "auto" ? detected.orientation : orientation;
     const fontPt = detected.adaptiveFontPt;
 
-    // Collect and sanitize all stylesheets from parent document
-    let combinedStyles = "";
-    document.querySelectorAll("style, link[rel='stylesheet']").forEach((styleEl) => {
-      if (styleEl.tagName.toLowerCase() === "style") {
-        combinedStyles += (styleEl.textContent || "") + "\n";
-      } else if (styleEl.tagName.toLowerCase() === "link") {
-        try {
-          const sheet = (styleEl as HTMLLinkElement).sheet;
-          if (sheet) {
-            Array.from(sheet.cssRules).forEach((rule) => {
-              combinedStyles += rule.cssText + "\n";
-            });
-          }
-        } catch {
-          // CORS stylesheet bypass
-        }
-      }
-    });
-
-    const sanitizedCss = sanitizeOklchString(combinedStyles);
+    // Reuse cached sanitized stylesheets from parent document
+    const sanitizedCss = getCachedSanitizedDocumentStyles();
 
     let sheetWidthMm = paperSize === "A4" ? 210 : 215;
     let sheetHeightMm = paperSize === "A4" ? 297 : 330;

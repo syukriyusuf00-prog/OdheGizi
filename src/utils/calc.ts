@@ -86,6 +86,99 @@ export function formatRupiah(value: number): string {
   }).format(value);
 }
 
+const tkpiNameIndexCache = new WeakMap<Map<string, TKPIItem>, Map<string, TKPIItem>>();
+
+function getTkpiNameIndex(idMap: Map<string, TKPIItem>): Map<string, TKPIItem> {
+  let nameMap = tkpiNameIndexCache.get(idMap);
+  if (!nameMap) {
+    nameMap = new Map<string, TKPIItem>();
+    for (const item of idMap.values()) {
+      if (item && item.nama) {
+        const key = item.nama.trim().toLowerCase();
+        if (key && !nameMap.has(key)) {
+          nameMap.set(key, item);
+        }
+      }
+    }
+    tkpiNameIndexCache.set(idMap, nameMap);
+  }
+  return nameMap;
+}
+
+// Fast, zero-eval arithmetic parser (supports plain numbers and simple + - * / () expressions)
+function evaluateSimpleExpression(expr: string): number {
+  const s = expr.replace(/\s+/g, "");
+  if (!s) return 0;
+  let pos = 0;
+
+  const parseExpr = (): number => {
+    let val = parseTerm();
+    while (pos < s.length && (s[pos] === "+" || s[pos] === "-")) {
+      const op = s[pos++];
+      const rhs = parseTerm();
+      val = op === "+" ? val + rhs : val - rhs;
+    }
+    return val;
+  };
+
+  const parseTerm = (): number => {
+    let val = parseFactor();
+    while (pos < s.length && (s[pos] === "*" || s[pos] === "/")) {
+      const op = s[pos++];
+      const rhs = parseFactor();
+      val = op === "*" ? val * rhs : rhs !== 0 ? val / rhs : 0;
+    }
+    return val;
+  };
+
+  const parseFactor = (): number => {
+    if (pos >= s.length) return 0;
+    if (s[pos] === "+") {
+      pos++;
+      return parseFactor();
+    }
+    if (s[pos] === "-") {
+      pos++;
+      return -parseFactor();
+    }
+    if (s[pos] === "(") {
+      pos++;
+      const inner = parseExpr();
+      if (s[pos] === ")") pos++;
+      return inner;
+    }
+    const start = pos;
+    while (pos < s.length && ((s[pos] >= "0" && s[pos] <= "9") || s[pos] === ".")) {
+      pos++;
+    }
+    if (start === pos) return 0;
+    const num = parseFloat(s.slice(start, pos));
+    return Number.isFinite(num) ? num : 0;
+  };
+
+  const result = parseExpr();
+  return Number.isFinite(result) ? result : 0;
+}
+
+function parseNumericVal(val: number | string | undefined | null): number {
+  if (val === undefined || val === null) return 0;
+  if (typeof val === "number") return Number.isFinite(val) ? val : 0;
+  const str = String(val).trim();
+  if (!str) return 0;
+  // Fast path for standard numeric strings (99.9% of inputs)
+  if (/^[+-]?\d+(\.\d+)?$/.test(str)) {
+    const direct = Number(str);
+    return Number.isFinite(direct) ? direct : 0;
+  }
+  const sanitized = str.replace(/[^0-9+\-*/().\s]/g, "");
+  if (sanitized.trim()) {
+    const evaluated = evaluateSimpleExpression(sanitized);
+    if (Number.isFinite(evaluated)) return evaluated;
+  }
+  const parsed = parseFloat(str);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 export function createTkpiMap(tkpiList: TKPIItem[]): Map<string, TKPIItem> {
   const map = new Map<string, TKPIItem>();
   for (let i = 0; i < tkpiList.length; i++) {
@@ -108,11 +201,8 @@ export function calculateIngredient(
     tkpi = tkpiListOrMap.get(input.tkpiId);
     if (!tkpi && input.nama) {
       const targetName = input.nama.trim().toLowerCase();
-      for (const candidate of tkpiListOrMap.values()) {
-        if (candidate.nama.trim().toLowerCase() === targetName) {
-          tkpi = candidate;
-          break;
-        }
+      if (targetName) {
+        tkpi = getTkpiNameIndex(tkpiListOrMap).get(targetName);
       }
     }
   } else if (Array.isArray(tkpiListOrMap)) {
@@ -159,27 +249,9 @@ export function calculateIngredient(
   // Total kebutuhan = BK * Jumlah PM (g)
   const totalKebutuhanGram = beratKotor * jumlahPM;
   const totalKebutuhanKg = totalKebutuhanGram / 1000;
-  
-  // Helper to parse potential math expression strings
-  const parseVal = (val: number | string | undefined | null): number => {
-    if (val === undefined || val === null) return 0;
-    if (typeof val === "number") return val;
-    const str = String(val).trim();
-    if (!str) return 0;
-    try {
-      const sanitized = str.replace(/[^0-9+\-*/().\s]/g, "");
-      if (!sanitized.trim()) return 0;
-      const evaluated = new Function(`return (${sanitized})`)();
-      if (typeof evaluated === "number" && !isNaN(evaluated) && isFinite(evaluated)) {
-        return evaluated;
-      }
-    } catch (e) {}
-    const parsed = parseFloat(str);
-    return isNaN(parsed) ? 0 : parsed;
-  };
 
-  const potongVal = parseVal(input.potong);
-  const ekorVal = parseVal(input.ekor);
+  const potongVal = parseNumericVal(input.potong);
+  const ekorVal = parseNumericVal(input.ekor);
 
   // 1. Base quantity from which buffer is calculated
   const selectedBase = input.bufferBase || "auto";

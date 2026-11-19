@@ -229,19 +229,63 @@ export function sanitizeOklchString(str: string): string {
     result = result.replace(/light-dark\(\s*([^,\)]+)\s*,\s*([^,\)]+)\s*\)/gi, "$1");
   }
   if (result.includes("color(")) {
-    result = result.replace(/color\([^)]+\)/gi, (m) => convertCssColorToRgb(m));
+    result = result.replace(/color\([^()]+\)/gi, (m) => convertCssColorToRgb(m));
   }
   if (result.includes("oklab")) {
-    result = result.replace(/oklab\([^)]+\)/gi, (m) => convertCssColorToRgb(m));
+    result = result.replace(/oklab\([^()]+\)/gi, (m) => convertCssColorToRgb(m));
   }
   if (result.includes("oklch")) {
-    result = result.replace(/oklch\([^)]+\)/gi, (m) => convertCssColorToRgb(m));
+    result = result.replace(/oklch\([^()]+\)/gi, (m) => convertCssColorToRgb(m));
   }
   if (result.includes("color-mix")) {
-    result = result.replace(/color-mix\([^)]+\)/gi, (m) => convertCssColorToRgb(m));
+    result = result.replace(/color-mix\([^()]+\)/gi, (m) => convertCssColorToRgb(m));
   }
 
   return result;
+}
+
+let cachedSanitizedDocCss: { key: string; css: string } | null = null;
+
+/**
+ * Collects and sanitizes current document stylesheets once per stylesheet signature
+ * so opening print previews or triggering smart print never stalls the main thread.
+ */
+export function getCachedSanitizedDocumentStyles(): string {
+  if (typeof document === "undefined") return "";
+  const nodes = Array.from(document.querySelectorAll("style, link[rel='stylesheet']"));
+  const sig = nodes
+    .map((el) =>
+      el.tagName.toLowerCase() === "style"
+        ? `s:${(el.textContent || "").length}`
+        : `l:${(el as HTMLLinkElement).href || ""}`
+    )
+    .join("|");
+
+  if (cachedSanitizedDocCss && cachedSanitizedDocCss.key === sig) {
+    return cachedSanitizedDocCss.css;
+  }
+
+  let combinedStyles = "";
+  nodes.forEach((styleEl) => {
+    if (styleEl.tagName.toLowerCase() === "style") {
+      combinedStyles += (styleEl.textContent || "") + "\n";
+    } else if (styleEl.tagName.toLowerCase() === "link") {
+      try {
+        const sheet = (styleEl as HTMLLinkElement).sheet;
+        if (sheet) {
+          Array.from(sheet.cssRules).forEach((rule) => {
+            combinedStyles += rule.cssText + "\n";
+          });
+        }
+      } catch {
+        // Ignore CORS stylesheets
+      }
+    }
+  });
+
+  const sanitized = sanitizeOklchString(combinedStyles);
+  cachedSanitizedDocCss = { key: sig, css: sanitized };
+  return sanitized;
 }
 
 function createSanitizedComputedStyle(origFn: typeof window.getComputedStyle) {
@@ -682,26 +726,8 @@ export const printElementSmart = (
   const pageSizeCss = paperSize === "F4" ? `215mm 330mm ${resolvedOrientation}` : `A4 ${resolvedOrientation}`;
   const scalePercent = options.scalePercent || 100;
 
-  // Gather and sanitize stylesheets from current document
-  let combinedStyles = "";
-  document.querySelectorAll("style, link[rel='stylesheet']").forEach((styleEl) => {
-    if (styleEl.tagName.toLowerCase() === "style") {
-      combinedStyles += (styleEl.textContent || "") + "\n";
-    } else if (styleEl.tagName.toLowerCase() === "link") {
-      try {
-        const sheet = (styleEl as HTMLLinkElement).sheet;
-        if (sheet) {
-          Array.from(sheet.cssRules).forEach((rule) => {
-            combinedStyles += rule.cssText + "\n";
-          });
-        }
-      } catch {
-        // Ignore CORS stylesheets
-      }
-    }
-  });
-
-  const sanitizedCss = sanitizeOklchString(combinedStyles);
+  // Reuse cached sanitized stylesheets from current document
+  const sanitizedCss = getCachedSanitizedDocumentStyles();
 
   // Clone element cleanly and replace inputs/selects with static Arial text
   const cloned = element.cloneNode(true) as HTMLElement;
@@ -903,7 +929,16 @@ export const exportToPDF = async (
   try {
     window.getComputedStyle = createSanitizedComputedStyle(origWindowGetComputedStyle);
 
-    const renderScale = 2; // 2x scale for sharp crisp rendering
+    // Yield a frame so progress message paints before html2canvas starts
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+
+    const elW = Math.max(element.scrollWidth || 0, element.offsetWidth || 800);
+    const elH = Math.max(element.scrollHeight || 0, element.offsetHeight || 600);
+    const area = elW * elH;
+    // Dynamically protect Chrome memory on tall photo-heavy sheets (e.g., 20-30 day IKSS photo tables)
+    const renderScale =
+      elH > 4500 || area > 5_000_000 ? 1.25 : elH > 2600 || area > 2_600_000 ? 1.5 : 2;
+
     const canvas = await html2canvas(element, {
       scale: renderScale,
       useCORS: true,
@@ -919,15 +954,15 @@ export const exportToPDF = async (
       }
     });
 
-    if (onProgress) onProgress("Menyusun file PDF presisi...");
+    if (onProgress) onProgress("Menyusun halaman PDF presisi...");
+    await new Promise<void>((r) => setTimeout(r, 0));
 
-    const imgData = canvas.toDataURL("image/png");
-    const imgWidth = canvas.width;
-    const imgHeight = canvas.height;
+    const imgWidth = Math.max(canvas.width, 1);
+    const imgHeight = Math.max(canvas.height, 1);
 
     const finalOrientation: "portrait" | "landscape" =
       requestedOrientation === "auto"
-        ? detected.orientation === "landscape" || imgWidth / Math.max(imgHeight, 1) > 1.25
+        ? detected.orientation === "landscape" || imgWidth / imgHeight > 1.25
           ? "landscape"
           : "portrait"
         : resolvedOrientation;
@@ -938,6 +973,7 @@ export const exportToPDF = async (
       orientation: finalOrientation,
       unit: "mm",
       format: pdfFormat,
+      compress: true,
     });
 
     const pdfWidth = pdf.internal.pageSize.getWidth();
@@ -945,36 +981,69 @@ export const exportToPDF = async (
 
     const marginX = 7;
     const marginY = 7;
-    const availWidth = pdfWidth - marginX * 2;
-    const availHeight = pdfHeight - marginY * 2;
+    const availWidth = Math.max(10, pdfWidth - marginX * 2);
+    const availHeight = Math.max(10, pdfHeight - marginY * 2);
 
-    const imgAspect = imgHeight / Math.max(imgWidth, 1);
+    const imgAspect = imgHeight / imgWidth;
     let printWidth = availWidth;
     let printHeight = printWidth * imgAspect;
 
-    // If page content slightly exceeds page height, fit height neatly onto one page
-    if (printHeight > availHeight && printHeight <= availHeight * 1.16) {
+    // If page content slightly exceeds single page height, fit neatly onto one page
+    if (printHeight > availHeight && printHeight <= availHeight * 1.15) {
       printHeight = availHeight;
       printWidth = printHeight / imgAspect;
     }
 
     const xPos = marginX + Math.max(0, (availWidth - printWidth) / 2);
-    const yPos = marginY;
 
     if (printHeight <= availHeight) {
-      pdf.addImage(imgData, "PNG", xPos, yPos, printWidth, printHeight);
+      const pageImg = canvas.toDataURL("image/jpeg", 0.92);
+      pdf.addImage(pageImg, "JPEG", xPos, marginY, printWidth, printHeight, undefined, "FAST");
     } else {
-      let heightLeft = printHeight;
-      let position = marginY;
+      // Slice canvas per page so multi-page PDFs never duplicate huge full-document images in memory
+      const pxPerMm = imgWidth / printWidth;
+      const pageSlicePx = Math.max(100, Math.floor(availHeight * pxPerMm));
+      const sliceCanvas = document.createElement("canvas");
+      sliceCanvas.width = imgWidth;
+      const sliceCtx = sliceCanvas.getContext("2d", { alpha: false });
 
-      pdf.addImage(imgData, "PNG", xPos, position, printWidth, printHeight);
-      heightLeft -= availHeight;
+      let offsetY = 0;
+      let pageIndex = 0;
+      const maxPages = 40;
 
-      while (heightLeft > 0) {
-        pdf.addPage();
-        position = marginY - (printHeight - heightLeft);
-        pdf.addImage(imgData, "PNG", xPos, position, printWidth, printHeight);
-        heightLeft -= availHeight;
+      while (offsetY < imgHeight && pageIndex < maxPages) {
+        const remainingPx = imgHeight - offsetY;
+        const currentSlicePx = Math.min(pageSlicePx, remainingPx);
+        sliceCanvas.height = currentSlicePx;
+
+        if (sliceCtx) {
+          sliceCtx.fillStyle = "#ffffff";
+          sliceCtx.fillRect(0, 0, imgWidth, currentSlicePx);
+          sliceCtx.drawImage(
+            canvas,
+            0,
+            offsetY,
+            imgWidth,
+            currentSlicePx,
+            0,
+            0,
+            imgWidth,
+            currentSlicePx
+          );
+        }
+
+        const sliceMmHeight = currentSlicePx / pxPerMm;
+        const sliceData = sliceCanvas.toDataURL("image/jpeg", 0.9);
+        if (pageIndex > 0) pdf.addPage();
+        pdf.addImage(sliceData, "JPEG", xPos, marginY, printWidth, sliceMmHeight, undefined, "FAST");
+
+        offsetY += currentSlicePx;
+        pageIndex += 1;
+
+        // Yield cleanly between pages so Chrome never marks the page unresponsive
+        if (offsetY < imgHeight) {
+          await new Promise<void>((r) => setTimeout(r, 0));
+        }
       }
     }
 

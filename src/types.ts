@@ -173,6 +173,14 @@ export interface IkssAkgOverride {
   serat?: number;
 }
 
+export interface IkssDailyPostMeta {
+  posted: boolean;
+  postedAt?: string;
+  caption?: string;
+  customMenuName?: string;
+  updatedAt?: string;
+}
+
 export interface IkssDataState {
   selectedFoodCostTypes: string[];
   selectedSasaranIds: string[];
@@ -180,8 +188,14 @@ export interface IkssDataState {
   customPeriodeLabel?: string;
   showKopOnIkss?: boolean;
   akgOverride?: IkssAkgOverride;
-  /** Map keyed by `${groupKey}__day_${hariKe}` -> compressed JPEG data URL */
+  /** Legacy inline photo map — automatically migrated into async IndexedDB + chunked cloud batches */
   photos: Record<string, string>;
+  /** Lightweight per-day posting metadata keyed by `${groupKey}__day_${hariKe}` */
+  dailyPosts?: Record<string, IkssDailyPostMeta>;
+  /** Remember last active IKSS sub-tab */
+  activeSubView?: "nilai_gizi" | "foto_menu";
+  /** Optional 1-click auto-posting when uploading from camera/gallery */
+  autoPostOnUpload?: boolean;
 }
 
 export interface SPPGProfile {

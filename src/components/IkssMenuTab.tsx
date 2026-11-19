@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Camera,
   Image as ImageIcon,
@@ -13,17 +13,31 @@ import {
   Eye,
   Trash2,
   RotateCcw,
+  RotateCw,
   ClipboardList,
   Check,
+  CheckCircle2,
   Layers,
   AlertCircle,
   X,
+  Upload,
+  Send,
+  Cloud,
+  CloudOff,
+  Loader2,
+  LayoutGrid,
+  Table2,
+  Edit3,
+  ChevronLeft,
+  ChevronRight,
+  ZoomIn,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import {
   DEFAULT_UNIFIED_KOP_CONFIG,
   FoodCostDay,
   HariPM,
+  IkssDailyPostMeta,
   IkssDataState,
   MasterMenu,
   SPPGProfile,
@@ -38,6 +52,14 @@ import {
 } from "../utils/menuSchedule";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import { printElementSmart, exportToPDF } from "../lib/printUtils";
+import {
+  compressMenuPhoto,
+  loadIkssPhotosFromCloud,
+  loadIkssPhotosLocal,
+  rotatePhotoDataUrl90,
+  saveIkssPhotosLocal,
+  saveIkssPhotosToCloud,
+} from "../utils/ikssPhotoStore";
 import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import AutoSignatureBlock from "./AutoSignatureBlock";
 import PrintPreviewModal from "./PrintPreviewModal";
@@ -61,7 +83,12 @@ interface IkssMenuTabProps {
   kopConfig?: UnifiedKopConfig;
   paperSize?: "A4" | "F4";
   bumbuPct?: number;
+  cloudUserId?: string;
+  isCloudActive?: boolean;
 }
+
+const DEFAULT_FC_TYPES: string[] = ["Basah", "3B-Basah"];
+const DEFAULT_SASARAN_IDS: string[] = ["anak_balita", "anak_balita_13_59"];
 
 const STANDARD_FOOD_COST_TYPES: Array<{
   id: FoodCostDay["jenisMenu"];
@@ -103,7 +130,6 @@ interface AkgPresetTarget {
   serat: number;
 }
 
-// Reference AKG 20-25% (Porsi Kecil) & 30-35% (Porsi Besar) per sasaran ID
 const SASARAN_AKG_REF: Record<string, AkgPresetTarget> = {
   balita_6_11: {
     label: "Rujukan AKG 20-25%",
@@ -311,6 +337,20 @@ function formatIndoFullDate(dateStr?: string): string {
   }
 }
 
+function formatShortTimestamp(iso?: string): string {
+  if (!iso) return "";
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    const months = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${d.getDate()} ${months[d.getMonth()]} ${hh}.${mm}`;
+  } catch {
+    return "";
+  }
+}
+
 function derivePeriodeBulanLabel(dates: string[]): string {
   const valid = (dates || []).filter((d) => /^\d{4}-\d{2}-\d{2}/.test(d || ""));
   if (valid.length === 0) {
@@ -348,38 +388,28 @@ function derivePeriodeBulanLabel(dates: string[]): string {
   return `${months[first.m]} ${first.y} SD ${months[last.m]} ${last.y}`;
 }
 
-function compressPhotoFile(file: File, maxWidth = 380, quality = 0.72): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      const img = new Image();
-      img.onload = () => {
-        const scale = img.width > maxWidth ? maxWidth / img.width : 1;
-        const w = Math.max(1, Math.round(img.width * scale));
-        const h = Math.max(1, Math.round(img.height * scale));
-        const canvas = document.createElement("canvas");
-        canvas.width = w;
-        canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) {
-          reject(new Error("Gagal memproses gambar."));
-          return;
-        }
-        ctx.drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL("image/jpeg", quality));
-      };
-      img.onerror = () => reject(new Error("File gambar tidak valid."));
-      img.src = String(reader.result || "");
-    };
-    reader.onerror = () => reject(new Error("Gagal membaca file gambar."));
-    reader.readAsDataURL(file);
-  });
-}
-
 function formatDec1(val: number): string {
   if (!Number.isFinite(val)) return "0.0";
   return (Math.round(val * 10) / 10).toFixed(1);
 }
+
+interface DailyNutritionValues {
+  energi: number;
+  protein: number;
+  lemak: number;
+  kh: number;
+  serat: number;
+  hasNutrition: boolean;
+}
+
+const EMPTY_NUTRITION: DailyNutritionValues = {
+  energi: 0,
+  protein: 0,
+  lemak: 0,
+  kh: 0,
+  serat: 0,
+  hasNutrition: false,
+};
 
 export default function IkssMenuTab({
   profile,
@@ -400,11 +430,182 @@ export default function IkssMenuTab({
   kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
   paperSize = "A4",
   bumbuPct = 10,
+  cloudUserId = "local",
+  isCloudActive = false,
 }: IkssMenuTabProps) {
-  const [subView, setSubView] = useState<"nilai_gizi" | "foto_menu">("nilai_gizi");
+  const [subView, setSubView] = useState<"nilai_gizi" | "foto_menu">(
+    ikssData.activeSubView === "foto_menu" ? "foto_menu" : "nilai_gizi"
+  );
+  const [photoViewMode, setPhotoViewMode] = useState<"tabel" | "kartu">("tabel");
+  const [photoFilter, setPhotoFilter] = useState<"semua" | "diposting" | "draft" | "belum">("semua");
   const [showPrintModal, setShowPrintModal] = useState(false);
-  const [photoError, setPhotoError] = useState<string | null>(null);
-  const [showCategoryDrawer, setShowCategoryDrawer] = useState(true);
+  const [showCategoryDrawer, setShowCategoryDrawer] = useState(false);
+
+  // Localized async photo map (IndexedDB + chunked Cloud) so uploading never re-renders App.tsx
+  const [photoMap, setPhotoMap] = useState<Record<string, string>>({});
+  const [photosHydrated, setPhotosHydrated] = useState(false);
+  const [processingDays, setProcessingDays] = useState<Record<number, boolean>>({});
+  const [dragOverDay, setDragOverDay] = useState<number | null>(null);
+  const [bulkProgress, setBulkProgress] = useState<{ current: number; total: number } | null>(null);
+  const [syncState, setSyncState] = useState<"idle" | "saving" | "synced" | "local_only">("idle");
+  const [photoBanner, setPhotoBanner] = useState<{ type: "success" | "error" | "info"; text: string } | null>(null);
+
+  // Lightbox & inline menu editor state
+  const [lightboxDay, setLightboxDay] = useState<number | null>(null);
+  const [editingMenuDay, setEditingMenuDay] = useState<number | null>(null);
+  const [editMenuDraft, setEditMenuDraft] = useState("");
+  const [editCaptionDraft, setEditCaptionDraft] = useState("");
+
+  // Export guard to prevent duplicate overlapping html2canvas calls
+  const [isExportingPdf, setIsExportingPdf] = useState(false);
+  const [exportStatusMsg, setExportStatusMsg] = useState<string | null>(null);
+
+  const photoMapRef = useRef<Record<string, string>>(photoMap);
+  photoMapRef.current = photoMap;
+  const cloudSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bulkInputRef = useRef<HTMLInputElement | null>(null);
+
+  const showNotice = useCallback((type: "success" | "error" | "info", text: string) => {
+    setPhotoBanner({ type, text });
+  }, []);
+
+  // Hydrate photos asynchronously from IndexedDB + Cloud + one-time migration of legacy ikssData.photos
+  useEffect(() => {
+    let cancelled = false;
+    const scope = cloudUserId || "local";
+
+    const hydrate = async () => {
+      const localPhotos = await loadIkssPhotosLocal(scope);
+      const legacyPhotos =
+        ikssData.photos && typeof ikssData.photos === "object" ? ikssData.photos : {};
+      const hasLegacy = Object.keys(legacyPhotos).length > 0;
+
+      let merged: Record<string, string> = { ...legacyPhotos, ...localPhotos };
+
+      if (!cancelled) {
+        setPhotoMap(merged);
+        setPhotosHydrated(true);
+      }
+
+      if (hasLegacy) {
+        await saveIkssPhotosLocal(scope, merged);
+        // Strip heavy base64 blobs from App.tsx ikssData state once safely persisted in IndexedDB
+        if (!cancelled) {
+          setIkssData((prev) => {
+            if (!prev.photos || Object.keys(prev.photos).length === 0) return prev;
+            const migratedPosts: Record<string, IkssDailyPostMeta> = { ...(prev.dailyPosts || {}) };
+            Object.keys(prev.photos).forEach((k) => {
+              if (!migratedPosts[k]) {
+                migratedPosts[k] = { posted: true, postedAt: new Date().toISOString() };
+              }
+            });
+            return { ...prev, photos: {}, dailyPosts: migratedPosts };
+          });
+        }
+      }
+
+      if (isCloudActive && cloudUserId && cloudUserId !== "local") {
+        const cloudPhotos = await loadIkssPhotosFromCloud(cloudUserId);
+        if (!cancelled && cloudPhotos && Object.keys(cloudPhotos).length > 0) {
+          merged = { ...cloudPhotos, ...merged };
+          setPhotoMap(merged);
+          await saveIkssPhotosLocal(scope, merged);
+        } else if (!cancelled && hasLegacy && Object.keys(merged).length > 0) {
+          // Push migrated legacy photos to chunked cloud store
+          saveIkssPhotosToCloud(cloudUserId, merged).catch(() => {});
+        }
+      }
+    };
+
+    hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [cloudUserId, isCloudActive]);
+
+  // Also migrate any legacy inline photos that arrive later after cloud hydration
+  const legacyPhotoCount = ikssData.photos ? Object.keys(ikssData.photos).length : 0;
+  useEffect(() => {
+    if (legacyPhotoCount === 0) return;
+    const legacyPhotos = ikssData.photos || {};
+    const scope = cloudUserId || "local";
+    const merged = { ...legacyPhotos, ...photoMapRef.current };
+    setPhotoMap(merged);
+    saveIkssPhotosLocal(scope, merged).then(() => {
+      if (isCloudActive && cloudUserId && cloudUserId !== "local") {
+        saveIkssPhotosToCloud(cloudUserId, merged).catch(() => {});
+      }
+    });
+    setIkssData((prev) => {
+      if (!prev.photos || Object.keys(prev.photos).length === 0) return prev;
+      const migratedPosts: Record<string, IkssDailyPostMeta> = { ...(prev.dailyPosts || {}) };
+      Object.keys(prev.photos).forEach((k) => {
+        if (!migratedPosts[k]) {
+          migratedPosts[k] = { posted: true, postedAt: new Date().toISOString() };
+        }
+      });
+      return { ...prev, photos: {}, dailyPosts: migratedPosts };
+    });
+  }, [legacyPhotoCount, cloudUserId, isCloudActive]);
+
+  useEffect(() => {
+    return () => {
+      if (cloudSyncTimerRef.current) {
+        clearTimeout(cloudSyncTimerRef.current);
+      }
+    };
+  }, []);
+
+  const persistPhotos = useCallback(
+    async (nextPhotos: Record<string, string>, immediateCloud = false): Promise<{ cloudOk: boolean; error?: string }> => {
+      const scope = cloudUserId || "local";
+      setSyncState("saving");
+      await saveIkssPhotosLocal(scope, nextPhotos);
+
+      if (!isCloudActive || !cloudUserId || cloudUserId === "local") {
+        setSyncState("local_only");
+        return { cloudOk: false };
+      }
+
+      if (cloudSyncTimerRef.current) {
+        clearTimeout(cloudSyncTimerRef.current);
+        cloudSyncTimerRef.current = null;
+      }
+
+      if (immediateCloud) {
+        const res = await saveIkssPhotosToCloud(cloudUserId, nextPhotos);
+        setSyncState(res.ok ? "synced" : "local_only");
+        return { cloudOk: res.ok, error: res.error };
+      }
+
+      cloudSyncTimerRef.current = setTimeout(async () => {
+        const res = await saveIkssPhotosToCloud(cloudUserId, photoMapRef.current);
+        setSyncState(res.ok ? "synced" : "local_only");
+      }, 900);
+      return { cloudOk: true };
+    },
+    [cloudUserId, isCloudActive]
+  );
+
+  // Stable references so useMemo caches never bust spuriously
+  const selectedFoodCostTypes = useMemo(
+    () =>
+      ikssData.selectedFoodCostTypes && ikssData.selectedFoodCostTypes.length > 0
+        ? ikssData.selectedFoodCostTypes
+        : DEFAULT_FC_TYPES,
+    [ikssData.selectedFoodCostTypes]
+  );
+
+  const selectedSasaranIds = useMemo(
+    () =>
+      ikssData.selectedSasaranIds && ikssData.selectedSasaranIds.length > 0
+        ? ikssData.selectedSasaranIds
+        : DEFAULT_SASARAN_IDS,
+    [ikssData.selectedSasaranIds]
+  );
+
+  const selectedFcTypeSet = useMemo(() => new Set(selectedFoodCostTypes), [selectedFoodCostTypes]);
+  const selectedSasaranSet = useMemo(() => new Set(selectedSasaranIds), [selectedSasaranIds]);
 
   const tkpiMap = useMemo(() => createTkpiMap(tkpiList), [tkpiList]);
 
@@ -420,37 +621,25 @@ export default function IkssMenuTab({
     return [] as any[];
   }, [foodCostDays]);
 
-  const selectedFoodCostTypes =
-    ikssData.selectedFoodCostTypes && ikssData.selectedFoodCostTypes.length > 0
-      ? ikssData.selectedFoodCostTypes
-      : ["Basah", "3B-Basah"];
-
-  const selectedSasaranIds =
-    ikssData.selectedSasaranIds && ikssData.selectedSasaranIds.length > 0
-      ? ikssData.selectedSasaranIds
-      : ["anak_balita", "anak_balita_13_59"];
-
-  // Compute default category label dynamically from selected sasaran
   const autoCategoryTitle = useMemo(() => {
     const matchedPreset = QUICK_PRESETS.find(
       (p) =>
         p.sasaranIds.length === selectedSasaranIds.length &&
-        p.sasaranIds.every((id) => selectedSasaranIds.includes(id))
+        p.sasaranIds.every((id) => selectedSasaranSet.has(id))
     );
     if (matchedPreset) return matchedPreset.title;
-    const labels = SASARAN_KATEGORI_LIST.filter((s) =>
-      selectedSasaranIds.includes(s.id)
-    ).map((s) => s.shortLabel.toUpperCase());
+    const labels = SASARAN_KATEGORI_LIST.filter((s) => selectedSasaranSet.has(s.id)).map((s) =>
+      s.shortLabel.toUpperCase()
+    );
     if (labels.length === 0) return "SEMUA KATEGORI";
     if (labels.length <= 3) return labels.join(" / ");
     return `${labels.slice(0, 3).join(", ")} +${labels.length - 3} LAINNYA`;
-  }, [selectedSasaranIds]);
+  }, [selectedSasaranIds, selectedSasaranSet]);
 
   const displayCategoryTitle = (
     ikssData.customCategoryTitle?.trim() || autoCategoryTitle
   ).toUpperCase();
 
-  // Period/Month automatically derived from profile.periodeDates
   const autoPeriodeBulan = useMemo(
     () => derivePeriodeBulanLabel(profile.periodeDates || []),
     [profile.periodeDates]
@@ -459,25 +648,41 @@ export default function IkssMenuTab({
     ikssData.customPeriodeLabel?.trim() || autoPeriodeBulan
   ).toUpperCase();
 
-  // Group key for storing photos per selected category combination (shared across same category selection)
   const photoGroupKey = useMemo(() => {
     const sorted = [...selectedSasaranIds].sort().join("_");
     return sorted || "default";
   }, [selectedSasaranIds]);
 
-  const totalDays = Math.max(
-    profile.periodeDates?.length || 0,
-    harianPM?.length || 0,
-    10
+  // Safely cap totalDays so corrupted arrays can never spin thousands of DOM rows
+  const totalDays = Math.min(
+    62,
+    Math.max(profile.periodeDates?.length || 0, harianPM?.length || 0, 10)
   );
 
-  // Normalized master menu plans for rich menu name fallback
-  const normalizedMenu = useMemo(
-    () => ensureMasterMenuPlans(masterMenu),
-    [masterMenu]
-  );
+  const normalizedMenu = useMemo(() => ensureMasterMenuPlans(masterMenu), [masterMenu]);
 
-  // Check which Food Cost types actually have ingredients in the current planning
+  // Pre-index FoodCostDays & HarianPM by hariKe for O(1) lookup
+  const fcByDay = useMemo(() => {
+    const map = new Map<number, FoodCostDay[]>();
+    for (let i = 0; i < foodCostDays.length; i++) {
+      const fc = foodCostDays[i];
+      if (!fc) continue;
+      const list = map.get(fc.hariKe);
+      if (list) list.push(fc);
+      else map.set(fc.hariKe, [fc]);
+    }
+    return map;
+  }, [foodCostDays]);
+
+  const pmByDay = useMemo(() => {
+    const map = new Map<number, HariPM>();
+    for (let i = 0; i < harianPM.length; i++) {
+      const h = harianPM[i];
+      if (h) map.set(h.hariKe, h);
+    }
+    return map;
+  }, [harianPM]);
+
   const populatedFcTypes = useMemo(() => {
     const set = new Set<string>();
     foodCostDays.forEach((d) => {
@@ -494,60 +699,149 @@ export default function IkssMenuTab({
     return set;
   }, [foodCostDays, customFcTables]);
 
-  // Core Daily IKSS Rows computed automatically from Food Cost + Penerima Manfaat + Profil SPPG Dates
-  const dailyRows = useMemo(() => {
+  // Fast base daily rows (dates, auto menu names, beneficiary counts) — zero heavy nutrition calc
+  const baseDailyRows = useMemo(() => {
     const hasKecilSelected = selectedSasaranIds.some((id) => PORSI_KECIL_IDS.has(id));
     const hasBesarSelected = selectedSasaranIds.some((id) => PORSI_BESAR_IDS.has(id));
     const isAlergiOnly =
       selectedFoodCostTypes.length > 0 &&
       selectedFoodCostTypes.every((t) => t.toLowerCase().includes("alergi"));
 
+    const matchingPlans = (normalizedMenu.plans || []).filter(
+      (plan) =>
+        selectedSasaranIds.length === 0 ||
+        (plan.sasaranIds || []).some((id) => selectedSasaranSet.has(id))
+    );
+
     const rows: Array<{
       hariKe: number;
       dateStr: string;
       formattedDate: string;
-      namaMenu: string;
-      energi: number;
-      protein: number;
-      lemak: number;
-      kh: number;
-      serat: number;
+      autoNamaMenu: string;
+      pmKecilCount: number;
+      pmBesarCount: number;
       jumlahManfaat: number;
-      hasNutrition: boolean;
+      photoKey: string;
     }> = [];
 
     for (let i = 0; i < totalDays; i++) {
       const hariKe = i + 1;
       const dateStr = profile.periodeDates?.[i] || "";
-      const formattedDate = dateStr
-        ? formatIndoFullDate(dateStr)
-        : `Hari Ke-${hariKe}`;
+      const formattedDate = dateStr ? formatIndoFullDate(dateStr) : `Hari Ke-${hariKe}`;
 
-      // 1. Beneficiaries for selected Sasaran IDs on hariKe
-      const dayPM = harianPM.find((h) => h.hariKe === hariKe) || harianPM[0];
+      const dayPM = pmByDay.get(hariKe) || harianPM[0];
       let pmKecilCount = 0;
       let pmBesarCount = 0;
-      selectedSasaranIds.forEach((sId) => {
-        const sas = dayPM?.sasaran?.find((s) => s.id === sId);
-        if (!sas) return;
-        const count = isAlergiOnly
-          ? (Number(sas.alergiKecil) || 0) + (Number(sas.alergiBesar) || 0)
-          : (Number(sas.porsiKecil) || 0) + (Number(sas.porsiBesar) || 0);
-        if (PORSI_KECIL_IDS.has(sId)) {
-          pmKecilCount += count;
-        } else {
-          pmBesarCount += count;
+      if (dayPM?.sasaran) {
+        for (let sIdx = 0; sIdx < dayPM.sasaran.length; sIdx++) {
+          const sas = dayPM.sasaran[sIdx];
+          if (!selectedSasaranSet.has(sas.id)) continue;
+          const count = isAlergiOnly
+            ? (Number(sas.alergiKecil) || 0) + (Number(sas.alergiBesar) || 0)
+            : (Number(sas.porsiKecil) || 0) + (Number(sas.porsiBesar) || 0);
+          if (PORSI_KECIL_IDS.has(sas.id)) pmKecilCount += count;
+          else pmBesarCount += count;
         }
+      }
+
+      // Resolve menu name cleanly from Master Menu plans first, then Food Cost
+      const masterMenuNames: string[] = [];
+      for (let pIdx = 0; pIdx < matchingPlans.length; pIdx++) {
+        const dayItem = matchingPlans[pIdx].days?.[i];
+        if (!dayItem) continue;
+        const composed = composeMenuName(dayItem).trim();
+        if (composed && !masterMenuNames.includes(composed)) {
+          masterMenuNames.push(composed);
+        }
+      }
+
+      let autoNamaMenu = "";
+      if (masterMenuNames.length > 0) {
+        autoNamaMenu = masterMenuNames.join(" | ");
+      } else {
+        const matchedDays = (fcByDay.get(hariKe) || []).filter((fc) =>
+          selectedFcTypeSet.has(fc.jenisMenu)
+        );
+        const menuNameParts: string[] = [];
+        for (let mIdx = 0; mIdx < matchedDays.length; mIdx++) {
+          const fc = matchedDays[mIdx];
+          if (fc.namaMenu && fc.namaMenu.trim()) {
+            menuNameParts.push(fc.namaMenu.trim());
+          } else {
+            const hasKecilBahan = (fc.porsiKecilBahan || []).some(
+              (b) => (Number(b.beratBB) || 0) > 0 && (b.nama?.trim() || b.tkpiId)
+            );
+            const hasBesarBahan = (fc.porsiBesarBahan || []).some(
+              (b) => (Number(b.beratBB) || 0) > 0 && (b.nama?.trim() || b.tkpiId)
+            );
+            const sourceList =
+              hasKecilSelected && !hasBesarSelected && hasKecilBahan
+                ? fc.porsiKecilBahan
+                : hasBesarBahan
+                ? fc.porsiBesarBahan
+                : fc.porsiKecilBahan;
+            const names = (sourceList || [])
+              .map((b) => (b.nama || "").trim())
+              .filter((n) => n && n.toLowerCase() !== "ketik bahan...");
+            if (names.length > 0) {
+              menuNameParts.push(names.slice(0, 6).join(", "));
+            }
+          }
+        }
+        for (let cIdx = 0; cIdx < customFcTables.length; cIdx++) {
+          const tbl = customFcTables[cIdx];
+          if (!selectedFcTypeSet.has(`custom:${tbl.id}`)) continue;
+          if (tbl.hariKe !== undefined && Number(tbl.hariKe) !== hariKe) continue;
+          if (tbl.namaMenu) menuNameParts.push(String(tbl.namaMenu));
+        }
+        if (menuNameParts.length > 0) {
+          autoNamaMenu = Array.from(new Set(menuNameParts)).join(" | ");
+        }
+      }
+
+      rows.push({
+        hariKe,
+        dateStr,
+        formattedDate,
+        autoNamaMenu,
+        pmKecilCount,
+        pmBesarCount,
+        jumlahManfaat: pmKecilCount + pmBesarCount,
+        photoKey: `${photoGroupKey}__day_${hariKe}`,
       });
+    }
 
-      const jumlahManfaat = pmKecilCount + pmBesarCount;
+    return rows;
+  }, [
+    totalDays,
+    profile.periodeDates,
+    pmByDay,
+    harianPM,
+    fcByDay,
+    customFcTables,
+    selectedFoodCostTypes,
+    selectedFcTypeSet,
+    selectedSasaranIds,
+    selectedSasaranSet,
+    normalizedMenu,
+    photoGroupKey,
+  ]);
 
-      // 2. Match FoodCostDays for hariKe & selectedFoodCostTypes
-      const matchedDays = foodCostDays.filter(
-        (fc) => fc.hariKe === hariKe && selectedFoodCostTypes.includes(fc.jenisMenu)
+  // Compute heavy nutrition only when on IKSS Nilai Gizi sub-view so Foto Menu tab stays 100% instant
+  const nutritionByDay = useMemo(() => {
+    const map = new Map<number, DailyNutritionValues>();
+    if (subView !== "nilai_gizi") return map;
+
+    const hasKecilSelected = selectedSasaranIds.some((id) => PORSI_KECIL_IDS.has(id));
+    const hasBesarSelected = selectedSasaranIds.some((id) => PORSI_BESAR_IDS.has(id));
+
+    for (let i = 0; i < baseDailyRows.length; i++) {
+      const base = baseDailyRows[i];
+      const { hariKe, pmKecilCount, pmBesarCount } = base;
+      const matchedDays = (fcByDay.get(hariKe) || []).filter((fc) =>
+        selectedFcTypeSet.has(fc.jenisMenu)
       );
 
-      // Compute nutrition entries from matched standard FoodCostDays
       const nutriSamples: Array<{
         energi: number;
         protein: number;
@@ -556,16 +850,16 @@ export default function IkssMenuTab({
         serat: number;
         weight: number;
       }> = [];
-      const menuNameParts: string[] = [];
 
-      matchedDays.forEach((fc) => {
+      for (let mIdx = 0; mIdx < matchedDays.length; mIdx++) {
+        const fc = matchedDays[mIdx];
         const hasBesarBahan = (fc.porsiBesarBahan || []).some(
           (b) => (Number(b.beratBB) || 0) > 0 && (b.nama?.trim() || b.tkpiId)
         );
         const hasKecilBahan = (fc.porsiKecilBahan || []).some(
           (b) => (Number(b.beratBB) || 0) > 0 && (b.nama?.trim() || b.tkpiId)
         );
-        if (!hasBesarBahan && !hasKecilBahan) return;
+        if (!hasBesarBahan && !hasKecilBahan) continue;
 
         const calc = calculateDay(
           fc.porsiBesarBahan || [],
@@ -614,31 +908,13 @@ export default function IkssMenuTab({
           const chosen = hasBesarBahan ? nBesar : nKecil;
           nutriSamples.push(toSample(chosen, Math.max(pmBesarCount, 1)));
         }
+      }
 
-        if (fc.namaMenu && fc.namaMenu.trim()) {
-          menuNameParts.push(fc.namaMenu.trim());
-        } else {
-          const sourceList =
-            hasKecilSelected && !hasBesarSelected && hasKecilBahan
-              ? fc.porsiKecilBahan
-              : hasBesarBahan
-              ? fc.porsiBesarBahan
-              : fc.porsiKecilBahan;
-          const names = (sourceList || [])
-            .map((b) => (b.nama || "").trim())
-            .filter((n) => n && n.toLowerCase() !== "ketik bahan...");
-          if (names.length > 0) {
-            menuNameParts.push(names.slice(0, 6).join(", "));
-          }
-        }
-      });
-
-      // Also include any selected custom Food Cost tables
-      customFcTables.forEach((tbl: any) => {
-        if (!selectedFoodCostTypes.includes(`custom:${tbl.id}`)) return;
-        if (!Array.isArray(tbl.bahanList) || tbl.bahanList.length === 0) return;
-        const isDayMatch = tbl.hariKe === undefined || Number(tbl.hariKe) === hariKe;
-        if (!isDayMatch) return;
+      for (let cIdx = 0; cIdx < customFcTables.length; cIdx++) {
+        const tbl = customFcTables[cIdx];
+        if (!selectedFcTypeSet.has(`custom:${tbl.id}`)) continue;
+        if (!Array.isArray(tbl.bahanList) || tbl.bahanList.length === 0) continue;
+        if (tbl.hariKe !== undefined && Number(tbl.hariKe) !== hariKe) continue;
         const calc =
           tbl.porsi === "besar"
             ? calculateDay(tbl.bahanList, [], Math.max(tbl.pmCount || 1, 1), 0, tbl.bufferPct || 5, tkpiMap, bumbuPct)
@@ -656,83 +932,107 @@ export default function IkssMenuTab({
             weight: Math.max(tbl.pmCount || 1, 1),
           });
         }
-        if (tbl.namaMenu) menuNameParts.push(String(tbl.namaMenu));
-      });
-
-      // Resolve rich menu description from Master Menu plans matching selected Sasaran if available
-      const masterMenuNames: string[] = [];
-      (normalizedMenu.plans || []).forEach((plan) => {
-        const overlaps =
-          (plan.sasaranIds || []).some((id) => selectedSasaranIds.includes(id)) ||
-          selectedSasaranIds.length === 0;
-        if (!overlaps) return;
-        const dayItem = plan.days?.[i];
-        if (!dayItem) return;
-        const composed = composeMenuName(dayItem).trim();
-        if (composed && !masterMenuNames.includes(composed)) {
-          masterMenuNames.push(composed);
-        }
-      });
-
-      // Prefer rich Master Menu composition or Food Cost namaMenu
-      let namaMenu = "";
-      if (masterMenuNames.length > 0) {
-        namaMenu = masterMenuNames.join(" | ");
-      } else if (menuNameParts.length > 0) {
-        const uniqueParts = Array.from(new Set(menuNameParts));
-        namaMenu = uniqueParts.join(" | ");
       }
 
-      let energi = 0;
-      let protein = 0;
-      let lemak = 0;
-      let kh = 0;
-      let serat = 0;
-      const hasNutrition = nutriSamples.length > 0;
-
-      if (hasNutrition) {
+      if (nutriSamples.length > 0) {
         const sumW = nutriSamples.reduce((a, b) => a + b.weight, 0) || nutriSamples.length;
-        energi = nutriSamples.reduce((a, b) => a + b.energi * b.weight, 0) / sumW;
-        protein = nutriSamples.reduce((a, b) => a + b.protein * b.weight, 0) / sumW;
-        lemak = nutriSamples.reduce((a, b) => a + b.lemak * b.weight, 0) / sumW;
-        kh = nutriSamples.reduce((a, b) => a + b.kh * b.weight, 0) / sumW;
-        serat = nutriSamples.reduce((a, b) => a + b.serat * b.weight, 0) / sumW;
+        map.set(hariKe, {
+          energi: nutriSamples.reduce((a, b) => a + b.energi * b.weight, 0) / sumW,
+          protein: nutriSamples.reduce((a, b) => a + b.protein * b.weight, 0) / sumW,
+          lemak: nutriSamples.reduce((a, b) => a + b.lemak * b.weight, 0) / sumW,
+          kh: nutriSamples.reduce((a, b) => a + b.kh * b.weight, 0) / sumW,
+          serat: nutriSamples.reduce((a, b) => a + b.serat * b.weight, 0) / sumW,
+          hasNutrition: true,
+        });
+      } else {
+        map.set(hariKe, EMPTY_NUTRITION);
       }
-
-      rows.push({
-        hariKe,
-        dateStr,
-        formattedDate,
-        namaMenu,
-        energi,
-        protein,
-        lemak,
-        kh,
-        serat,
-        jumlahManfaat,
-        hasNutrition,
-      });
     }
 
-    return rows;
+    return map;
   }, [
-    totalDays,
-    profile.periodeDates,
-    harianPM,
-    foodCostDays,
+    subView,
+    baseDailyRows,
+    fcByDay,
     customFcTables,
-    selectedFoodCostTypes,
+    selectedFcTypeSet,
     selectedSasaranIds,
     tkpiMap,
     bumbuPct,
-    normalizedMenu,
   ]);
 
-  // Compute Auto Rujukan AKG averaged across selected Sasaran IDs
+  const dailyPosts = ikssData.dailyPosts || {};
+
+  const getPhotoForDay = useCallback(
+    (hariKe: number): string => {
+      return (
+        photoMap[`${photoGroupKey}__day_${hariKe}`] ||
+        photoMap[`day_${hariKe}`] ||
+        ""
+      );
+    },
+    [photoMap, photoGroupKey]
+  );
+
+  const getPostMetaForDay = useCallback(
+    (hariKe: number): IkssDailyPostMeta | undefined => {
+      return dailyPosts[`${photoGroupKey}__day_${hariKe}`] || dailyPosts[`day_${hariKe}`];
+    },
+    [dailyPosts, photoGroupKey]
+  );
+
+  const dailyRows = useMemo(() => {
+    return baseDailyRows.map((row) => {
+      const nut = nutritionByDay.get(row.hariKe) || EMPTY_NUTRITION;
+      const meta = dailyPosts[row.photoKey] || dailyPosts[`day_${row.hariKe}`];
+      const namaMenu = (meta?.customMenuName || "").trim() || row.autoNamaMenu;
+      return {
+        ...row,
+        namaMenu,
+        caption: meta?.caption || "",
+        energi: nut.energi,
+        protein: nut.protein,
+        lemak: nut.lemak,
+        kh: nut.kh,
+        serat: nut.serat,
+        hasNutrition: nut.hasNutrition,
+      };
+    });
+  }, [baseDailyRows, nutritionByDay, dailyPosts]);
+
+  // Photo & Posting KPI stats
+  const photoStats = useMemo(() => {
+    let uploaded = 0;
+    let posted = 0;
+    let draft = 0;
+    for (let i = 0; i < baseDailyRows.length; i++) {
+      const r = baseDailyRows[i];
+      const hasPhoto = Boolean(photoMap[r.photoKey] || photoMap[`day_${r.hariKe}`]);
+      if (hasPhoto) {
+        uploaded += 1;
+        const meta = dailyPosts[r.photoKey] || dailyPosts[`day_${r.hariKe}`];
+        if (meta?.posted) posted += 1;
+        else draft += 1;
+      }
+    }
+    const empty = Math.max(0, baseDailyRows.length - uploaded);
+    const pct = baseDailyRows.length > 0 ? Math.round((posted / baseDailyRows.length) * 100) : 0;
+    return { total: baseDailyRows.length, uploaded, posted, draft, empty, pct };
+  }, [baseDailyRows, photoMap, dailyPosts]);
+
+  const filteredPhotoRows = useMemo(() => {
+    if (photoFilter === "semua") return dailyRows;
+    return dailyRows.filter((row) => {
+      const hasPhoto = Boolean(getPhotoForDay(row.hariKe));
+      const meta = getPostMetaForDay(row.hariKe);
+      if (photoFilter === "diposting") return hasPhoto && Boolean(meta?.posted);
+      if (photoFilter === "draft") return hasPhoto && !meta?.posted;
+      return !hasPhoto;
+    });
+  }, [dailyRows, photoFilter, getPhotoForDay, getPostMetaForDay]);
+
   const autoAkg = useMemo<AkgPresetTarget>(() => {
-    const matched = selectedSasaranIds
-      .map((id) => SASARAN_AKG_REF[id])
-      .filter(Boolean);
+    const matched = selectedSasaranIds.map((id) => SASARAN_AKG_REF[id]).filter(Boolean);
     if (matched.length === 0) {
       return {
         label: "Rujukan AKG 20-25%",
@@ -762,31 +1062,31 @@ export default function IkssMenuTab({
     };
   }, [selectedSasaranIds]);
 
-  const effectiveAkg = {
-    label: ikssData.akgOverride?.label || autoAkg.label,
-    energi:
-      ikssData.akgOverride?.energi !== undefined
-        ? ikssData.akgOverride.energi
-        : autoAkg.energi,
-    protein:
-      ikssData.akgOverride?.protein !== undefined
-        ? ikssData.akgOverride.protein
-        : autoAkg.protein,
-    lemak:
-      ikssData.akgOverride?.lemak !== undefined
-        ? ikssData.akgOverride.lemak
-        : autoAkg.lemak,
-    kh:
-      ikssData.akgOverride?.kh !== undefined
-        ? ikssData.akgOverride.kh
-        : autoAkg.kh,
-    serat:
-      ikssData.akgOverride?.serat !== undefined
-        ? ikssData.akgOverride.serat
-        : autoAkg.serat,
-  };
+  const effectiveAkg = useMemo(
+    () => ({
+      label: ikssData.akgOverride?.label || autoAkg.label,
+      energi:
+        ikssData.akgOverride?.energi !== undefined
+          ? ikssData.akgOverride.energi
+          : autoAkg.energi,
+      protein:
+        ikssData.akgOverride?.protein !== undefined
+          ? ikssData.akgOverride.protein
+          : autoAkg.protein,
+      lemak:
+        ikssData.akgOverride?.lemak !== undefined
+          ? ikssData.akgOverride.lemak
+          : autoAkg.lemak,
+      kh:
+        ikssData.akgOverride?.kh !== undefined ? ikssData.akgOverride.kh : autoAkg.kh,
+      serat:
+        ikssData.akgOverride?.serat !== undefined
+          ? ikssData.akgOverride.serat
+          : autoAkg.serat,
+    }),
+    [ikssData.akgOverride, autoAkg]
+  );
 
-  // Summary Aggregates (Exact Gambar 2 bottom block)
   const summary = useMemo(() => {
     const totalEnergi = dailyRows.reduce((s, r) => s + r.energi, 0);
     const totalProtein = dailyRows.reduce((s, r) => s + r.protein, 0);
@@ -831,14 +1131,20 @@ export default function IkssMenuTab({
     };
   }, [dailyRows, effectiveAkg]);
 
-  // Handlers
+  // Sub-view switch handler (remember user choice)
+  const handleSwitchSubView = (nextView: "nilai_gizi" | "foto_menu") => {
+    setSubView(nextView);
+    setIkssData((prev) =>
+      prev.activeSubView === nextView ? prev : { ...prev, activeSubView: nextView }
+    );
+  };
+
+  // Category & Preset Handlers
   const toggleFoodCostType = (typeId: string) => {
     setIkssData((prev) => {
       const current = prev.selectedFoodCostTypes || [];
       const exists = current.includes(typeId);
-      const next = exists
-        ? current.filter((x) => x !== typeId)
-        : [...current, typeId];
+      const next = exists ? current.filter((x) => x !== typeId) : [...current, typeId];
       return {
         ...prev,
         selectedFoodCostTypes: next.length > 0 ? next : [typeId],
@@ -850,9 +1156,7 @@ export default function IkssMenuTab({
     setIkssData((prev) => {
       const current = prev.selectedSasaranIds || [];
       const exists = current.includes(sasId);
-      const next = exists
-        ? current.filter((x) => x !== sasId)
-        : [...current, sasId];
+      const next = exists ? current.filter((x) => x !== sasId) : [...current, sasId];
       return {
         ...prev,
         selectedSasaranIds: next.length > 0 ? next : [sasId],
@@ -872,48 +1176,347 @@ export default function IkssMenuTab({
     }));
   };
 
-  const handlePhotoUpload = async (
+  // =========================================================================
+  // PHOTO UPLOAD, ROTATE, POSTING & BULK HANDLERS (100% NON-BLOCKING)
+  // =========================================================================
+
+  const processSinglePhotoFile = useCallback(
+    async (hariKe: number, file: File) => {
+      setPhotoBanner(null);
+      setProcessingDays((prev) => ({ ...prev, [hariKe]: true }));
+      try {
+        const compressed = await compressMenuPhoto(file, {
+          maxWidth: 640,
+          maxHeight: 480,
+          targetMaxChars: 72_000,
+        });
+        const key = `${photoGroupKey}__day_${hariKe}`;
+        const nextPhotos = { ...photoMapRef.current, [key]: compressed };
+        setPhotoMap(nextPhotos);
+
+        const autoPost = Boolean(ikssData.autoPostOnUpload);
+        const nowIso = new Date().toISOString();
+        setIkssData((prev) => ({
+          ...prev,
+          dailyPosts: {
+            ...(prev.dailyPosts || {}),
+            [key]: {
+              ...(prev.dailyPosts?.[key] || {}),
+              posted: autoPost,
+              postedAt: autoPost ? nowIso : prev.dailyPosts?.[key]?.postedAt,
+              updatedAt: nowIso,
+            },
+          },
+        }));
+
+        const res = await persistPhotos(nextPhotos, autoPost);
+        if (autoPost) {
+          showNotice(
+            "success",
+            res.cloudOk
+              ? `Foto menu Hari Ke-${hariKe} berhasil diunggah, diposting, dan tersinkron ke cloud.`
+              : `Foto menu Hari Ke-${hariKe} berhasil diunggah & diposting (tersimpan di perangkat ini).`
+          );
+        } else {
+          showNotice(
+            "info",
+            `Foto menu Hari Ke-${hariKe} berhasil diunggah sebagai Draft. Klik "Posting Foto" untuk mempublikasikan ke rekapan.`
+          );
+        }
+      } catch (err: any) {
+        showNotice("error", err?.message || `Gagal memproses foto Hari Ke-${hariKe}.`);
+      } finally {
+        setProcessingDays((prev) => {
+          const copy = { ...prev };
+          delete copy[hariKe];
+          return copy;
+        });
+      }
+    },
+    [photoGroupKey, ikssData.autoPostOnUpload, persistPhotos, setIkssData, showNotice]
+  );
+
+  const handlePhotoInputChange = (
     hariKe: number,
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
-    setPhotoError(null);
-    try {
-      const compressed = await compressPhotoFile(file, 380, 0.72);
-      const key = `${photoGroupKey}__day_${hariKe}`;
-      setIkssData((prev) => {
-        const nextPhotos = { ...(prev.photos || {}), [key]: compressed };
-        const approxSize = JSON.stringify(nextPhotos).length;
-        if (approxSize > 860000) {
-          setPhotoError(
-            "Kapasitas penyimpanan foto cloud hampir penuh. Hapus foto periode lama yang tidak diperlukan agar sinkronisasi tetap cepat."
-          );
-          return prev;
-        }
-        return { ...prev, photos: nextPhotos };
-      });
-    } catch (err: any) {
-      setPhotoError(err?.message || "Gagal mengunggah foto menu.");
+    void processSinglePhotoFile(hariKe, file);
+  };
+
+  const handleDropOnDay = (hariKe: number, e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOverDay(null);
+    const file = e.dataTransfer.files?.[0];
+    if (file && file.type.startsWith("image/")) {
+      void processSinglePhotoFile(hariKe, file);
+    } else if (file) {
+      showNotice("error", "Harap lepaskan file gambar (JPG, PNG, WEBP).");
     }
   };
 
-  const handleDeletePhoto = (hariKe: number) => {
-    const key = `${photoGroupKey}__day_${hariKe}`;
-    setIkssData((prev) => {
-      const next = { ...(prev.photos || {}) };
-      delete next[key];
-      return { ...prev, photos: next };
-    });
+  const handleBulkUploadChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files;
+    const files: File[] = fileList
+      ? Array.from<File>(fileList).filter((f) => f.type.startsWith("image/"))
+      : [];
+    e.target.value = "";
+    if (files.length === 0) return;
+
+    // Assign sequentially to unfilled days first, then remaining days from day 1
+    const unfilledDays = baseDailyRows
+      .filter((r) => !photoMapRef.current[r.photoKey] && !photoMapRef.current[`day_${r.hariKe}`])
+      .map((r) => r.hariKe);
+    const targetDays =
+      unfilledDays.length > 0
+        ? unfilledDays
+        : baseDailyRows.map((r) => r.hariKe);
+
+    const pairs = files.slice(0, targetDays.length).map((file, idx) => ({
+      file,
+      hariKe: targetDays[idx],
+    }));
+
+    setPhotoBanner(null);
+    setBulkProgress({ current: 0, total: pairs.length });
+
+    const updatedPhotos: Record<string, string> = { ...photoMapRef.current };
+    const postedMetaPatch: Record<string, IkssDailyPostMeta> = {};
+    const autoPost = Boolean(ikssData.autoPostOnUpload);
+    const nowIso = new Date().toISOString();
+    let successCount = 0;
+
+    for (let i = 0; i < pairs.length; i++) {
+      const { file, hariKe } = pairs[i];
+      setBulkProgress({ current: i + 1, total: pairs.length });
+      setProcessingDays((prev) => ({ ...prev, [hariKe]: true }));
+      try {
+        const compressed = await compressMenuPhoto(file, {
+          maxWidth: 640,
+          maxHeight: 480,
+          targetMaxChars: 72_000,
+        });
+        const key = `${photoGroupKey}__day_${hariKe}`;
+        updatedPhotos[key] = compressed;
+        postedMetaPatch[key] = {
+          ...(ikssData.dailyPosts?.[key] || {}),
+          posted: autoPost,
+          postedAt: autoPost ? nowIso : ikssData.dailyPosts?.[key]?.postedAt,
+          updatedAt: nowIso,
+        };
+        successCount += 1;
+        setPhotoMap({ ...updatedPhotos });
+      } catch {
+        // Continue with remaining files
+      } finally {
+        setProcessingDays((prev) => {
+          const copy = { ...prev };
+          delete copy[hariKe];
+          return copy;
+        });
+      }
+      // Yield back to browser paint loop between images
+      await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    }
+
+    setBulkProgress(null);
+
+    if (successCount > 0) {
+      setIkssData((prev) => ({
+        ...prev,
+        dailyPosts: {
+          ...(prev.dailyPosts || {}),
+          ...postedMetaPatch,
+        },
+      }));
+      const res = await persistPhotos(updatedPhotos, autoPost);
+      showNotice(
+        "success",
+        autoPost
+          ? `${successCount} foto menu harian berhasil diunggah & diposting${res.cloudOk ? " ke cloud" : " (tersimpan lokal)"}.`
+          : `${successCount} foto berhasil diunggah ke tabel harian. Klik "Posting Semua Foto" untuk mempublikasikan.`
+      );
+    } else {
+      showNotice("error", "Tidak ada foto valid yang berhasil diproses.");
+    }
   };
 
-  const getPhotoForDay = (hariKe: number): string => {
-    const exact = ikssData.photos?.[`${photoGroupKey}__day_${hariKe}`];
-    if (exact) return exact;
-    // Also fallback to generic day photo if uploaded under a single day key
-    return ikssData.photos?.[`day_${hariKe}`] || "";
+  const handlePostDayPhoto = async (hariKe: number) => {
+    const photoSrc = getPhotoForDay(hariKe);
+    if (!photoSrc) {
+      showNotice("error", `Unggah foto menu Hari Ke-${hariKe} terlebih dahulu sebelum memposting.`);
+      return;
+    }
+    const key = `${photoGroupKey}__day_${hariKe}`;
+    const nowIso = new Date().toISOString();
+
+    // Ensure photo is stored under current group key
+    const nextPhotos = { ...photoMapRef.current, [key]: photoSrc };
+    setPhotoMap(nextPhotos);
+
+    setIkssData((prev) => ({
+      ...prev,
+      dailyPosts: {
+        ...(prev.dailyPosts || {}),
+        [key]: {
+          ...(prev.dailyPosts?.[key] || {}),
+          posted: true,
+          postedAt: nowIso,
+          updatedAt: nowIso,
+        },
+      },
+    }));
+
+    const res = await persistPhotos(nextPhotos, true);
+    showNotice(
+      "success",
+      res.cloudOk
+        ? `Foto menu Hari Ke-${hariKe} resmi diposting & tersinkron ke cloud.`
+        : `Foto menu Hari Ke-${hariKe} resmi diposting & tersimpan aman di perangkat.`
+    );
   };
+
+  const handleUnpostDayPhoto = (hariKe: number) => {
+    const key = `${photoGroupKey}__day_${hariKe}`;
+    setIkssData((prev) => ({
+      ...prev,
+      dailyPosts: {
+        ...(prev.dailyPosts || {}),
+        [key]: {
+          ...(prev.dailyPosts?.[key] || {}),
+          posted: false,
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    }));
+  };
+
+  const handlePostAllPhotos = async () => {
+    const uploadedKeys: string[] = [];
+    for (let i = 0; i < baseDailyRows.length; i++) {
+      const r = baseDailyRows[i];
+      const src = photoMapRef.current[r.photoKey] || photoMapRef.current[`day_${r.hariKe}`];
+      if (src) {
+        uploadedKeys.push(r.photoKey);
+      }
+    }
+
+    if (uploadedKeys.length === 0) {
+      showNotice("error", "Belum ada foto menu harian yang diunggah untuk diposting.");
+      return;
+    }
+
+    const nowIso = new Date().toISOString();
+    const nextPhotos = { ...photoMapRef.current };
+    baseDailyRows.forEach((r) => {
+      const fallbackSrc = photoMapRef.current[`day_${r.hariKe}`];
+      if (!nextPhotos[r.photoKey] && fallbackSrc) {
+        nextPhotos[r.photoKey] = fallbackSrc;
+      }
+    });
+    setPhotoMap(nextPhotos);
+
+    setIkssData((prev) => {
+      const nextPosts = { ...(prev.dailyPosts || {}) };
+      uploadedKeys.forEach((k) => {
+        nextPosts[k] = {
+          ...(nextPosts[k] || {}),
+          posted: true,
+          postedAt: nowIso,
+          updatedAt: nowIso,
+        };
+      });
+      return { ...prev, dailyPosts: nextPosts };
+    });
+
+    const res = await persistPhotos(nextPhotos, true);
+    showNotice(
+      "success",
+      res.cloudOk
+        ? `${uploadedKeys.length} foto menu harian berhasil diposting & disinkronkan ke cloud (${formatShortTimestamp(nowIso)}).`
+        : `${uploadedKeys.length} foto menu harian berhasil diposting & disimpan lokal${res.error ? ` — ${res.error}` : "."}`
+    );
+  };
+
+  const handleRotateDayPhoto = async (hariKe: number) => {
+    const photoSrc = getPhotoForDay(hariKe);
+    if (!photoSrc) return;
+    setProcessingDays((prev) => ({ ...prev, [hariKe]: true }));
+    try {
+      const rotated = await rotatePhotoDataUrl90(photoSrc);
+      const key = `${photoGroupKey}__day_${hariKe}`;
+      const nextPhotos = { ...photoMapRef.current, [key]: rotated };
+      setPhotoMap(nextPhotos);
+      await persistPhotos(nextPhotos, false);
+    } catch (err: any) {
+      showNotice("error", err?.message || "Gagal memutar foto.");
+    } finally {
+      setProcessingDays((prev) => {
+        const copy = { ...prev };
+        delete copy[hariKe];
+        return copy;
+      });
+    }
+  };
+
+  const handleDeletePhoto = async (hariKe: number) => {
+    const key = `${photoGroupKey}__day_${hariKe}`;
+    const fallbackKey = `day_${hariKe}`;
+    const nextPhotos = { ...photoMapRef.current };
+    delete nextPhotos[key];
+    delete nextPhotos[fallbackKey];
+    setPhotoMap(nextPhotos);
+
+    setIkssData((prev) => {
+      const nextPosts = { ...(prev.dailyPosts || {}) };
+      if (nextPosts[key]) {
+        nextPosts[key] = { ...nextPosts[key], posted: false, postedAt: undefined };
+      }
+      if (nextPosts[fallbackKey]) {
+        nextPosts[fallbackKey] = { ...nextPosts[fallbackKey], posted: false, postedAt: undefined };
+      }
+      return { ...prev, dailyPosts: nextPosts };
+    });
+
+    if (lightboxDay === hariKe) setLightboxDay(null);
+    await persistPhotos(nextPhotos, false);
+  };
+
+  const startEditDayMenu = (hariKe: number) => {
+    const row = dailyRows.find((r) => r.hariKe === hariKe);
+    const meta = getPostMetaForDay(hariKe);
+    setEditingMenuDay(hariKe);
+    setEditMenuDraft(meta?.customMenuName ?? row?.namaMenu ?? "");
+    setEditCaptionDraft(meta?.caption ?? "");
+  };
+
+  const saveEditDayMenu = (hariKe: number) => {
+    const key = `${photoGroupKey}__day_${hariKe}`;
+    const row = baseDailyRows.find((r) => r.hariKe === hariKe);
+    const trimmedMenu = editMenuDraft.trim();
+    const isSameAsAuto = trimmedMenu === (row?.autoNamaMenu || "").trim();
+
+    setIkssData((prev) => ({
+      ...prev,
+      dailyPosts: {
+        ...(prev.dailyPosts || {}),
+        [key]: {
+          ...(prev.dailyPosts?.[key] || { posted: false }),
+          customMenuName: isSameAsAuto ? "" : trimmedMenu,
+          caption: editCaptionDraft.trim(),
+          updatedAt: new Date().toISOString(),
+        },
+      },
+    }));
+    setEditingMenuDay(null);
+  };
+
+  // =========================================================================
+  // PRINT / PDF / EXCEL EXPORTS
+  // =========================================================================
 
   const activePrintId =
     subView === "nilai_gizi" ? "print-area-ikss-gizi" : "print-area-ikss-foto";
@@ -927,6 +1530,17 @@ export default function IkssMenuTab({
       : `IKSS_Foto_Menu_${displayCategoryTitle.replace(/[^A-Za-z0-9]+/g, "_")}`;
 
   const handlePrint = () => {
+    if (photoFilter !== "semua") {
+      setPhotoFilter("semua");
+      setTimeout(() => {
+        printElementSmart(activePrintId, {
+          title: activePrintTitle,
+          paperSize,
+          orientation: "auto",
+        });
+      }, 60);
+      return;
+    }
     printElementSmart(activePrintId, {
       title: activePrintTitle,
       paperSize,
@@ -935,10 +1549,28 @@ export default function IkssMenuTab({
   };
 
   const handleExportPdf = async () => {
-    await exportToPDF(activePrintId, activeFilename, 100, undefined, {
-      paperSize,
-      orientation: "auto",
-    });
+    if (isExportingPdf) return;
+    if (photoFilter !== "semua") {
+      setPhotoFilter("semua");
+      await new Promise<void>((r) => setTimeout(r, 60));
+    }
+    setIsExportingPdf(true);
+    setExportStatusMsg("Menyiapkan dokumen PDF presisi...");
+    try {
+      await exportToPDF(
+        activePrintId,
+        activeFilename,
+        100,
+        (msg) => setExportStatusMsg(msg),
+        {
+          paperSize,
+          orientation: "auto",
+        }
+      );
+    } finally {
+      setIsExportingPdf(false);
+      setExportStatusMsg(null);
+    }
   };
 
   const handleExportExcel = () => {
@@ -1055,16 +1687,27 @@ export default function IkssMenuTab({
           "ID SPPG",
           "Hari / Tanggal",
           "Nama Menu",
+          "Catatan",
           "Status Foto Menu",
         ],
-        ...dailyRows.map((r) => [
-          r.hariKe,
-          (profile.namaLembaga || "").toUpperCase(),
-          (profile.idSPPG || "").toUpperCase(),
-          r.formattedDate,
-          r.namaMenu || "-",
-          getPhotoForDay(r.hariKe) ? "Foto Terlampir (Cetak PDF/Print)" : "Belum Diunggah",
-        ]),
+        ...dailyRows.map((r) => {
+          const hasPhoto = Boolean(getPhotoForDay(r.hariKe));
+          const meta = getPostMetaForDay(r.hariKe);
+          const status = !hasPhoto
+            ? "Belum Diunggah"
+            : meta?.posted
+            ? `Diposting (${formatShortTimestamp(meta.postedAt)})`
+            : "Draft (Belum Diposting)";
+          return [
+            r.hariKe,
+            (profile.namaLembaga || "").toUpperCase(),
+            (profile.idSPPG || "").toUpperCase(),
+            r.formattedDate,
+            r.namaMenu || "-",
+            r.caption || "-",
+            status,
+          ];
+        }),
       ];
       const ws = XLSX.utils.aoa_to_sheet(sheetData);
       ws["!cols"] = [
@@ -1074,6 +1717,7 @@ export default function IkssMenuTab({
         { wch: 24 },
         { wch: 44 },
         { wch: 24 },
+        { wch: 28 },
       ];
       XLSX.utils.book_append_sheet(wb, ws, "IKSS Foto Menu");
     }
@@ -1120,6 +1764,12 @@ export default function IkssMenuTab({
     );
   };
 
+  // Active lightbox row info
+  const activeLightboxRow =
+    lightboxDay !== null ? dailyRows.find((r) => r.hariKe === lightboxDay) || null : null;
+  const activeLightboxPhoto = lightboxDay !== null ? getPhotoForDay(lightboxDay) : "";
+  const activeLightboxMeta = lightboxDay !== null ? getPostMetaForDay(lightboxDay) : undefined;
+
   return (
     <div id="ikss-menu-tab" className="space-y-5 font-sans">
       {/* TOP CONTROL BAR */}
@@ -1131,7 +1781,7 @@ export default function IkssMenuTab({
               Menu IKSS — Rekapan Nilai Gizi &amp; Foto Menu Makanan
             </h2>
             <p className="text-xs text-slate-500">
-              Terhubung otomatis dengan <strong>Profil SPPG</strong> (identitas, tanggal periode &amp; TTD) dan seluruh perencanaan kategori pada <strong>Food Cost</strong>. Pilih satu atau gabungkan bebas beberapa kategori.
+              Terhubung otomatis dengan <strong>Profil SPPG</strong> (identitas, tanggal periode &amp; TTD) dan perencanaan <strong>Food Cost</strong>. Unggah &amp; posting foto menu harian langsung dari kamera atau galeri tanpa hambatan.
             </p>
           </div>
 
@@ -1139,8 +1789,8 @@ export default function IkssMenuTab({
           <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 self-start lg:self-center shrink-0">
             <button
               type="button"
-              onClick={() => setSubView("nilai_gizi")}
-              className={`px-4 py-2 text-xs font-bold rounded-lg transition cursor-pointer flex items-center gap-1.5 ${
+              onClick={() => handleSwitchSubView("nilai_gizi")}
+              className={`px-4 py-2 text-xs font-bold rounded-lg transition cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
                 subView === "nilai_gizi"
                   ? "bg-white text-emerald-700 shadow-xs"
                   : "text-slate-600 hover:text-slate-900"
@@ -1151,8 +1801,8 @@ export default function IkssMenuTab({
             </button>
             <button
               type="button"
-              onClick={() => setSubView("foto_menu")}
-              className={`px-4 py-2 text-xs font-bold rounded-lg transition cursor-pointer flex items-center gap-1.5 ${
+              onClick={() => handleSwitchSubView("foto_menu")}
+              className={`px-4 py-2 text-xs font-bold rounded-lg transition cursor-pointer flex items-center gap-1.5 whitespace-nowrap ${
                 subView === "foto_menu"
                   ? "bg-white text-emerald-700 shadow-xs"
                   : "text-slate-600 hover:text-slate-900"
@@ -1160,6 +1810,9 @@ export default function IkssMenuTab({
             >
               <Camera className="w-3.5 h-3.5" />
               IKSS Foto Menu Makanan
+              <span className="ml-0.5 text-[11px] font-extrabold tabular-nums text-emerald-700">
+                ({photoStats.posted}/{photoStats.total})
+              </span>
             </button>
           </div>
         </div>
@@ -1170,17 +1823,17 @@ export default function IkssMenuTab({
             <button
               type="button"
               onClick={() => setShowCategoryDrawer((v) => !v)}
-              className="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
               <Layers className="w-3.5 h-3.5 text-emerald-600" />
               <span>
                 {showCategoryDrawer
                   ? "Sembunyikan Pilihan Kategori"
-                  : "Pilih / Gabung Kategori"}
+                  : `Pilih / Gabung Kategori (${selectedSasaranIds.length})`}
               </span>
             </button>
 
-            <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer select-none">
+            <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer select-none whitespace-nowrap">
               <input
                 type="checkbox"
                 checked={!!ikssData.showKopOnIkss}
@@ -1200,7 +1853,7 @@ export default function IkssMenuTab({
             <button
               type="button"
               onClick={() => setShowPrintModal(true)}
-              className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
               <Eye className="w-3.5 h-3.5" />
               Pratinjau Cetak
@@ -1208,15 +1861,20 @@ export default function IkssMenuTab({
             <button
               type="button"
               onClick={handleExportPdf}
-              className="px-3 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+              disabled={isExportingPdf}
+              className="px-3 py-2 bg-rose-600 hover:bg-rose-700 disabled:opacity-60 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
-              <FileDown className="w-3.5 h-3.5" />
-              Unduh PDF
+              {isExportingPdf ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <FileDown className="w-3.5 h-3.5" />
+              )}
+              {isExportingPdf ? "Memproses PDF..." : "Unduh PDF"}
             </button>
             <button
               type="button"
               onClick={handleExportExcel}
-              className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
               <Download className="w-3.5 h-3.5" />
               Unduh Excel
@@ -1224,7 +1882,7 @@ export default function IkssMenuTab({
             <button
               type="button"
               onClick={handlePrint}
-              className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+              className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer whitespace-nowrap"
             >
               <Printer className="w-3.5 h-3.5" />
               Cetak Langsung
@@ -1232,10 +1890,17 @@ export default function IkssMenuTab({
           </div>
         </div>
 
+        {/* PDF export status bar */}
+        {exportStatusMsg && (
+          <div className="px-3.5 py-2 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-800 text-xs font-semibold flex items-center gap-2">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-600 shrink-0" />
+            <span>{exportStatusMsg}</span>
+          </div>
+        )}
+
         {/* FLEXIBLE CATEGORY & MERGE SELECTOR */}
         {showCategoryDrawer && (
           <div className="pt-4 border-t border-slate-100 space-y-4">
-            {/* Quick Presets */}
             <div className="space-y-1.5">
               <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
                 Preset Cepat Kategori IKSS
@@ -1244,7 +1909,7 @@ export default function IkssMenuTab({
                 {QUICK_PRESETS.map((preset) => {
                   const isActive =
                     preset.sasaranIds.length === selectedSasaranIds.length &&
-                    preset.sasaranIds.every((id) => selectedSasaranIds.includes(id));
+                    preset.sasaranIds.every((id) => selectedSasaranSet.has(id));
                   return (
                     <button
                       key={preset.id}
@@ -1264,7 +1929,6 @@ export default function IkssMenuTab({
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Source Food Cost Categories (Multi-select) */}
               <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2.5">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-[11px] font-bold text-slate-700 uppercase tracking-wider">
@@ -1289,7 +1953,7 @@ export default function IkssMenuTab({
 
                 <div className="flex flex-wrap gap-1.5">
                   {STANDARD_FOOD_COST_TYPES.map((fcType) => {
-                    const checked = selectedFoodCostTypes.includes(fcType.id);
+                    const checked = selectedFcTypeSet.has(fcType.id);
                     const hasData = populatedFcTypes.has(fcType.id);
                     return (
                       <button
@@ -1313,9 +1977,7 @@ export default function IkssMenuTab({
                         </span>
                         <span>{fcType.label}</span>
                         {hasData && (
-                          <span className="text-[10px] font-bold text-emerald-600">
-                            •
-                          </span>
+                          <span className="text-[10px] font-bold text-emerald-600">•</span>
                         )}
                       </button>
                     );
@@ -1323,7 +1985,7 @@ export default function IkssMenuTab({
 
                   {customFcTables.map((tbl: any) => {
                     const customKey = `custom:${tbl.id}`;
-                    const checked = selectedFoodCostTypes.includes(customKey);
+                    const checked = selectedFcTypeSet.has(customKey);
                     return (
                       <button
                         key={customKey}
@@ -1351,7 +2013,6 @@ export default function IkssMenuTab({
                 </div>
               </div>
 
-              {/* Kelompok Sasaran Multi-select */}
               <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2.5">
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-[11px] font-bold text-slate-700 uppercase tracking-wider">
@@ -1375,7 +2036,7 @@ export default function IkssMenuTab({
 
                 <div className="flex flex-wrap gap-1.5">
                   {SASARAN_KATEGORI_LIST.map((sas) => {
-                    const checked = selectedSasaranIds.includes(sas.id);
+                    const checked = selectedSasaranSet.has(sas.id);
                     return (
                       <button
                         key={sas.id}
@@ -1404,7 +2065,6 @@ export default function IkssMenuTab({
               </div>
             </div>
 
-            {/* Custom Banner Title & Periode Override */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div className="space-y-1">
                 <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider block">
@@ -1459,17 +2119,33 @@ export default function IkssMenuTab({
         )}
       </div>
 
-      {/* Photo Error Alert */}
-      {photoError && (
-        <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-xs font-semibold flex items-center justify-between gap-3 no-print">
+      {/* Inline Feedback Banner */}
+      {photoBanner && (
+        <div
+          className={`p-3.5 rounded-xl border text-xs font-semibold flex items-center justify-between gap-3 no-print ${
+            photoBanner.type === "error"
+              ? "bg-rose-50 border-rose-200 text-rose-900"
+              : photoBanner.type === "success"
+              ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+              : "bg-sky-50 border-sky-200 text-sky-900"
+          }`}
+        >
           <div className="flex items-center gap-2">
-            <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
-            <span>{photoError}</span>
+            {photoBanner.type === "error" ? (
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+            ) : (
+              <CheckCircle2
+                className={`w-4 h-4 shrink-0 ${
+                  photoBanner.type === "success" ? "text-emerald-600" : "text-sky-600"
+                }`}
+              />
+            )}
+            <span>{photoBanner.text}</span>
           </div>
           <button
             type="button"
-            onClick={() => setPhotoError(null)}
-            className="p-1 hover:bg-amber-100 rounded-lg cursor-pointer"
+            onClick={() => setPhotoBanner(null)}
+            className="p-1 hover:bg-black/5 rounded-lg cursor-pointer"
           >
             <X className="w-3.5 h-3.5" />
           </button>
@@ -1477,7 +2153,7 @@ export default function IkssMenuTab({
       )}
 
       {/* ================================================================= */}
-      {/* SUB-VIEW A: IKSS NILAI GIZI (FORMAT GAMBAR 2)                     */}
+      {/* SUB-VIEW A: IKSS NILAI GIZI                                       */}
       {/* ================================================================= */}
       {subView === "nilai_gizi" && (
         <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-x-auto p-4 sm:p-6">
@@ -1501,17 +2177,14 @@ export default function IkssMenuTab({
               />
             )}
 
-            {/* Top Bright Green Title Banner */}
             <div className="bg-[#00B050] border border-black py-2 px-3 text-center">
               <h3 className="text-sm font-bold uppercase text-black tracking-wide">
                 REKAPAN NILAI GIZI {displayCategoryTitle}
               </h3>
             </div>
 
-            {/* Auto-Populated SPPG Identity Header */}
             {renderIdentityBlock()}
 
-            {/* Main IKSS Nutrition Table */}
             <table
               className="w-full border-collapse border border-black text-[11px]"
               style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
@@ -1604,7 +2277,6 @@ export default function IkssMenuTab({
                   </tr>
                 ))}
 
-                {/* FOOTER ROW 1: Total Nilai Gizi */}
                 <tr>
                   <td
                     colSpan={2}
@@ -1632,7 +2304,6 @@ export default function IkssMenuTab({
                   </td>
                 </tr>
 
-                {/* FOOTER ROW 2: Jumlah Hari */}
                 <tr>
                   <td
                     colSpan={2}
@@ -1660,7 +2331,6 @@ export default function IkssMenuTab({
                   </td>
                 </tr>
 
-                {/* FOOTER ROW 3: Nilai Rata-Rata */}
                 <tr>
                   <td
                     colSpan={2}
@@ -1691,7 +2361,6 @@ export default function IkssMenuTab({
                   </td>
                 </tr>
 
-                {/* FOOTER ROW 4: Rujukan AKG (editable inline) */}
                 <tr>
                   <td
                     colSpan={2}
@@ -1726,7 +2395,6 @@ export default function IkssMenuTab({
                   )}
                 </tr>
 
-                {/* FOOTER ROW 5: % Kebutuhan 90-110% */}
                 <tr>
                   <td
                     colSpan={2}
@@ -1743,190 +2411,853 @@ export default function IkssMenuTab({
               </tbody>
             </table>
 
-            {/* Centralized Auto Signature Block from Profil SPPG */}
             <AutoSignatureBlock profile={profile} docKey="ikss" />
           </div>
         </div>
       )}
 
       {/* ================================================================= */}
-      {/* SUB-VIEW B: IKSS FOTO MENU MAKANAN (FORMAT GAMBAR 3)              */}
+      {/* SUB-VIEW B: IKSS FOTO MENU MAKANAN (UPLOAD & POSTING HARIAN)      */}
       {/* ================================================================= */}
       {subView === "foto_menu" && (
-        <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-x-auto p-4 sm:p-6">
-          <div
-            id="print-area-ikss-foto"
-            className="w-full min-w-[780px] bg-white text-black"
-            style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
-          >
-            {ikssData.showKopOnIkss && (
-              <KopSuratRenderHeader
-                kopLine1={kopLine1}
-                kopLine2={kopLine2}
-                kopLine3={kopLine3}
-                kopLine4={kopLine4}
-                leftLogo={leftLogo}
-                rightLogo={rightLogo}
-                leftLogoCrop={leftLogoCrop}
-                rightLogoCrop={rightLogoCrop}
-                kopConfig={kopConfig}
-                docKey="ikss"
-              />
-            )}
+        <div className="space-y-4">
+          {/* DAILY PHOTO UPLOAD & POSTING CONTROL PANEL */}
+          <div className="bg-white rounded-2xl border border-slate-200 p-4 sm:p-5 shadow-xs space-y-4 no-print">
+            <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
+              {/* Progress & Stats */}
+              <div className="space-y-2 flex-1 min-w-[240px]">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                  <span className="font-extrabold text-slate-900 text-sm">
+                    Posting Foto Menu Harian
+                  </span>
+                  <span className="text-slate-600 font-semibold tabular-nums">
+                    Terunggah: <strong className="text-slate-900">{photoStats.uploaded}</strong>/{photoStats.total} Hari
+                  </span>
+                  <span className="text-emerald-700 font-semibold tabular-nums">
+                    Diposting: <strong>{photoStats.posted}</strong> Hari
+                  </span>
+                  {photoStats.draft > 0 && (
+                    <span className="text-amber-700 font-semibold tabular-nums">
+                      Draft: <strong>{photoStats.draft}</strong>
+                    </span>
+                  )}
+                  <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-500">
+                    {syncState === "saving" ? (
+                      <>
+                        <Loader2 className="w-3 h-3 animate-spin text-indigo-600" />
+                        Menyimpan...
+                      </>
+                    ) : syncState === "synced" || (isCloudActive && photosHydrated && syncState === "idle") ? (
+                      <>
+                        <Cloud className="w-3.5 h-3.5 text-emerald-600" />
+                        Sinkron Cloud Aktif
+                      </>
+                    ) : (
+                      <>
+                        <CloudOff className="w-3.5 h-3.5 text-slate-400" />
+                        Tersimpan Lokal
+                      </>
+                    )}
+                  </span>
+                </div>
 
-            {/* Top Bright Green Title Banner */}
-            <div className="bg-[#00B050] border border-black py-2 px-3 text-center">
-              <h3 className="text-sm font-bold uppercase text-black tracking-wide">
-                REKAPAN MENU {displayCategoryTitle}
-              </h3>
+                {/* Progress Bar */}
+                <div className="w-full max-w-md h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-emerald-600 transition-all duration-300"
+                    style={{ width: `${photoStats.pct}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* Bulk Upload + Post All Primary Controls */}
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <input
+                  ref={bulkInputRef}
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={handleBulkUploadChange}
+                  className="hidden"
+                />
+
+                <button
+                  type="button"
+                  onClick={() => bulkInputRef.current?.click()}
+                  disabled={Boolean(bulkProgress)}
+                  className="px-3.5 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-slate-800 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
+                >
+                  {bulkProgress ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-600" />
+                  ) : (
+                    <Upload className="w-3.5 h-3.5 text-emerald-600" />
+                  )}
+                  {bulkProgress
+                    ? `Memproses ${bulkProgress.current}/${bulkProgress.total}...`
+                    : "Unggah Banyak Foto"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handlePostAllPhotos}
+                  disabled={photoStats.uploaded === 0 || syncState === "saving"}
+                  className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white text-xs font-bold inline-flex items-center gap-1.5 shadow-xs cursor-pointer whitespace-nowrap"
+                >
+                  {syncState === "saving" ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Send className="w-3.5 h-3.5" />
+                  )}
+                  Posting Semua Foto ({photoStats.uploaded})
+                </button>
+              </div>
             </div>
 
-            {/* Auto-Populated SPPG Identity Header */}
-            {renderIdentityBlock()}
+            {/* Secondary Row: Filter, Auto-Post Toggle, Layout Mode */}
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-100">
+              <div className="flex flex-wrap items-center gap-1.5">
+                {(
+                  [
+                    { id: "semua", label: `Semua (${photoStats.total})` },
+                    { id: "diposting", label: `Diposting (${photoStats.posted})` },
+                    { id: "draft", label: `Draft (${photoStats.draft})` },
+                    { id: "belum", label: `Belum Foto (${photoStats.empty})` },
+                  ] as const
+                ).map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => setPhotoFilter(item.id)}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition cursor-pointer ${
+                      photoFilter === item.id
+                        ? "bg-slate-900 text-white"
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200/70"
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
 
-            {/* Main IKSS Menu Photo Table */}
-            <table
-              className="w-full border-collapse border border-black text-[11px]"
-              style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
-            >
-              <thead>
-                <tr>
-                  <th
-                    rowSpan={2}
-                    className="border border-black bg-[#E54D3D] text-black font-bold px-1.5 py-2 text-center w-[46px]"
-                  >
-                    Hari
-                    <br />
-                    Ke
-                  </th>
-                  <th
-                    colSpan={2}
-                    className="border border-black bg-[#E54D3D] text-black font-bold px-2 py-1 text-center"
-                  >
-                    IDENTITAS SPPG
-                  </th>
-                  <th
-                    rowSpan={2}
-                    className="border border-black bg-[#8EA9DB] text-black font-bold px-2 py-2 text-center w-[155px]"
-                  >
-                    Hari / Tanggal
-                  </th>
-                  <th
-                    rowSpan={2}
-                    className="border border-black bg-[#8EA9DB] text-black font-bold px-2 py-2 text-center"
-                  >
-                    Nama Menu
-                  </th>
-                  <th
-                    rowSpan={2}
-                    className="border border-black bg-[#8EA9DB] text-black font-bold px-2 py-2 text-center w-[180px]"
-                  >
-                    FOTO MENU
-                  </th>
-                </tr>
-                <tr>
-                  <th className="border border-black bg-[#E54D3D] text-black font-bold px-2 py-1 text-center w-[195px]">
-                    Nama SPPG
-                  </th>
-                  <th className="border border-black bg-[#E54D3D] text-black font-bold px-2 py-1 text-center w-[88px]">
-                    ID SPPG
-                  </th>
-                </tr>
-              </thead>
+              <div className="flex flex-wrap items-center gap-3">
+                <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer select-none whitespace-nowrap">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(ikssData.autoPostOnUpload)}
+                    onChange={(e) =>
+                      setIkssData((prev) => ({
+                        ...prev,
+                        autoPostOnUpload: e.target.checked,
+                      }))
+                    }
+                    className="w-4 h-4 accent-emerald-600 rounded cursor-pointer"
+                  />
+                  <span>Auto-Posting saat Unggah</span>
+                </label>
 
-              <tbody>
-                {dailyRows.map((row) => {
-                  const photoSrc = getPhotoForDay(row.hariKe);
-                  return (
-                    <tr key={row.hariKe}>
-                      <td className="border border-black px-1.5 py-2 text-center align-middle font-normal tabular-nums">
-                        {row.hariKe}
-                      </td>
-                      <td className="border border-black px-2 py-2 text-left align-middle uppercase">
-                        {profile.namaLembaga || "-"}
-                      </td>
-                      <td className="border border-black px-1.5 py-2 text-center align-middle uppercase tabular-nums">
-                        {profile.idSPPG || "-"}
-                      </td>
-                      <td className="border border-black px-2 py-2 text-left align-middle whitespace-nowrap">
-                        {row.formattedDate}
-                      </td>
-                      <td className="border border-black px-2 py-2 text-left align-middle leading-snug">
-                        {row.namaMenu || "-"}
-                      </td>
-                      <td className="border border-black p-1.5 text-center align-middle">
-                        <div className="flex flex-col items-center justify-center gap-1.5">
-                          {photoSrc ? (
-                            <div className="relative group w-[158px] h-[98px] overflow-hidden border border-slate-300 bg-slate-50">
-                              <img
-                                src={photoSrc}
-                                alt={`Foto Menu Hari Ke-${row.hariKe}`}
-                                className="w-full h-full object-cover"
-                              />
+                <div className="flex bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => setPhotoViewMode("tabel")}
+                    className={`px-2.5 py-1 rounded-md text-xs font-bold inline-flex items-center gap-1 cursor-pointer transition ${
+                      photoViewMode === "tabel"
+                        ? "bg-white text-slate-900 shadow-xs"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    <Table2 className="w-3.5 h-3.5" />
+                    Tabel Resmi
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPhotoViewMode("kartu")}
+                    className={`px-2.5 py-1 rounded-md text-xs font-bold inline-flex items-center gap-1 cursor-pointer transition ${
+                      photoViewMode === "kartu"
+                        ? "bg-white text-slate-900 shadow-xs"
+                        : "text-slate-600 hover:text-slate-900"
+                    }`}
+                  >
+                    <LayoutGrid className="w-3.5 h-3.5" />
+                    Kartu Posting
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* INTERACTIVE CARD POSTING VIEW (OPTIMAL FOR MOBILE CAMERA & RAPID DAILY POSTING) */}
+          {photoViewMode === "kartu" && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 no-print">
+              {filteredPhotoRows.map((row) => {
+                const photoSrc = getPhotoForDay(row.hariKe);
+                const postMeta = getPostMetaForDay(row.hariKe);
+                const isPosted = Boolean(photoSrc && postMeta?.posted);
+                const isBusy = Boolean(processingDays[row.hariKe]);
+                const isDragging = dragOverDay === row.hariKe;
+                const isEditing = editingMenuDay === row.hariKe;
+
+                return (
+                  <div
+                    key={row.hariKe}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      setDragOverDay(row.hariKe);
+                    }}
+                    onDragLeave={() => setDragOverDay(null)}
+                    onDrop={(e) => handleDropOnDay(row.hariKe, e)}
+                    className={`bg-white rounded-2xl border transition flex flex-col overflow-hidden ${
+                      isDragging
+                        ? "border-emerald-500 ring-2 ring-emerald-500/30"
+                        : isPosted
+                        ? "border-emerald-200"
+                        : "border-slate-200"
+                    }`}
+                  >
+                    {/* Card Header */}
+                    <div className="px-3.5 py-2.5 border-b border-slate-100 flex items-center justify-between gap-2 bg-slate-50/70">
+                      <div className="min-w-0">
+                        <div className="text-xs font-extrabold text-slate-900 tabular-nums">
+                          Hari Ke-{row.hariKe}
+                        </div>
+                        <div className="text-[11px] text-slate-500 truncate">
+                          {row.formattedDate}
+                        </div>
+                      </div>
+                      <span
+                        className={`text-[11px] font-bold shrink-0 ${
+                          isPosted
+                            ? "text-emerald-700"
+                            : photoSrc
+                            ? "text-amber-700"
+                            : "text-slate-400"
+                        }`}
+                      >
+                        {isPosted ? "Diposting" : photoSrc ? "Draft" : "Belum Foto"}
+                      </span>
+                    </div>
+
+                    {/* Photo Stage */}
+                    <div className="p-3 space-y-2.5 flex-1 flex flex-col">
+                      <div className="relative w-full aspect-[4/3] rounded-xl overflow-hidden border border-slate-200 bg-slate-50 flex items-center justify-center">
+                        {isBusy ? (
+                          <div className="flex flex-col items-center gap-1.5 text-emerald-700">
+                            <Loader2 className="w-6 h-6 animate-spin" />
+                            <span className="text-[11px] font-bold">Memproses foto...</span>
+                          </div>
+                        ) : photoSrc ? (
+                          <>
+                            <img
+                              src={photoSrc}
+                              alt={`Foto Menu Hari Ke-${row.hariKe}`}
+                              onClick={() => setLightboxDay(row.hariKe)}
+                              className="w-full h-full object-cover cursor-zoom-in"
+                              loading="lazy"
+                              decoding="async"
+                            />
+                            <div className="absolute top-1.5 right-1.5 flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => setLightboxDay(row.hariKe)}
+                                title="Perbesar Foto"
+                                className="p-1.5 rounded-lg bg-slate-900/75 hover:bg-slate-900 text-white cursor-pointer"
+                              >
+                                <ZoomIn className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRotateDayPhoto(row.hariKe)}
+                                title="Putar 90°"
+                                className="p-1.5 rounded-lg bg-slate-900/75 hover:bg-slate-900 text-white cursor-pointer"
+                              >
+                                <RotateCw className="w-3.5 h-3.5" />
+                              </button>
                               <button
                                 type="button"
                                 onClick={() => handleDeletePhoto(row.hariKe)}
                                 title="Hapus Foto"
-                                className="no-print absolute top-1 right-1 p-1 rounded bg-rose-600/90 hover:bg-rose-700 text-white opacity-90 hover:opacity-100 transition cursor-pointer"
+                                className="p-1.5 rounded-lg bg-rose-600/90 hover:bg-rose-700 text-white cursor-pointer"
                               >
-                                <Trash2 className="w-3 h-3" />
+                                <Trash2 className="w-3.5 h-3.5" />
                               </button>
                             </div>
-                          ) : (
-                            <div className="w-[158px] h-[64px] border border-dashed border-slate-300 bg-slate-50/70 flex items-center justify-center text-[10px] text-slate-400 print:border-transparent print:bg-transparent">
-                              <span className="no-print">Belum ada foto</span>
-                            </div>
-                          )}
+                          </>
+                        ) : (
+                          <div className="text-center px-3 space-y-1">
+                            <Camera className="w-6 h-6 text-slate-300 mx-auto" />
+                            <p className="text-[11px] text-slate-400 font-medium">
+                              Ambil kamera, pilih galeri, atau seret foto ke sini
+                            </p>
+                          </div>
+                        )}
+                      </div>
 
-                          {/* Direct Camera & Gallery Controls (Hidden on Print/PDF) */}
-                          <div className="no-print flex items-center justify-center gap-1.5 w-full">
-                            <label className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[10px] font-bold cursor-pointer transition">
-                              <Camera className="w-3 h-3" />
-                              <span>Kamera</span>
-                              <input
-                                type="file"
-                                accept="image/*"
-                                capture="environment"
-                                onChange={(e) => handlePhotoUpload(row.hariKe, e)}
-                                className="hidden"
-                              />
-                            </label>
-                            <label className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 text-[10px] font-bold cursor-pointer transition">
-                              <ImageIcon className="w-3 h-3" />
-                              <span>Galeri</span>
-                              <input
-                                type="file"
-                                accept="image/*"
-                                onChange={(e) => handlePhotoUpload(row.hariKe, e)}
-                                className="hidden"
-                              />
-                            </label>
+                      {/* Menu Name & Caption */}
+                      {isEditing ? (
+                        <div className="space-y-1.5">
+                          <textarea
+                            rows={2}
+                            value={editMenuDraft}
+                            onChange={(e) => setEditMenuDraft(e.target.value)}
+                            placeholder="Nama Menu Harian..."
+                            className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:border-emerald-500"
+                          />
+                          <input
+                            type="text"
+                            value={editCaptionDraft}
+                            onChange={(e) => setEditCaptionDraft(e.target.value)}
+                            placeholder="Catatan penyajian (opsional)"
+                            className="w-full px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg focus:outline-none focus:border-emerald-500"
+                          />
+                          <div className="flex items-center justify-end gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => setEditingMenuDay(null)}
+                              className="px-2 py-1 text-[11px] font-semibold text-slate-600 hover:bg-slate-100 rounded-md cursor-pointer"
+                            >
+                              Batal
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => saveEditDayMenu(row.hariKe)}
+                              className="px-2.5 py-1 text-[11px] font-bold bg-emerald-600 text-white rounded-md cursor-pointer"
+                            >
+                              Simpan
+                            </button>
                           </div>
                         </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                      ) : (
+                        <div className="flex items-start justify-between gap-1.5 min-h-[38px]">
+                          <div className="min-w-0">
+                            <p className="text-xs font-bold text-slate-800 leading-snug line-clamp-2">
+                              {row.namaMenu || "Menu belum diisi"}
+                            </p>
+                            {row.caption && (
+                              <p className="text-[11px] text-slate-500 mt-0.5 line-clamp-1">
+                                {row.caption}
+                              </p>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => startEditDayMenu(row.hariKe)}
+                            title="Edit Nama Menu / Catatan"
+                            className="p-1 text-slate-400 hover:text-slate-700 rounded cursor-pointer shrink-0"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      )}
 
-            {/* Centralized Auto Signature Block from Profil SPPG */}
-            <AutoSignatureBlock profile={profile} docKey="ikss" />
+                      {/* Camera + Gallery + Post Action */}
+                      <div className="pt-2 border-t border-slate-100 mt-auto space-y-2">
+                        <div className="grid grid-cols-2 gap-1.5">
+                          <label className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-xs font-bold cursor-pointer transition">
+                            <Camera className="w-3.5 h-3.5" />
+                            <span>Kamera</span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              capture="environment"
+                              onChange={(e) => handlePhotoInputChange(row.hariKe, e)}
+                              className="hidden"
+                            />
+                          </label>
+                          <label className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 text-xs font-bold cursor-pointer transition">
+                            <ImageIcon className="w-3.5 h-3.5" />
+                            <span>Galeri</span>
+                            <input
+                              type="file"
+                              accept="image/*"
+                              onChange={(e) => handlePhotoInputChange(row.hariKe, e)}
+                              className="hidden"
+                            />
+                          </label>
+                        </div>
+
+                        {photoSrc && !isPosted && (
+                          <button
+                            type="button"
+                            onClick={() => handlePostDayPhoto(row.hariKe)}
+                            className="w-full py-1.5 px-3 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold inline-flex items-center justify-center gap-1.5 cursor-pointer transition"
+                          >
+                            <Send className="w-3.5 h-3.5" />
+                            Posting Foto Hari Ke-{row.hariKe}
+                          </button>
+                        )}
+                        {isPosted && (
+                          <div className="flex items-center justify-between text-[11px] text-emerald-700 font-semibold px-1">
+                            <span className="inline-flex items-center gap-1">
+                              <CheckCircle2 className="w-3.5 h-3.5" />
+                              Diposting {formatShortTimestamp(postMeta?.postedAt)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleUnpostDayPhoto(row.hariKe)}
+                              className="text-slate-400 hover:text-slate-700 underline cursor-pointer"
+                            >
+                              Draft
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {filteredPhotoRows.length === 0 && (
+                <div className="col-span-full bg-white rounded-2xl border border-slate-200 p-8 text-center text-xs text-slate-500">
+                  Tidak ada hari yang cocok dengan filter status foto yang dipilih.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* OFFICIAL PRINTABLE IKSS FOTO MENU TABLE (ALWAYS MOUNTED SO PRINT & PDF WORK FROM ANY MODE) */}
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-x-auto p-4 sm:p-6">
+            {photoViewMode === "kartu" && (
+              <div className="mb-3 pb-2 border-b border-slate-100 flex items-center justify-between no-print">
+                <span className="text-xs font-bold text-slate-700">
+                  Pratinjau Lembar Resmi IKSS Foto Menu (Siap Cetak / PDF)
+                </span>
+                <span className="text-[11px] text-slate-500">
+                  Seluruh foto yang diunggah &amp; diposting tampil otomatis di tabel ini
+                </span>
+              </div>
+            )}
+
+            <div
+              id="print-area-ikss-foto"
+              className="w-full min-w-[780px] bg-white text-black"
+              style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
+            >
+              {ikssData.showKopOnIkss && (
+                <KopSuratRenderHeader
+                  kopLine1={kopLine1}
+                  kopLine2={kopLine2}
+                  kopLine3={kopLine3}
+                  kopLine4={kopLine4}
+                  leftLogo={leftLogo}
+                  rightLogo={rightLogo}
+                  leftLogoCrop={leftLogoCrop}
+                  rightLogoCrop={rightLogoCrop}
+                  kopConfig={kopConfig}
+                  docKey="ikss"
+                />
+              )}
+
+              <div className="bg-[#00B050] border border-black py-2 px-3 text-center">
+                <h3 className="text-sm font-bold uppercase text-black tracking-wide">
+                  REKAPAN MENU {displayCategoryTitle}
+                </h3>
+              </div>
+
+              {renderIdentityBlock()}
+
+              <table
+                className="w-full border-collapse border border-black text-[11px]"
+                style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
+              >
+                <thead>
+                  <tr>
+                    <th
+                      rowSpan={2}
+                      className="border border-black bg-[#E54D3D] text-black font-bold px-1.5 py-2 text-center w-[46px]"
+                    >
+                      Hari
+                      <br />
+                      Ke
+                    </th>
+                    <th
+                      colSpan={2}
+                      className="border border-black bg-[#E54D3D] text-black font-bold px-2 py-1 text-center"
+                    >
+                      IDENTITAS SPPG
+                    </th>
+                    <th
+                      rowSpan={2}
+                      className="border border-black bg-[#8EA9DB] text-black font-bold px-2 py-2 text-center w-[155px]"
+                    >
+                      Hari / Tanggal
+                    </th>
+                    <th
+                      rowSpan={2}
+                      className="border border-black bg-[#8EA9DB] text-black font-bold px-2 py-2 text-center"
+                    >
+                      Nama Menu
+                    </th>
+                    <th
+                      rowSpan={2}
+                      className="border border-black bg-[#8EA9DB] text-black font-bold px-2 py-2 text-center w-[210px]"
+                    >
+                      FOTO MENU
+                    </th>
+                  </tr>
+                  <tr>
+                    <th className="border border-black bg-[#E54D3D] text-black font-bold px-2 py-1 text-center w-[190px]">
+                      Nama SPPG
+                    </th>
+                    <th className="border border-black bg-[#E54D3D] text-black font-bold px-2 py-1 text-center w-[88px]">
+                      ID SPPG
+                    </th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {(photoViewMode === "tabel" && !isExportingPdf && !showPrintModal
+                    ? filteredPhotoRows
+                    : dailyRows
+                  ).map((row) => {
+                    const photoSrc = getPhotoForDay(row.hariKe);
+                    const postMeta = getPostMetaForDay(row.hariKe);
+                    const isPosted = Boolean(photoSrc && postMeta?.posted);
+                    const isBusy = Boolean(processingDays[row.hariKe]);
+                    const isDragging = dragOverDay === row.hariKe;
+                    const isEditing = editingMenuDay === row.hariKe;
+
+                    return (
+                      <tr key={row.hariKe}>
+                        <td className="border border-black px-1.5 py-2 text-center align-middle font-normal tabular-nums">
+                          {row.hariKe}
+                        </td>
+                        <td className="border border-black px-2 py-2 text-left align-middle uppercase">
+                          {profile.namaLembaga || "-"}
+                        </td>
+                        <td className="border border-black px-1.5 py-2 text-center align-middle uppercase tabular-nums">
+                          {profile.idSPPG || "-"}
+                        </td>
+                        <td className="border border-black px-2 py-2 text-left align-middle whitespace-nowrap">
+                          {row.formattedDate}
+                        </td>
+                        <td className="border border-black px-2 py-2 text-left align-middle leading-snug">
+                          {isEditing ? (
+                            <div className="space-y-1.5 no-print font-sans">
+                              <textarea
+                                rows={2}
+                                value={editMenuDraft}
+                                onChange={(e) => setEditMenuDraft(e.target.value)}
+                                placeholder="Nama Menu Harian..."
+                                className="w-full px-2 py-1 text-xs border border-slate-300 rounded focus:outline-none focus:border-emerald-500"
+                              />
+                              <input
+                                type="text"
+                                value={editCaptionDraft}
+                                onChange={(e) => setEditCaptionDraft(e.target.value)}
+                                placeholder="Catatan singkat (opsional)"
+                                className="w-full px-2 py-1 text-xs border border-slate-300 rounded focus:outline-none focus:border-emerald-500"
+                              />
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => saveEditDayMenu(row.hariKe)}
+                                  className="px-2.5 py-1 bg-emerald-600 text-white text-[11px] font-bold rounded cursor-pointer"
+                                >
+                                  Simpan
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingMenuDay(null)}
+                                  className="px-2 py-1 bg-slate-100 text-slate-700 text-[11px] font-semibold rounded cursor-pointer"
+                                >
+                                  Batal
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="flex items-start justify-between gap-1.5 group">
+                              <div>
+                                <div>{row.namaMenu || "-"}</div>
+                                {row.caption && (
+                                  <div className="text-[10px] text-slate-600 mt-0.5 italic">
+                                    {row.caption}
+                                  </div>
+                                )}
+                              </div>
+                              <button
+                                type="button"
+                                onClick={() => startEditDayMenu(row.hariKe)}
+                                title="Edit Nama Menu / Catatan"
+                                className="no-print p-1 rounded text-slate-400 hover:text-slate-800 hover:bg-slate-100 opacity-70 group-hover:opacity-100 cursor-pointer shrink-0"
+                              >
+                                <Edit3 className="w-3 h-3" />
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                        <td
+                          className="border border-black p-1.5 text-center align-middle"
+                          onDragOver={(e) => {
+                            e.preventDefault();
+                            setDragOverDay(row.hariKe);
+                          }}
+                          onDragLeave={() => setDragOverDay(null)}
+                          onDrop={(e) => handleDropOnDay(row.hariKe, e)}
+                        >
+                          <div className="flex flex-col items-center justify-center gap-1.5">
+                            {isBusy ? (
+                              <div className="w-[176px] h-[106px] border border-emerald-300 bg-emerald-50/70 flex flex-col items-center justify-center gap-1 text-[10px] font-bold text-emerald-700 font-sans">
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                                <span>Memproses foto...</span>
+                              </div>
+                            ) : photoSrc ? (
+                              <div className="relative group w-[176px] h-[106px] overflow-hidden border border-slate-300 bg-slate-50">
+                                <img
+                                  src={photoSrc}
+                                  alt={`Foto Menu Hari Ke-${row.hariKe}`}
+                                  onClick={() => setLightboxDay(row.hariKe)}
+                                  className="w-full h-full object-cover cursor-zoom-in"
+                                  loading="lazy"
+                                  decoding="async"
+                                />
+                                <div className="no-print absolute top-1 right-1 flex items-center gap-1 opacity-95">
+                                  <button
+                                    type="button"
+                                    onClick={() => setLightboxDay(row.hariKe)}
+                                    title="Perbesar Foto"
+                                    className="p-1 rounded bg-slate-900/80 hover:bg-slate-900 text-white cursor-pointer"
+                                  >
+                                    <ZoomIn className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleRotateDayPhoto(row.hariKe)}
+                                    title="Putar 90°"
+                                    className="p-1 rounded bg-slate-900/80 hover:bg-slate-900 text-white cursor-pointer"
+                                  >
+                                    <RotateCw className="w-3 h-3" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDeletePhoto(row.hariKe)}
+                                    title="Hapus Foto"
+                                    className="p-1 rounded bg-rose-600/90 hover:bg-rose-700 text-white cursor-pointer"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div
+                                className={`w-[176px] h-[72px] border border-dashed flex flex-col items-center justify-center gap-0.5 text-[10px] transition print:border-transparent print:bg-transparent font-sans ${
+                                  isDragging
+                                    ? "border-emerald-600 bg-emerald-50 text-emerald-700 font-bold"
+                                    : "border-slate-300 bg-slate-50/70 text-slate-400"
+                                }`}
+                              >
+                                <span className="no-print">
+                                  {isDragging ? "Lepaskan foto di sini" : "Belum ada foto / seret ke sini"}
+                                </span>
+                              </div>
+                            )}
+
+                            {/* Upload & Posting Controls (Hidden on Print/PDF) */}
+                            <div className="no-print flex flex-col items-center gap-1 w-full font-sans">
+                              <div className="flex items-center justify-center gap-1.5 w-full">
+                                <label className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[10px] font-bold cursor-pointer transition whitespace-nowrap">
+                                  <Camera className="w-3 h-3" />
+                                  <span>Kamera</span>
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    capture="environment"
+                                    onChange={(e) => handlePhotoInputChange(row.hariKe, e)}
+                                    className="hidden"
+                                  />
+                                </label>
+                                <label className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 text-[10px] font-bold cursor-pointer transition whitespace-nowrap">
+                                  <ImageIcon className="w-3 h-3" />
+                                  <span>Galeri</span>
+                                  <input
+                                    type="file"
+                                    accept="image/*"
+                                    onChange={(e) => handlePhotoInputChange(row.hariKe, e)}
+                                    className="hidden"
+                                  />
+                                </label>
+                              </div>
+
+                              {photoSrc && !isPosted && (
+                                <button
+                                  type="button"
+                                  onClick={() => handlePostDayPhoto(row.hariKe)}
+                                  className="w-[176px] py-1 px-2 rounded-md bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold inline-flex items-center justify-center gap-1 cursor-pointer transition"
+                                >
+                                  <Send className="w-3 h-3" />
+                                  Posting Foto
+                                </button>
+                              )}
+
+                              {isPosted && (
+                                <div className="w-[176px] flex items-center justify-between text-[10px] text-emerald-700 font-bold px-0.5">
+                                  <span className="inline-flex items-center gap-1">
+                                    <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                    Diposting{postMeta?.postedAt ? ` • ${formatShortTimestamp(postMeta.postedAt)}` : ""}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleUnpostDayPhoto(row.hariKe)}
+                                    className="text-slate-400 hover:text-slate-700 underline font-semibold cursor-pointer"
+                                  >
+                                    Draft
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+
+              <AutoSignatureBlock profile={profile} docKey="ikss" />
+            </div>
           </div>
         </div>
       )}
 
-      {/* Print Preview Modal */}
-      <PrintPreviewModal
-        isOpen={showPrintModal}
-        onClose={() => setShowPrintModal(false)}
-        title={`Pratinjau Cetak: ${activePrintTitle}`}
-        elementId={activePrintId}
-        filename={activeFilename}
-        defaultScale={100}
-        defaultPaperSize={paperSize}
-        defaultOrientation="auto"
-      />
+      {/* PHOTO LIGHTBOX MODAL */}
+      {lightboxDay !== null && activeLightboxRow && (
+        <div
+          className="fixed inset-0 z-[9998] bg-slate-950/80 backdrop-blur-xs flex items-center justify-center p-4 no-print"
+          onClick={() => setLightboxDay(null)}
+        >
+          <div
+            className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-2xl w-full overflow-hidden flex flex-col max-h-[90vh]"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="px-4 py-3 border-b border-slate-200 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-sm font-extrabold text-slate-900">
+                  Hari Ke-{activeLightboxRow.hariKe} — {activeLightboxRow.formattedDate}
+                </div>
+                <div className="text-xs text-slate-600 truncate">
+                  {activeLightboxRow.namaMenu || "Menu belum diisi"}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setLightboxDay(null)}
+                className="p-1.5 text-slate-400 hover:text-slate-800 hover:bg-slate-100 rounded-lg cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="bg-slate-900 flex items-center justify-center p-3 min-h-[260px] max-h-[58vh] overflow-hidden relative">
+              {activeLightboxPhoto ? (
+                <img
+                  src={activeLightboxPhoto}
+                  alt={`Foto Menu Hari Ke-${activeLightboxRow.hariKe}`}
+                  className="max-h-[54vh] max-w-full object-contain rounded"
+                />
+              ) : (
+                <div className="text-slate-400 text-xs">Foto belum diunggah</div>
+              )}
+
+              {lightboxDay > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setLightboxDay((d) => (d && d > 1 ? d - 1 : d))}
+                  className="absolute left-3 top-1/2 -translate-y-1/2 p-2 rounded-full bg-white/15 hover:bg-white/30 text-white cursor-pointer"
+                  title="Hari Sebelumnya"
+                >
+                  <ChevronLeft className="w-5 h-5" />
+                </button>
+              )}
+              {lightboxDay < totalDays && (
+                <button
+                  type="button"
+                  onClick={() => setLightboxDay((d) => (d && d < totalDays ? d + 1 : d))}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 p-2 rounded-full bg-white/15 hover:bg-white/30 text-white cursor-pointer"
+                  title="Hari Berikutnya"
+                >
+                  <ChevronRight className="w-5 h-5" />
+                </button>
+              )}
+            </div>
+
+            <div className="px-4 py-3 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer">
+                  <Camera className="w-3.5 h-3.5" />
+                  <span>Ganti Kamera</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={(e) => handlePhotoInputChange(activeLightboxRow.hariKe, e)}
+                    className="hidden"
+                  />
+                </label>
+                <label className="px-3 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer">
+                  <ImageIcon className="w-3.5 h-3.5" />
+                  <span>Ganti Galeri</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(e) => handlePhotoInputChange(activeLightboxRow.hariKe, e)}
+                    className="hidden"
+                  />
+                </label>
+                {activeLightboxPhoto && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleRotateDayPhoto(activeLightboxRow.hariKe)}
+                      className="px-3 py-1.5 rounded-lg border border-slate-300 bg-white hover:bg-slate-100 text-slate-700 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RotateCw className="w-3.5 h-3.5" />
+                      Putar 90°
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleDeletePhoto(activeLightboxRow.hariKe)}
+                      className="px-3 py-1.5 rounded-lg border border-rose-200 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Hapus
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {activeLightboxPhoto && (
+                activeLightboxMeta?.posted ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs font-bold text-emerald-700">
+                    <CheckCircle2 className="w-4 h-4" />
+                    Sudah Diposting ({formatShortTimestamp(activeLightboxMeta.postedAt)})
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => handlePostDayPhoto(activeLightboxRow.hariKe)}
+                    className="px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold inline-flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Send className="w-3.5 h-3.5" />
+                    Posting Foto Ini
+                  </button>
+                )
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Print Preview Modal (mounted strictly when open) */}
+      {showPrintModal && (
+        <PrintPreviewModal
+          isOpen={showPrintModal}
+          onClose={() => setShowPrintModal(false)}
+          title={`Pratinjau Cetak: ${activePrintTitle}`}
+          elementId={activePrintId}
+          filename={activeFilename}
+          defaultScale={100}
+          defaultPaperSize={paperSize}
+          defaultOrientation="auto"
+        />
+      )}
     </div>
   );
 }
