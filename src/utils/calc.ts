@@ -465,6 +465,11 @@ export function getCountsForDay(harianPM: HariPM[], dayNum: number) {
   let pmKecil3B = 0;
   let pmBesar3B = 0;
 
+  let sampelPorsiKecil = 0;
+  let sampelPorsiBesar = 0;
+  let sampelAlergiKecil = 0;
+  let sampelAlergiBesar = 0;
+
   const sekolahIds = ["tk_paud_lb", "sd_kelas_1_3", "sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan"];
   const tigaBIds = ["anak_balita", "anak_balita_13_59", "balita_6_11", "ibu_hamil", "ibu_menyusui"];
   const balitaIds = ["anak_balita", "anak_balita_13_59", "balita_6_11"];
@@ -479,6 +484,13 @@ export function getCountsForDay(harianPM: HariPM[], dayNum: number) {
     totalPorsiBesarAll += pb;
     totalAlergiKecilAll += ak;
     totalAlergiBesarAll += ab;
+
+    if (s.id === "sampel") {
+      sampelPorsiKecil += pk;
+      sampelPorsiBesar += pb;
+      sampelAlergiKecil += ak;
+      sampelAlergiBesar += ab;
+    }
 
     if (sekolahIds.includes(s.id)) {
       pmKecilSekolah += pk;
@@ -513,6 +525,7 @@ export function getCountsForDay(harianPM: HariPM[], dayNum: number) {
   const totalSekolahAlergi = totalSekolahAlergiKecil + totalSekolahAlergiBesar;
   const total3BAlergi = total3BAlergiKecil + total3BAlergiBesar;
   const total3BPM = pmKecil3B + pmBesar3B;
+  const totalSampel = sampelPorsiKecil + sampelPorsiBesar + sampelAlergiKecil + sampelAlergiBesar;
   const grandTotalPMAll = totalPorsiKecilAll + totalPorsiBesarAll;
 
   return {
@@ -532,6 +545,11 @@ export function getCountsForDay(harianPM: HariPM[], dayNum: number) {
     totalMPAsi,
     pmKecil3B,
     pmBesar3B,
+    sampelPorsiKecil,
+    sampelPorsiBesar,
+    sampelAlergiKecil,
+    sampelAlergiBesar,
+    totalSampel,
     totalPorsiKecilAll,
     totalPorsiBesarAll,
     totalAlergiKecilAll,
@@ -540,3 +558,210 @@ export function getCountsForDay(harianPM: HariPM[], dayNum: number) {
     grandTotalPMAll
   };
 }
+
+export interface PMCategoryBreakdown {
+  // Non-overlapping 5 buckets (strict sum === totalPM and totalRAB)
+  nonSampelBesar: number;
+  nonSampelKecil: number;
+  nonSampelAlergiBesar: number;
+  nonSampelAlergiKecil: number;
+  sampelBesar: number;
+  sampelKecil: number;
+  totalSampel: number;
+
+  // Column sums matching Tabel 2 (inclusive of row 13 Sampel)
+  totalPorsiBesar: number;
+  totalPorsiKecil: number;
+  totalAlergiBesar: number;
+  totalAlergiKecil: number;
+  totalAlergi: number;
+  totalPM: number;
+
+  // Non-overlapping 5-bucket RAB (strict sum === totalRAB)
+  rabNonSampelBesar: number;
+  rabNonSampelKecil: number;
+  rabNonSampelAlergiBesar: number;
+  rabNonSampelAlergiKecil: number;
+  rabSampelBesar: number;
+  rabSampelKecil: number;
+  rabSampel: number;
+
+  // Column RAB matching Tabel 2 (inclusive of row 13 Sampel)
+  rabPorsiBesar: number;
+  rabPorsiKecil: number;
+  rabAlergiBesar: number;
+  rabAlergiKecil: number;
+  totalRAB: number;
+}
+
+export interface PMPeriodBreakdown extends PMCategoryBreakdown {
+  totalDays: number;
+  filledDaysCount: number;
+}
+
+export function computeSasaranBreakdown(
+  sasaranList: { id?: string; porsiBesar?: number; porsiKecil?: number; alergiBesar?: number; alergiKecil?: number }[] = [],
+  hargaKecil = 8000,
+  hargaBesar = 10000
+): PMCategoryBreakdown {
+  let nonSampelBesar = 0;
+  let nonSampelKecil = 0;
+  let nonSampelAlergiBesar = 0;
+  let nonSampelAlergiKecil = 0;
+  let sampelBesar = 0;
+  let sampelKecil = 0;
+
+  let totalPorsiBesar = 0;
+  let totalPorsiKecil = 0;
+  let totalAlergiBesar = 0;
+  let totalAlergiKecil = 0;
+
+  (Array.isArray(sasaranList) ? sasaranList : []).forEach((s) => {
+    const pb = Math.max(0, Number(s?.porsiBesar) || 0);
+    const pk = Math.max(0, Number(s?.porsiKecil) || 0);
+    const ab = Math.max(0, Number(s?.alergiBesar) || 0);
+    const ak = Math.max(0, Number(s?.alergiKecil) || 0);
+
+    totalPorsiBesar += pb;
+    totalPorsiKecil += pk;
+    totalAlergiBesar += ab;
+    totalAlergiKecil += ak;
+
+    if (s?.id === "sampel") {
+      sampelBesar += pb + ab;
+      sampelKecil += pk + ak;
+    } else {
+      nonSampelBesar += pb;
+      nonSampelKecil += pk;
+      nonSampelAlergiBesar += ab;
+      nonSampelAlergiKecil += ak;
+    }
+  });
+
+  const totalSampel = sampelBesar + sampelKecil;
+  const totalAlergi = totalAlergiBesar + totalAlergiKecil;
+  const totalPM = totalPorsiBesar + totalPorsiKecil + totalAlergiBesar + totalAlergiKecil;
+
+  const rabNonSampelBesar = nonSampelBesar * hargaBesar;
+  const rabNonSampelKecil = nonSampelKecil * hargaKecil;
+  const rabNonSampelAlergiBesar = nonSampelAlergiBesar * hargaBesar;
+  const rabNonSampelAlergiKecil = nonSampelAlergiKecil * hargaKecil;
+  const rabSampelBesar = sampelBesar * hargaBesar;
+  const rabSampelKecil = sampelKecil * hargaKecil;
+  const rabSampel = rabSampelBesar + rabSampelKecil;
+
+  const rabPorsiBesar = totalPorsiBesar * hargaBesar;
+  const rabPorsiKecil = totalPorsiKecil * hargaKecil;
+  const rabAlergiBesar = totalAlergiBesar * hargaBesar;
+  const rabAlergiKecil = totalAlergiKecil * hargaKecil;
+  const totalRAB = rabPorsiBesar + rabPorsiKecil + rabAlergiBesar + rabAlergiKecil;
+
+  return {
+    nonSampelBesar,
+    nonSampelKecil,
+    nonSampelAlergiBesar,
+    nonSampelAlergiKecil,
+    sampelBesar,
+    sampelKecil,
+    totalSampel,
+    totalPorsiBesar,
+    totalPorsiKecil,
+    totalAlergiBesar,
+    totalAlergiKecil,
+    totalAlergi,
+    totalPM,
+    rabNonSampelBesar,
+    rabNonSampelKecil,
+    rabNonSampelAlergiBesar,
+    rabNonSampelAlergiKecil,
+    rabSampelBesar,
+    rabSampelKecil,
+    rabSampel,
+    rabPorsiBesar,
+    rabPorsiKecil,
+    rabAlergiBesar,
+    rabAlergiKecil,
+    totalRAB,
+  };
+}
+
+export function getDayPMBreakdown(
+  harianPM: HariPM[],
+  dayNum: number,
+  hargaKecil = 8000,
+  hargaBesar = 10000
+): PMCategoryBreakdown {
+  const day = (Array.isArray(harianPM) ? harianPM : []).find((h) => h.hariKe === dayNum);
+  return computeSasaranBreakdown(day?.sasaran || [], hargaKecil, hargaBesar);
+}
+
+export function getPeriodPMAndRABSummary(
+  harianPM: HariPM[],
+  totalDays: number,
+  hargaKecil = 8000,
+  hargaBesar = 10000
+): PMPeriodBreakdown {
+  const safeDays = Math.max(1, totalDays);
+  const acc: PMPeriodBreakdown = {
+    nonSampelBesar: 0,
+    nonSampelKecil: 0,
+    nonSampelAlergiBesar: 0,
+    nonSampelAlergiKecil: 0,
+    sampelBesar: 0,
+    sampelKecil: 0,
+    totalSampel: 0,
+    totalPorsiBesar: 0,
+    totalPorsiKecil: 0,
+    totalAlergiBesar: 0,
+    totalAlergiKecil: 0,
+    totalAlergi: 0,
+    totalPM: 0,
+    rabNonSampelBesar: 0,
+    rabNonSampelKecil: 0,
+    rabNonSampelAlergiBesar: 0,
+    rabNonSampelAlergiKecil: 0,
+    rabSampelBesar: 0,
+    rabSampelKecil: 0,
+    rabSampel: 0,
+    rabPorsiBesar: 0,
+    rabPorsiKecil: 0,
+    rabAlergiBesar: 0,
+    rabAlergiKecil: 0,
+    totalRAB: 0,
+    totalDays: safeDays,
+    filledDaysCount: 0,
+  };
+
+  for (let dayNum = 1; dayNum <= safeDays; dayNum++) {
+    const d = getDayPMBreakdown(harianPM, dayNum, hargaKecil, hargaBesar);
+    if (d.totalPM > 0) acc.filledDaysCount += 1;
+    acc.nonSampelBesar += d.nonSampelBesar;
+    acc.nonSampelKecil += d.nonSampelKecil;
+    acc.nonSampelAlergiBesar += d.nonSampelAlergiBesar;
+    acc.nonSampelAlergiKecil += d.nonSampelAlergiKecil;
+    acc.sampelBesar += d.sampelBesar;
+    acc.sampelKecil += d.sampelKecil;
+    acc.totalSampel += d.totalSampel;
+    acc.totalPorsiBesar += d.totalPorsiBesar;
+    acc.totalPorsiKecil += d.totalPorsiKecil;
+    acc.totalAlergiBesar += d.totalAlergiBesar;
+    acc.totalAlergiKecil += d.totalAlergiKecil;
+    acc.totalAlergi += d.totalAlergi;
+    acc.totalPM += d.totalPM;
+    acc.rabNonSampelBesar += d.rabNonSampelBesar;
+    acc.rabNonSampelKecil += d.rabNonSampelKecil;
+    acc.rabNonSampelAlergiBesar += d.rabNonSampelAlergiBesar;
+    acc.rabNonSampelAlergiKecil += d.rabNonSampelAlergiKecil;
+    acc.rabSampelBesar += d.rabSampelBesar;
+    acc.rabSampelKecil += d.rabSampelKecil;
+    acc.rabSampel += d.rabSampel;
+    acc.rabPorsiBesar += d.rabPorsiBesar;
+    acc.rabPorsiKecil += d.rabPorsiKecil;
+    acc.rabAlergiBesar += d.rabAlergiBesar;
+    acc.rabAlergiKecil += d.rabAlergiKecil;
+    acc.totalRAB += d.totalRAB;
+  }
+
+  return acc;
+}
+

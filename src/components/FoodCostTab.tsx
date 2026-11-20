@@ -438,8 +438,8 @@ export default function FoodCostTab({
   const settings = pmSettings || {
     porsiKecilHarga: 8000,
     porsiBesarHarga: 10000,
-    porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11"],
-    porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"]
+    porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11", "sampel"],
+    porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui", "sampel"]
   };
 
   const defaultKecilIds: string[] = Array.isArray(settings.porsiKecilSasaranIds)
@@ -881,6 +881,7 @@ export default function FoodCostTab({
   const dayPMForLabels = harianPM.find(h => h.hariKe === selectedDay) || harianPM[0] || { sasaran: [] };
 
   const getSasaranLabel = (sId: string): string => {
+    if (sId === "sampel") return "Sampel";
     const fromDay = dayPMForLabels.sasaran.find((s) => s.id === sId)?.label;
     if (fromDay) return fromDay;
     const fromConst = SASARAN_KATEGORI_LIST.find((s) => s.id === sId)?.label;
@@ -890,10 +891,18 @@ export default function FoodCostTab({
   const getSasaranPmCount = (sId: string, porsi: "besar" | "kecil"): number => {
     const sasItem = dayPMForLabels.sasaran.find((item) => item.id === sId);
     if (!sasItem) return 0;
+    const isSharedPortion =
+      sId === "sampel" ||
+      (defaultKecilIds.includes(sId) && defaultBesarIds.includes(sId));
     if (selectedType === "Alergi") {
       const cAlergi = porsi === "besar" ? (Number(sasItem.alergiBesar) || 0) : (Number(sasItem.alergiKecil) || 0);
-      const cNormal = (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+      const cNormal = isSharedPortion
+        ? (porsi === "besar" ? (Number(sasItem.porsiBesar) || 0) : (Number(sasItem.porsiKecil) || 0))
+        : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
       return cAlergi > 0 ? cAlergi : cNormal;
+    }
+    if (isSharedPortion) {
+      return porsi === "besar" ? (Number(sasItem.porsiBesar) || 0) : (Number(sasItem.porsiKecil) || 0);
     }
     return (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
   };

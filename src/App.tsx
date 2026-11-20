@@ -18,7 +18,8 @@ import {
   EMPTY_HARIAN_PM,
   EMPTY_MASTER_MENU,
   EMPTY_FOOD_COST_DAYS,
-  EMPTY_SASARAN_LIST
+  EMPTY_SASARAN_LIST,
+  normalizeHarianPM
 } from "./initialData";
 import { INITIAL_TKPI_DATABASE } from "./tkpiData";
 import { getCountsForDay } from "./utils/calc";
@@ -170,7 +171,7 @@ export default function App() {
     const saved = safeReadStorage("sisper_harian_pm");
     if (saved) {
       try {
-        return JSON.parse(saved);
+        return normalizeHarianPM(JSON.parse(saved));
       } catch (e) {
         console.error(e);
       }
@@ -316,8 +317,8 @@ export default function App() {
     return {
       porsiKecilHarga: 8000,
       porsiBesarHarga: 10000,
-      porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11"],
-      porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"]
+      porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11", "sampel"],
+      porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui", "sampel"]
     };
   });
 
@@ -832,7 +833,7 @@ export default function App() {
           }
 
           if (cloudHarianPM) {
-            setHarianPM(cloudHarianPM);
+            setHarianPM(normalizeHarianPM(cloudHarianPM));
           } else {
             const initialHarian = isMainAdminAccount ? INITIAL_HARIAN_PM : EMPTY_HARIAN_PM;
             setHarianPM(initialHarian);
@@ -924,8 +925,8 @@ export default function App() {
             const defaultPmSettings = {
               porsiKecilHarga: 8000,
               porsiBesarHarga: 10000,
-              porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11"],
-              porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"]
+              porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11", "sampel"],
+              porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui", "sampel"]
             };
             setPmSettings(defaultPmSettings);
           }
@@ -976,8 +977,8 @@ export default function App() {
       setPmSettings({
         porsiKecilHarga: 8000,
         porsiBesarHarga: 10000,
-        porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11"],
-        porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"]
+        porsiKecilSasaranIds: ["tk_paud_lb", "sd_kelas_1_3", "anak_balita", "anak_balita_13_59", "balita_6_11", "sampel"],
+        porsiBesarSasaranIds: ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui", "sampel"]
       });
       clearPerUserWorksheetStorage();
     }
@@ -3296,6 +3297,8 @@ export default function App() {
                   paperSize={paperSize}
                   setPaperSize={setPaperSize}
                   isAdmin={isAdminUser}
+                  pmSettings={pmSettings}
+                  setPmSettings={setPmSettings}
                 />
               </div>
             )}
@@ -3390,7 +3393,7 @@ export default function App() {
               if (period.profile) setProfile(period.profile);
               if (period.sekolahPM) setSekolahPM(period.sekolahPM);
               if (period.tigaBPM) setTigaBPM(period.tigaBPM);
-              if (period.harianPM) setHarianPM(period.harianPM);
+              if (period.harianPM) setHarianPM(normalizeHarianPM(period.harianPM));
               if (period.masterMenu) setMasterMenu(period.masterMenu);
               if (period.foodCostDays) setFoodCostDays(period.foodCostDays);
             }}
@@ -3435,6 +3438,8 @@ export default function App() {
             harianPM={harianPM}
             onChange={setHarianPM}
             profile={profile}
+            sekolahPM={sekolahPM}
+            tigaBPM={tigaBPM}
             pmSettings={pmSettings}
             setPmSettings={setPmSettings}
             kopLine1={kopLine1}
@@ -3471,14 +3476,16 @@ export default function App() {
               const targetDays = updatedProfile.periodeDates?.length || 0;
               if (targetDays > harianPM.length) {
                 const templateSasaran = harianPM[0]?.sasaran || EMPTY_SASARAN_LIST;
+                const templateUraian = harianPM[0]?.uraian || [];
                 const nextHarian = [...harianPM];
                 for (let d = harianPM.length + 1; d <= targetDays; d++) {
                   nextHarian.push({
                     hariKe: d,
                     sasaran: templateSasaran.map((s) => ({ ...s })),
+                    uraian: templateUraian.map((u) => ({ ...u })),
                   });
                 }
-                setHarianPM(nextHarian);
+                setHarianPM(normalizeHarianPM(nextHarian));
               }
             }}
             onSendToFoodCost={(updatedMenu, dates) => {
@@ -3489,14 +3496,16 @@ export default function App() {
               // Ensure harianPM covers all planned days
               if (targetDays > harianPM.length) {
                 const templateSasaran = harianPM[0]?.sasaran || EMPTY_SASARAN_LIST;
+                const templateUraian = harianPM[0]?.uraian || [];
                 const nextHarian = [...harianPM];
                 for (let d = harianPM.length + 1; d <= targetDays; d++) {
                   nextHarian.push({
                     hariKe: d,
                     sasaran: templateSasaran.map((s) => ({ ...s })),
+                    uraian: templateUraian.map((u) => ({ ...u })),
                   });
                 }
-                setHarianPM(nextHarian);
+                setHarianPM(normalizeHarianPM(nextHarian));
               }
 
               // Map Master Menu plans & dates into FoodCostDay entries automatically

@@ -1,5 +1,12 @@
 @import "tailwindcss";
 
+/* Fix html2canvas FontMetrics baseline calculation under Tailwind v4 Preflight (img { display: block })
+   so exported PDF/PNG text never shifts downward onto cell bottom borders. */
+body > div[style*="visibility: hidden"] > img[width="1"][height="1"] {
+  display: inline !important;
+  vertical-align: baseline !important;
+}
+
 @layer utilities {
   @media print {
     /* Set page margins and colors */
@@ -34,8 +41,7 @@
     button:not(.print-keep),
     .sidebar,
     .tab-bar,
-    input[type="file"],
-    select {
+    input[type="file"] {
       display: none !important;
     }
 
@@ -78,11 +84,10 @@
     }
 
     th, td {
-      border: 1px solid #94a3b8 !important;
       word-wrap: break-word !important;
     }
 
-    input {
+    input, select, textarea {
       border: none !important;
       background: transparent !important;
       box-shadow: none !important;
@@ -90,4 +95,5 @@
     }
   }
 }
+
 

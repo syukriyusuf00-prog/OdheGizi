@@ -605,14 +605,14 @@ export default function FormSopTab({
     printElementSmart(currentPrintElementId, {
       title: currentDocTitle,
       paperSize,
-      orientation: activeSubTab === "penyimpanan" ? "auto" : "portrait",
+      orientation: activeSubTab === "penyimpanan" ? "landscape" : "portrait",
     });
   };
 
   const handleExportPdf = async () => {
     await exportToPDF(currentPrintElementId, currentDocFilename, 100, setIsDownloading, {
       paperSize,
-      orientation: activeSubTab === "penyimpanan" ? "auto" : "portrait",
+      orientation: activeSubTab === "penyimpanan" ? "landscape" : "portrait",
     });
   };
 
@@ -1865,98 +1865,98 @@ export default function FormSopTab({
               </h2>
 
               {/* Exact Gambar 3 Bold Italic Header Row */}
-              <div className="flex flex-wrap items-center justify-between gap-4 mb-3 text-[12px]">
-                <div className="flex flex-wrap items-center gap-12 font-bold italic">
+              <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1.5 mb-3 text-[12px]">
+                <div className="flex flex-wrap items-center gap-10 font-bold italic">
                   <span>Bulan: {activeMonthName}</span>
                   <span>Tahun: {activeYear}</span>
                 </div>
-                <div className="text-[11px] font-semibold text-slate-800 print:text-black tabular-nums">
+                <div className="text-[11px] font-semibold text-slate-800 print:text-black tabular-nums text-right">
                   {profile.namaLembaga || "-"} · ID SPPG: {profile.idSPPG || "-"}
                 </div>
               </div>
 
-              {/* Exact Gambar 3 Table with #D9D9D9 Shaded Header */}
+              {/* Exact Gambar 3 Table with #D9D9D9 Shaded Header (bg placed strictly on th, never tr, to protect rowSpan cells) */}
               <div className="overflow-x-auto">
                 <table className="w-full border-collapse border border-black text-[11px] text-black">
                   <thead>
-                    <tr style={{ backgroundColor: "#D9D9D9" }}>
+                    <tr>
                       <th
                         rowSpan={2}
-                        className="border border-black px-2 py-2 text-center font-bold min-w-[220px]"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-2 py-2 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "26%" }}
                       >
                         Kode Identitas Makanan
                       </th>
                       <th
                         rowSpan={2}
-                        className="border border-black px-2 py-2 text-center font-bold w-24"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-2 py-2 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "10%" }}
                       >
                         Jumlah Sampel
                       </th>
                       <th
                         colSpan={2}
-                        className="border border-black px-2 py-1 text-center font-bold"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-2 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "10%" }}
                       >
                         Kondisi Sampel
                       </th>
                       <th
                         rowSpan={2}
-                        className="border border-black px-2 py-2 text-center font-bold w-44"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-2 py-2 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "20%" }}
                       >
                         Nama Penanggung Jawab
                       </th>
                       <th
                         colSpan={2}
-                        className="border border-black px-2 py-1 text-center font-bold"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-2 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "17%" }}
                       >
                         Masuk Chiler
                       </th>
                       <th
                         colSpan={2}
-                        className="border border-black px-2 py-1 text-center font-bold"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-2 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "17%" }}
                       >
                         Keluar Chiler
                       </th>
                     </tr>
-                    <tr style={{ backgroundColor: "#D9D9D9" }}>
+                    <tr>
                       <th
-                        className="border border-black px-2 py-1 text-center font-bold w-12"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-1.5 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "5%" }}
                       >
                         OK
                       </th>
                       <th
-                        className="border border-black px-2 py-1 text-center font-bold w-12"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-1.5 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "5%" }}
                       >
                         NOK
                       </th>
                       <th
-                        className="border border-black px-2 py-1 text-center font-bold w-24"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-1.5 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "10%" }}
                       >
                         Tanggal
                       </th>
                       <th
-                        className="border border-black px-2 py-1 text-center font-bold w-16"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-1.5 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "7%" }}
                       >
                         Jam
                       </th>
                       <th
-                        className="border border-black px-2 py-1 text-center font-bold w-24"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-1.5 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "10%" }}
                       >
                         Tanggal
                       </th>
                       <th
-                        className="border border-black px-2 py-1 text-center font-bold w-16"
-                        style={{ backgroundColor: "#D9D9D9" }}
+                        className="border border-black px-1.5 py-1.5 text-center align-middle font-bold"
+                        style={{ backgroundColor: "#D9D9D9", width: "7%" }}
                       >
                         Jam
                       </th>
@@ -2127,8 +2127,8 @@ export default function FormSopTab({
           elementId={currentPrintElementId}
           title={currentDocTitle}
           filename={currentDocFilename}
-          paperSize={paperSize}
-          defaultOrientation={activeSubTab === "penyimpanan" ? "auto" : "portrait"}
+          defaultPaperSize={paperSize}
+          defaultOrientation={activeSubTab === "penyimpanan" ? "landscape" : "portrait"}
         />
       )}
 

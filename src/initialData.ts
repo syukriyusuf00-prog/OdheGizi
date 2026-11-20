@@ -223,6 +223,9 @@ for (let d = 3; d <= 10; d++) {
 }
 
 export const DEFAULT_SASARAN_LIST: KelompokSasaranPM[] = [
+  { id: "balita_6_11", label: "Balita 6-11 Bulan", porsiKecil: 35, porsiBesar: 0, alergiKecil: 1, alergiBesar: 0 },
+  { id: "anak_balita_13_59", label: "Anak Balita Usia 13-59 Bulan", porsiKecil: 90, porsiBesar: 0, alergiKecil: 3, alergiBesar: 0 },
+  { id: "anak_balita", label: "Anak Balita", porsiKecil: 75, porsiBesar: 0, alergiKecil: 2, alergiBesar: 0 },
   { id: "tk_paud_lb", label: "Siswa TK/PAUD/LB", porsiKecil: 191, porsiBesar: 0, alergiKecil: 5, alergiBesar: 0 },
   { id: "sd_kelas_1_3", label: "Siswa SD/MI/SLB Kelas 1-3", porsiKecil: 350, porsiBesar: 0, alergiKecil: 12, alergiBesar: 0 },
   { id: "sd_kelas_4_6", label: "Siswa SD/MI/SLB Kelas 4-6", porsiKecil: 0, porsiBesar: 420, alergiKecil: 0, alergiBesar: 15 },
@@ -230,16 +233,15 @@ export const DEFAULT_SASARAN_LIST: KelompokSasaranPM[] = [
   { id: "sma_smk_ma", label: "Siswa SMA/SMK/MK/MASMALB", porsiKecil: 0, porsiBesar: 280, alergiKecil: 0, alergiBesar: 8 },
   { id: "pendidik", label: "Pendidik", porsiKecil: 0, porsiBesar: 25, alergiKecil: 0, alergiBesar: 1 },
   { id: "tenaga_kependidikan", label: "Tenaga Pendidikan", porsiKecil: 0, porsiBesar: 15, alergiKecil: 0, alergiBesar: 0 },
-  { id: "anak_balita", label: "Anak Balita", porsiKecil: 75, porsiBesar: 0, alergiKecil: 2, alergiBesar: 0 },
-  { id: "anak_balita_13_59", label: "Anak Balita Usia 13-59 Bulan", porsiKecil: 90, porsiBesar: 0, alergiKecil: 3, alergiBesar: 0 },
-  { id: "balita_6_11", label: "Balita 6-11 Bulan", porsiKecil: 35, porsiBesar: 0, alergiKecil: 1, alergiBesar: 0 },
   { id: "ibu_hamil", label: "Ibu Hamil", porsiKecil: 0, porsiBesar: 42, alergiKecil: 0, alergiBesar: 1 },
-  { id: "ibu_menyusui", label: "Ibu Menyusui", porsiKecil: 0, porsiBesar: 38, alergiKecil: 0, alergiBesar: 1 }
+  { id: "ibu_menyusui", label: "Ibu Menyusui", porsiKecil: 0, porsiBesar: 38, alergiKecil: 0, alergiBesar: 1 },
+  { id: "sampel", label: "Sampel", porsiKecil: 0, porsiBesar: 0, alergiKecil: 0, alergiBesar: 0 }
 ];
 
 export const INITIAL_HARIAN_PM: HariPM[] = Array.from({ length: 10 }, (_, i) => ({
   hariKe: i + 1,
-  sasaran: DEFAULT_SASARAN_LIST.map(item => ({ ...item }))
+  sasaran: DEFAULT_SASARAN_LIST.map(item => ({ ...item })),
+  uraian: []
 }));
 
 export const EMPTY_SPPG_PROFILE: SPPGProfile = {
@@ -271,9 +273,75 @@ export const EMPTY_SASARAN_LIST: KelompokSasaranPM[] = DEFAULT_SASARAN_LIST.map(
   alergiBesar: 0
 }));
 
+export function normalizeSasaranList(list?: KelompokSasaranPM[]): KelompokSasaranPM[] {
+  const byId = new Map<string, KelompokSasaranPM>();
+  (Array.isArray(list) ? list : []).forEach((item) => {
+    if (item && item.id) {
+      byId.set(item.id, item);
+    }
+  });
+
+  const normalized: KelompokSasaranPM[] = EMPTY_SASARAN_LIST.map((def) => {
+    const existing = byId.get(def.id);
+    if (!existing) return { ...def };
+    return {
+      ...def,
+      porsiKecil: Number(existing.porsiKecil) || 0,
+      porsiBesar: Number(existing.porsiBesar) || 0,
+      alergiKecil: Number(existing.alergiKecil) || 0,
+      alergiBesar: Number(existing.alergiBesar) || 0,
+    };
+  });
+
+  // Keep any custom extra IDs at the end if present
+  const knownIds = new Set(EMPTY_SASARAN_LIST.map((d) => d.id));
+  (Array.isArray(list) ? list : []).forEach((item) => {
+    if (item && item.id && !knownIds.has(item.id)) {
+      normalized.push({
+        ...item,
+        porsiKecil: Number(item.porsiKecil) || 0,
+        porsiBesar: Number(item.porsiBesar) || 0,
+        alergiKecil: Number(item.alergiKecil) || 0,
+        alergiBesar: Number(item.alergiBesar) || 0,
+      });
+    }
+  });
+
+  return normalized;
+}
+
+export function normalizeHarianPM(days?: HariPM[]): HariPM[] {
+  if (!Array.isArray(days) || days.length === 0) {
+    return EMPTY_HARIAN_PM.map((d) => ({
+      hariKe: d.hariKe,
+      sasaran: d.sasaran.map((s) => ({ ...s })),
+      uraian: [],
+    }));
+  }
+  return days.map((day, idx) => ({
+    ...day,
+    hariKe: Number(day.hariKe) || idx + 1,
+    sasaran: normalizeSasaranList(day.sasaran),
+    uraian: Array.isArray(day.uraian)
+      ? day.uraian.map((u) => ({
+          ...u,
+          porsiBesar: Number(u.porsiBesar) || 0,
+          porsiKecil: Number(u.porsiKecil) || 0,
+          alergiBesar: Number(u.alergiBesar) || 0,
+          alergiKecil: Number(u.alergiKecil) || 0,
+          sampelBesar: Number(u.sampelBesar) || 0,
+          sampelKecil: Number(u.sampelKecil) || 0,
+          bumil: u.bumil !== undefined ? Number(u.bumil) || 0 : undefined,
+          busui: u.busui !== undefined ? Number(u.busui) || 0 : undefined,
+        }))
+      : [],
+  }));
+}
+
 export const EMPTY_HARIAN_PM: HariPM[] = Array.from({ length: 10 }, (_, i) => ({
   hariKe: i + 1,
-  sasaran: EMPTY_SASARAN_LIST.map(item => ({ ...item }))
+  sasaran: EMPTY_SASARAN_LIST.map(item => ({ ...item })),
+  uraian: []
 }));
 
 export const EMPTY_MASTER_MENU: MasterMenu = {

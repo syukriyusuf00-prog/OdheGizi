@@ -459,17 +459,26 @@ export default function NotaPesananLogistikTab({
       let pmKecil = 0;
       let pmBesar = 0;
 
-      (settings.porsiKecilSasaranIds || []).forEach((sId: string) => {
+      const kecilIds: string[] = settings.porsiKecilSasaranIds || [];
+      const besarIds: string[] = settings.porsiBesarSasaranIds || [];
+
+      kecilIds.forEach((sId: string) => {
         const sasItem = dayPM.sasaran.find((item) => item.id === sId);
         if (sasItem) {
-          pmKecil += (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+          const isShared = sId === "sampel" || besarIds.includes(sId);
+          pmKecil += isShared
+            ? Number(sasItem.porsiKecil) || 0
+            : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
         }
       });
 
-      (settings.porsiBesarSasaranIds || []).forEach((sId: string) => {
+      besarIds.forEach((sId: string) => {
         const sasItem = dayPM.sasaran.find((item) => item.id === sId);
         if (sasItem) {
-          pmBesar += (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+          const isShared = sId === "sampel" || kecilIds.includes(sId);
+          pmBesar += isShared
+            ? Number(sasItem.porsiBesar) || 0
+            : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
         }
       });
 
@@ -658,6 +667,7 @@ export default function NotaPesananLogistikTab({
         "tenaga_kependidikan",
         "ibu_hamil",
         "ibu_menyusui",
+        "sampel",
       ];
       const kecilSasaranIds = settings?.porsiKecilSasaranIds || [
         "tk_paud_lb",
@@ -665,6 +675,7 @@ export default function NotaPesananLogistikTab({
         "anak_balita",
         "anak_balita_13_59",
         "balita_6_11",
+        "sampel",
       ];
 
       dayNums.forEach((dayNum) => {
@@ -679,12 +690,17 @@ export default function NotaPesananLogistikTab({
           besarSasaranIds.forEach((sId: string) => {
             const sasItem = dayPM.sasaran?.find((item) => item.id === sId);
             if (sasItem) {
+              const isShared = sId === "sampel" || kecilSasaranIds.includes(sId);
               if (isAlergi) {
                 const cAlergi = Number(sasItem.alergiBesar) || 0;
-                const cNormal = (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+                const cNormal = isShared
+                  ? Number(sasItem.porsiBesar) || 0
+                  : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
                 pmBesar += cAlergi > 0 ? cAlergi : cNormal;
               } else {
-                pmBesar += (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+                pmBesar += isShared
+                  ? Number(sasItem.porsiBesar) || 0
+                  : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
               }
             }
           });
@@ -692,12 +708,17 @@ export default function NotaPesananLogistikTab({
           kecilSasaranIds.forEach((sId: string) => {
             const sasItem = dayPM.sasaran?.find((item) => item.id === sId);
             if (sasItem) {
+              const isShared = sId === "sampel" || besarSasaranIds.includes(sId);
               if (isAlergi) {
                 const cAlergi = Number(sasItem.alergiKecil) || 0;
-                const cNormal = (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+                const cNormal = isShared
+                  ? Number(sasItem.porsiKecil) || 0
+                  : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
                 pmKecil += cAlergi > 0 ? cAlergi : cNormal;
               } else {
-                pmKecil += (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+                pmKecil += isShared
+                  ? Number(sasItem.porsiKecil) || 0
+                  : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
               }
             }
           });

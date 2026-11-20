@@ -235,6 +235,32 @@ export interface TigaBPM {
   alergi?: number;   // Jumlah PM 3B alergi
 }
 
+export type UraianKategoriPM =
+  | "tk_paud_lb"
+  | "sd_mi_slb"
+  | "smp_mts_smplb"
+  | "sma_smk_ma"
+  | "pendidik"
+  | "tenaga_kependidikan"
+  | "posyandu_3b"
+  | "sampel";
+
+export interface UraianSasaranPM {
+  id: string;
+  nama: string; // Nama Sekolah, Nama Desa/Posyandu (3B), Tenaga Pendidikan, atau Sampel
+  tipeUnit: "sekolah" | "tiga_b" | "tenaga" | "sampel";
+  kategori: UraianKategoriPM;
+  balitaTargetId?: "anak_balita" | "anak_balita_13_59" | "balita_6_11";
+  bumil?: number; // Rincian Ibu Hamil (bagian dari Porsi Besar untuk unit 3B)
+  busui?: number; // Rincian Ibu Menyusui (bagian dari Porsi Besar untuk unit 3B)
+  porsiBesar: number;
+  porsiKecil: number;
+  alergiBesar: number;
+  alergiKecil: number;
+  sampelBesar: number;
+  sampelKecil: number;
+}
+
 export interface KelompokSasaranPM {
   id: string;
   label: string;
@@ -247,6 +273,7 @@ export interface KelompokSasaranPM {
 export interface HariPM {
   hariKe: number;
   sasaran: KelompokSasaranPM[];
+  uraian?: UraianSasaranPM[];
 }
 
 export interface MenuItem {
