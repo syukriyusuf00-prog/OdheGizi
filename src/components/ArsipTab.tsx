@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { onAuthStateChanged } from "firebase/auth";
 import {
   Archive,
   Calendar,
@@ -30,11 +31,15 @@ import {
   Users,
   X,
   AlertCircle,
+  ClipboardCheck,
+  Printer,
+  ArrowUpRight,
 } from "lucide-react";
 import {
   FoodCostDay,
   HariPM,
   MasterMenu,
+  SavedDocArchive,
   SekolahPM,
   SPPGProfile,
   TigaBPM,
@@ -42,6 +47,7 @@ import {
   UnifiedKopConfig,
   DEFAULT_UNIFIED_KOP_CONFIG,
 } from "../types";
+import { printElementSmart } from "../lib/printUtils";
 import { calculateDay, createTkpiMap, formatRupiah } from "../utils/calc";
 import {
   buildCategoryLabelFromIds,
@@ -60,8 +66,14 @@ import {
   DailyArchiveEntry,
   generateArchivePdfBlob,
 } from "../lib/archivePdf";
+import { auth } from "../lib/firebase";
 import {
+  cancelGoogleDriveConnect,
+  clearDriveSession,
   connectGoogleDrive,
+  DRIVE_OAUTH_AUDIENCE_URL,
+  DriveAuthErrorCode,
+  DriveConnectionError,
   DriveSessionInfo,
   DriveUploadResult,
   findOrCreateDriveFolder,
@@ -90,6 +102,9 @@ interface ArsipTabProps {
   bumbuPct?: number;
   userEmail?: string | null;
   isDemo?: boolean;
+  docArchives?: SavedDocArchive[];
+  setDocArchives?: React.Dispatch<React.SetStateAction<SavedDocArchive[]>>;
+  onOpenDocArchive?: (archive: SavedDocArchive) => void;
 }
 
 interface DriveArchiveLogItem {
@@ -497,13 +512,76 @@ export default function ArsipTab({
   bumbuPct = 10,
   userEmail,
   isDemo = false,
+  docArchives = [],
+  setDocArchives,
+  onOpenDocArchive,
 }: ArsipTabProps) {
   const [confirmPeriodAction, setConfirmPeriodAction] = useState<{
     kind: "load" | "delete";
     period: any;
   } | null>(null);
   const [showSavedHistory, setShowSavedHistory] = useState<boolean>(true);
+  const [docSourceFilter, setDocSourceFilter] = useState<"all" | "ikss" | "sop">("all");
+  const [docSearchQuery, setDocSearchQuery] = useState<string>("");
+  const [expandedDocArchiveIds, setExpandedDocArchiveIds] = useState<Record<string, boolean>>({});
+  const [confirmDeleteDocArchive, setConfirmDeleteDocArchive] = useState<SavedDocArchive | null>(null);
   const tkpiMap = useMemo(() => createTkpiMap(tkpiList), [tkpiList]);
+
+  const filteredDocArchives = useMemo(() => {
+    const q = docSearchQuery.trim().toLowerCase();
+    return docArchives.filter((arc) => {
+      if (docSourceFilter !== "all" && arc.source !== docSourceFilter) return false;
+      if (!q) return true;
+      return (
+        arc.title.toLowerCase().includes(q) ||
+        (arc.sasaranSummary || "").toLowerCase().includes(q) ||
+        (arc.periodeLabel || "").toLowerCase().includes(q) ||
+        (arc.worksheets || []).some((ws) => (ws.title || "").toLowerCase().includes(q))
+      );
+    });
+  }, [docArchives, docSourceFilter, docSearchQuery]);
+
+  const docArchiveCounts = useMemo(() => {
+    let ikss = 0;
+    let sop = 0;
+    docArchives.forEach((a) => {
+      if (a.source === "ikss") ikss += 1;
+      else if (a.source === "sop") sop += 1;
+    });
+    return { total: docArchives.length, ikss, sop };
+  }, [docArchives]);
+
+  const formatDocSavedTimestamp = (arc: SavedDocArchive): string => {
+    const raw = arc.savedAt || arc.createdAtIso || arc.createdAt || "";
+    if (!raw) return "-";
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return raw;
+    try {
+      return (
+        d.toLocaleString("id-ID", {
+          day: "numeric",
+          month: "short",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+        }) + " WIB"
+      );
+    } catch {
+      return raw;
+    }
+  };
+
+  const handlePrintDocArchive = (archive: SavedDocArchive) => {
+    const printId = `print-doc-archive-${archive.id}`;
+    if (!expandedDocArchiveIds[archive.id]) {
+      setExpandedDocArchiveIds((prev) => ({ ...prev, [archive.id]: true }));
+      setTimeout(() => {
+        printElementSmart(printId, { title: archive.title, paperSize });
+      }, 120);
+    } else {
+      printElementSmart(printId, { title: archive.title, paperSize });
+    }
+  };
 
   // Combine Active Planning Cycle + Historical Saved Periods into a monthly/daily index
   const allEntries = useMemo(() => {
@@ -575,6 +653,22 @@ export default function ArsipTab({
   const [driveSession, setDriveSession] = useState<DriveSessionInfo | null>(() => getDriveSession());
   const [isConnectingDrive, setIsConnectingDrive] = useState(false);
   const [driveError, setDriveError] = useState<string | null>(null);
+  const [driveErrorCode, setDriveErrorCode] = useState<DriveAuthErrorCode | null>(null);
+
+  // Sync in-memory Drive session state if primary Firebase Auth signs out
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (!firebaseUser) {
+        clearDriveSession();
+        setDriveSession(null);
+      } else {
+        setDriveSession(getDriveSession());
+      }
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, []);
 
   // Selection state: map of `${entry.id}::${category}` -> boolean
   const [selectedItemsMap, setSelectedItemsMap] = useState<Record<string, boolean>>({});
@@ -773,17 +867,36 @@ export default function ArsipTab({
     setTimeout(() => setSnapshotMessage(null), 5000);
   };
 
-  const handleConnectDrive = async () => {
+  const handleConnectDrive = async (skipLoginHint = false) => {
     setDriveError(null);
+    setDriveErrorCode(null);
     setIsConnectingDrive(true);
     try {
-      const session = await connectGoogleDrive(userEmail || undefined);
+      const session = await connectGoogleDrive(userEmail || undefined, { skipLoginHint });
       setDriveSession(session);
     } catch (err: any) {
-      setDriveError(err?.message || "Gagal menghubungkan Google Drive.");
+      if (err instanceof DriveConnectionError) {
+        setDriveErrorCode(err.code);
+        setDriveError(err.message);
+      } else {
+        setDriveErrorCode("unknown");
+        setDriveError(err?.message || "Gagal menghubungkan Google Drive.");
+      }
     } finally {
       setIsConnectingDrive(false);
     }
+  };
+
+  const handleCancelConnectDrive = () => {
+    cancelGoogleDriveConnect();
+    setIsConnectingDrive(false);
+  };
+
+  const handleDisconnectDrive = () => {
+    clearDriveSession();
+    setDriveSession(null);
+    setDriveError(null);
+    setDriveErrorCode(null);
   };
 
   const handleOpenSendConfirmation = () => {
@@ -1019,45 +1132,64 @@ export default function ArsipTab({
                 </div>
                 <button
                   type="button"
-                  onClick={handleConnectDrive}
+                  onClick={() => handleConnectDrive(true)}
                   disabled={isConnectingDrive}
-                  className="px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-bold border border-white/15 transition cursor-pointer"
+                  className="px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-bold border border-white/15 transition cursor-pointer disabled:opacity-60"
                 >
-                  Ganti Email Drive
+                  {isConnectingDrive ? "Menghubungkan..." : "Ganti Email Drive"}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleDisconnectDrive}
+                  disabled={isConnectingDrive}
+                  className="px-3 py-2 bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 rounded-xl text-xs font-bold border border-rose-400/30 transition cursor-pointer"
+                >
+                  Putuskan
                 </button>
               </div>
             ) : (
-              /* Official Google Sign-In Styled Button */
-              <button
-                type="button"
-                onClick={handleConnectDrive}
-                disabled={isConnectingDrive}
-                className="inline-flex items-center gap-2.5 bg-white hover:bg-slate-50 text-[#1F1F1F] border border-[#747775] px-4 py-2 rounded-xl text-xs font-bold shadow-sm transition cursor-pointer disabled:opacity-60"
-              >
-                {isConnectingDrive ? (
-                  <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-                ) : (
-                  <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
-                    <path
-                      fill="#4285F4"
-                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
-                    />
-                    <path
-                      fill="#34A853"
-                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24z"
-                    />
-                    <path
-                      fill="#FBBC05"
-                      d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14z"
-                    />
-                    <path
-                      fill="#EA4335"
-                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96z"
-                    />
-                  </svg>
+              <div className="flex flex-wrap items-center gap-2">
+                {/* Official Google Sign-In Styled Button */}
+                <button
+                  type="button"
+                  onClick={() => handleConnectDrive(false)}
+                  disabled={isConnectingDrive}
+                  className="inline-flex items-center gap-2.5 bg-white hover:bg-slate-50 text-[#1F1F1F] border border-[#747775] px-4 py-2 rounded-xl text-xs font-bold shadow-sm transition cursor-pointer disabled:opacity-60"
+                >
+                  {isConnectingDrive ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                  ) : (
+                    <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                      <path
+                        fill="#4285F4"
+                        d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17z"
+                      />
+                      <path
+                        fill="#34A853"
+                        d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24z"
+                      />
+                      <path
+                        fill="#FBBC05"
+                        d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14z"
+                      />
+                      <path
+                        fill="#EA4335"
+                        d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96z"
+                      />
+                    </svg>
+                  )}
+                  <span>{isConnectingDrive ? "Menghubungkan..." : "Sign in with Google (Drive)"}</span>
+                </button>
+                {isConnectingDrive && (
+                  <button
+                    type="button"
+                    onClick={handleCancelConnectDrive}
+                    className="px-3 py-2 bg-white/10 hover:bg-white/20 text-white rounded-xl text-xs font-bold border border-white/20 transition cursor-pointer"
+                  >
+                    Batal
+                  </button>
                 )}
-                <span>{isConnectingDrive ? "Menghubungkan..." : "Sign in with Google (Drive)"}</span>
-              </button>
+              </div>
             )}
           </div>
         </div>
@@ -1109,18 +1241,73 @@ export default function ArsipTab({
         </div>
 
         {driveError && (
-          <div className="bg-rose-500/15 border border-rose-400/40 text-rose-100 rounded-xl p-3 text-xs flex items-start justify-between gap-2">
-            <span className="flex items-start gap-2">
-              <AlertCircle className="w-4 h-4 text-rose-300 shrink-0 mt-0.5" />
-              <span>{driveError}</span>
-            </span>
-            <button
-              type="button"
-              onClick={() => setDriveError(null)}
-              className="text-rose-200 font-bold hover:underline shrink-0 cursor-pointer"
-            >
-              Tutup
-            </button>
+          <div className="bg-rose-500/15 border border-rose-400/40 text-rose-100 rounded-xl p-3.5 text-xs space-y-2.5">
+            <div className="flex items-start justify-between gap-2">
+              <span className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-300 shrink-0 mt-0.5" />
+                <span className="leading-relaxed">{driveError}</span>
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  setDriveError(null);
+                  setDriveErrorCode(null);
+                }}
+                className="text-rose-200 font-bold hover:underline shrink-0 cursor-pointer"
+              >
+                Tutup
+              </button>
+            </div>
+
+            {(driveErrorCode === "testing_access_denied" ||
+              driveErrorCode === "popup_closed" ||
+              driveErrorCode === "popup_timeout") && (
+              <div className="bg-slate-950/60 border border-white/10 rounded-lg p-3 space-y-2 text-[11px] text-slate-200">
+                <div className="font-bold text-amber-300">
+                  Panduan Mengatasi Error 403: access_denied (Google Verification / Testing Mode):
+                </div>
+                <ol className="list-decimal list-inside space-y-1 text-slate-300 leading-relaxed">
+                  <li>
+                    Buka{" "}
+                    <a
+                      href={DRIVE_OAUTH_AUDIENCE_URL}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-emerald-300 font-bold underline inline-flex items-center gap-0.5"
+                    >
+                      Google Auth Platform → Audience
+                      <ExternalLink className="w-3 h-3" />
+                    </a>{" "}
+                    (login sebagai pemilik project Google Cloud).
+                  </li>
+                  <li>
+                    Di bagian <strong>Test users</strong>, klik <strong>+ Add users</strong> lalu tambahkan email Google yang ingin dipakai{userEmail && userEmail.includes("@") && !userEmail.endsWith("@sispermbg.id") ? ` (${userEmail})` : ""}, atau klik <strong>Publish App</strong> agar semua akun Google dapat menghubungkan Drive.
+                  </li>
+                  <li>
+                    Atau gunakan akun Google tester/developer yang sudah terdaftar dengan menekan tombol di bawah ini:
+                  </li>
+                </ol>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => handleConnectDrive(true)}
+                    disabled={isConnectingDrive}
+                    className="px-3 py-1.5 bg-white text-slate-900 hover:bg-slate-100 rounded-lg font-bold text-[11px] inline-flex items-center gap-1.5 cursor-pointer transition disabled:opacity-60"
+                  >
+                    Pilih Akun Google Lain (Tanpa Hint Email)
+                  </button>
+                  <a
+                    href={DRIVE_OAUTH_AUDIENCE_URL}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-3 py-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-400/40 text-emerald-200 rounded-lg font-bold text-[11px] inline-flex items-center gap-1 transition"
+                  >
+                    Buka Google Auth Audience
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -1736,6 +1923,277 @@ export default function ArsipTab({
         </div>
       )}
 
+      {/* ARSIP LEMBAR KERJA MENU IKSS & FORM SOP */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <div className="p-2.5 bg-teal-50 rounded-xl text-teal-600 shrink-0">
+              <ClipboardCheck className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-extrabold text-slate-900">
+                Arsip Lembar Kerja Menu IKSS &amp; Form SOP
+              </h3>
+              <p className="text-xs text-slate-500">
+                Kumpulan lembar kerja per kelompok sasaran yang disimpan dari tombol <strong>Simpan Arsip</strong> di Menu IKSS dan Form SOP.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setDocSourceFilter("all")}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer ${
+                docSourceFilter === "all"
+                  ? "bg-slate-900 text-white border-slate-900"
+                  : "bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100"
+              }`}
+            >
+              Semua ({docArchiveCounts.total})
+            </button>
+            <button
+              type="button"
+              onClick={() => setDocSourceFilter("ikss")}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer ${
+                docSourceFilter === "ikss"
+                  ? "bg-emerald-600 text-white border-emerald-600"
+                  : "bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100"
+              }`}
+            >
+              Menu IKSS ({docArchiveCounts.ikss})
+            </button>
+            <button
+              type="button"
+              onClick={() => setDocSourceFilter("sop")}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer ${
+                docSourceFilter === "sop"
+                  ? "bg-cyan-600 text-white border-cyan-600"
+                  : "bg-cyan-50 text-cyan-700 border-cyan-200 hover:bg-cyan-100"
+              }`}
+            >
+              Form SOP ({docArchiveCounts.sop})
+            </button>
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={docSearchQuery}
+                onChange={(e) => setDocSearchQuery(e.target.value)}
+                placeholder="Cari arsip IKSS / SOP..."
+                className="pl-8 pr-3 py-1.5 rounded-xl border border-slate-200 text-xs bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-teal-500/30 w-48 sm:w-56"
+              />
+            </div>
+          </div>
+        </div>
+
+        {filteredDocArchives.length === 0 ? (
+          <div className="p-6 text-center rounded-xl border border-dashed border-slate-200 bg-slate-50/50 text-xs text-slate-500">
+            {docArchives.length === 0
+              ? 'Belum ada arsip Menu IKSS atau Form SOP tersimpan. Buka tab Menu IKSS atau Form SOP, pilih kelompok sasaran yang diinginkan, lalu klik "Simpan Arsip".'
+              : "Tidak ada arsip Menu IKSS / Form SOP yang cocok dengan filter atau pencarian."}
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {filteredDocArchives.map((arc) => {
+              const isExpanded = Boolean(expandedDocArchiveIds[arc.id]);
+              const isIkss = arc.source === "ikss";
+              return (
+                <div
+                  key={arc.id}
+                  className="rounded-xl border border-slate-200 bg-slate-50/50 overflow-hidden"
+                >
+                  <div className="p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3 bg-white">
+                    <div className="space-y-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`px-2 py-0.5 rounded-md text-[10px] font-extrabold uppercase tracking-wider border ${
+                            isIkss
+                              ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                              : "bg-cyan-50 text-cyan-700 border-cyan-200"
+                          }`}
+                        >
+                          {isIkss ? "Menu IKSS" : "Form SOP"}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-md text-[10px] font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
+                          {(arc.worksheets || []).length} Lembar Kerja
+                        </span>
+                        {arc.periodeLabel && (
+                          <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold bg-slate-100 text-slate-700">
+                            {arc.periodeLabel}
+                          </span>
+                        )}
+                      </div>
+                      <h4 className="font-bold text-slate-900 text-xs sm:text-sm truncate">
+                        {arc.title}
+                      </h4>
+                      <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-500">
+                        <span className="flex items-center gap-1">
+                          <Users className="w-3.5 h-3.5 text-slate-400" />
+                          {arc.sasaranSummary || "Umum"}
+                        </span>
+                        <span className="flex items-center gap-1">
+                          <Clock className="w-3.5 h-3.5 text-slate-400" />
+                          Disimpan: {formatDocSavedTimestamp(arc)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setExpandedDocArchiveIds((prev) => ({
+                            ...prev,
+                            [arc.id]: !prev[arc.id],
+                          }))
+                        }
+                        className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold inline-flex items-center gap-1 transition cursor-pointer"
+                      >
+                        {isExpanded ? (
+                          <>
+                            <ChevronDown className="w-3.5 h-3.5" />
+                            <span>Tutup Tabel</span>
+                          </>
+                        ) : (
+                          <>
+                            <ChevronRight className="w-3.5 h-3.5" />
+                            <span>Pratinjau Tabel</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handlePrintDocArchive(arc)}
+                        className="px-3 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-xl text-xs font-bold inline-flex items-center gap-1 transition cursor-pointer"
+                      >
+                        <Printer className="w-3.5 h-3.5" />
+                        <span>Cetak</span>
+                      </button>
+
+                      {onOpenDocArchive && (
+                        <button
+                          type="button"
+                          onClick={() => onOpenDocArchive(arc)}
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold inline-flex items-center gap-1 transition cursor-pointer"
+                        >
+                          <ArrowUpRight className="w-3.5 h-3.5" />
+                          <span>Buka ke Lembar Kerja</span>
+                        </button>
+                      )}
+
+                      {setDocArchives && (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteDocArchive(arc)}
+                          title="Hapus Arsip"
+                          className="p-1.5 text-rose-500 hover:bg-rose-50 rounded-xl transition cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {isExpanded && (
+                    <div
+                      id={`print-doc-archive-${arc.id}`}
+                      className="p-4 border-t border-slate-200 bg-slate-50/70 space-y-5"
+                    >
+                      <div className="border-b border-slate-300 pb-2">
+                        <h5 className="font-extrabold text-sm text-slate-900">{arc.title}</h5>
+                        <p className="text-[11px] text-slate-600">
+                          {arc.sppgName ? `${arc.sppgName} • ` : ""}
+                          {arc.idSppg ? `ID SPPG: ${arc.idSppg} • ` : ""}
+                          Periode: {arc.periodeLabel || "-"}
+                        </p>
+                      </div>
+
+                      {(arc.worksheets || []).map((ws, wsIdx) => {
+                        const cols = ws.columns || ws.headers || [];
+                        return (
+                          <div
+                            key={ws.id || `${arc.id}_ws_${wsIdx}`}
+                            className={`bg-white rounded-xl border border-slate-200 p-3.5 space-y-2 ${
+                              wsIdx > 0 ? "print:break-before-page" : ""
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div>
+                                <div className="text-xs font-extrabold text-slate-900">
+                                  {ws.title}
+                                </div>
+                                {(ws.subLabel || ws.subtitle || ws.sasaranLabel) && (
+                                  <div className="text-[11px] text-slate-500">
+                                    {[ws.sasaranLabel, ws.subLabel || ws.subtitle]
+                                      .filter(Boolean)
+                                      .join(" · ")}
+                                  </div>
+                                )}
+                              </div>
+                              <span className="text-[10px] font-bold text-slate-500 bg-slate-100 px-2 py-0.5 rounded-md">
+                                Lembar {wsIdx + 1} dari {arc.worksheets.length}
+                              </span>
+                            </div>
+
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-[11px] text-left border-collapse">
+                                {cols.length > 0 && (
+                                  <thead className="bg-slate-100 text-slate-800">
+                                    <tr>
+                                      {cols.map((col, ci) => (
+                                        <th
+                                          key={ci}
+                                          className="p-2 border border-slate-300 font-bold whitespace-nowrap"
+                                        >
+                                          {col}
+                                        </th>
+                                      ))}
+                                    </tr>
+                                  </thead>
+                                )}
+                                <tbody>
+                                  {(ws.rows || []).length === 0 ? (
+                                    <tr>
+                                      <td
+                                        colSpan={Math.max(cols.length, 1)}
+                                        className="p-3 border border-slate-200 text-center text-slate-400 italic"
+                                      >
+                                        Tidak ada baris data pada lembar kerja ini.
+                                      </td>
+                                    </tr>
+                                  ) : (
+                                    (ws.rows || []).map((row, ri) => (
+                                      <tr key={ri} className="hover:bg-slate-50/70">
+                                        {row.map((cell, ci) => (
+                                          <td
+                                            key={ci}
+                                            className="p-1.5 border border-slate-200 text-slate-700 align-top"
+                                          >
+                                            {cell === null || cell === undefined || cell === ""
+                                              ? "-"
+                                              : String(cell)}
+                                          </td>
+                                        ))}
+                                      </tr>
+                                    ))
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {/* RIWAYAT SNAPSHOT ARSIP DOKUMEN CLOUD (BUKA / PULIHKAN PERENCANAAN) */}
       <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1841,6 +2299,58 @@ export default function ArsipTab({
           </div>
         )}
       </div>
+
+      {/* IN-APP CONFIRMATION MODAL FOR DELETING SAVED IKSS / SOP ARCHIVE */}
+      {confirmDeleteDocArchive && (
+        <div className="fixed inset-0 z-[99999] bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-md w-full p-6 space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h4 className="text-base font-bold text-slate-900">
+                  Hapus Arsip Lembar Kerja?
+                </h4>
+                <p className="text-xs text-slate-500 mt-1">
+                  Arsip &ldquo;{confirmDeleteDocArchive.title}&rdquo; akan dihapus permanen dari Menu Arsip.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteDocArchive(null)}
+                className="p-1 text-slate-400 hover:text-slate-700 rounded-lg cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteDocArchive(null)}
+                className="px-4 py-2 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (setDocArchives && confirmDeleteDocArchive) {
+                    setDocArchives((prev) =>
+                      prev.filter((item) => item.id !== confirmDeleteDocArchive.id)
+                    );
+                    setSnapshotMessage({
+                      type: "success",
+                      text: `Arsip "${confirmDeleteDocArchive.title}" telah dihapus.`,
+                    });
+                  }
+                  setConfirmDeleteDocArchive(null);
+                }}
+                className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold cursor-pointer"
+              >
+                Ya, Hapus Permanen
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* IN-APP CONFIRMATION MODAL FOR OPENING OR DELETING SAVED ARCHIVE */}
       {confirmPeriodAction && (

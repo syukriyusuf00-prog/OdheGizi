@@ -19,6 +19,14 @@ import { EMPTY_SASARAN_LIST, normalizeSasaranList } from "../initialData";
 import { formatIndonesianDate } from "../utils/menuSchedule";
 import { computeSasaranBreakdown } from "../utils/calc";
 import {
+  validatePortionString,
+  isRawNegativeInput,
+  computeRegisteredSchoolCapacity,
+  computeActiveSchoolPortions,
+  getUraianRowTotal,
+  SCHOOL_URAIAN_KATEGORI,
+} from "../utils/pmValidation";
+import {
   Calendar,
   CalendarDays,
   Download,
@@ -26,6 +34,9 @@ import {
   Copy,
   RotateCcw,
   AlertTriangle,
+  AlertCircle,
+  ShieldCheck,
+  SlidersHorizontal,
   Users,
   Settings,
   ChevronDown,
@@ -47,6 +58,9 @@ import {
   X,
   Table2,
   Database,
+  Save,
+  CheckCircle2,
+  ArrowRight,
 } from "lucide-react";
 import * as XLSX from "xlsx";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
@@ -87,6 +101,10 @@ interface PenerimaManfaatTabProps {
   setPaperSize?: (val: "A4" | "F4") => void;
   kopConfig?: UnifiedKopConfig;
   isAdmin?: boolean;
+  isOnboardingStep?: boolean;
+  onSavePM?: () => Promise<void> | void;
+  onGoToMasterMenu?: () => void;
+  onGoToDashboard?: () => void;
 }
 
 type InputModeTab = "sekolah" | "tiga_b" | "tenaga" | "sampel";
@@ -221,10 +239,16 @@ export default function PenerimaManfaatTab({
   rightLogoCrop = { top: 0, bottom: 0, left: 0, right: 0 },
   paperSize = "A4",
   kopConfig = DEFAULT_UNIFIED_KOP_CONFIG,
+  isOnboardingStep = false,
+  onSavePM,
+  onGoToMasterMenu,
+  onGoToDashboard,
 }: PenerimaManfaatTabProps) {
   const [selectedDay, setSelectedDay] = useState<number>(1);
   const [alertMsg, setAlertMsg] = useState<{ type: "success" | "info" | "error"; text: string } | null>(null);
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
+  const [isSavingPM, setIsSavingPM] = useState<boolean>(false);
+  const [pmSavedDone, setPmSavedDone] = useState<boolean>(false);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
   const [confirmAction, setConfirmAction] = useState<"copy_all" | "reset_day" | null>(null);
 
@@ -252,6 +276,26 @@ export default function PenerimaManfaatTab({
   const [formSampelChoice, setFormSampelChoice] = useState<SampelChoiceMode>("none");
   const [formSampelBesar, setFormSampelBesar] = useState<string>("");
   const [formSampelKecil, setFormSampelKecil] = useState<string>("");
+
+  // Capacity validation & inline cell error feedback state
+  const [manualSchoolCapacity, setManualSchoolCapacity] = useState<number | null>(() => {
+    try {
+      const saved = localStorage.getItem("sisper_manual_school_capacity");
+      if (!saved) return null;
+      const parsed = parseInt(saved, 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+    } catch {
+      return null;
+    }
+  });
+  const [showCapacityEditor, setShowCapacityEditor] = useState<boolean>(false);
+  const [capacityInputDraft, setCapacityInputDraft] = useState<string>("");
+  const [capacityInputError, setCapacityInputError] = useState<string | null>(null);
+  const [inlineCellError, setInlineCellError] = useState<{
+    cellKey: string;
+    table: "tabel1" | "tabel2";
+    message: string;
+  } | null>(null);
 
   const totalDays = Math.max(profile?.periodeDates?.length || 0, 1);
   const effectiveTotalDays =
@@ -427,6 +471,296 @@ export default function PenerimaManfaatTab({
       maximumFractionDigits: 0,
     }).format(num);
 
+  // Registered school capacity & active-day utilization validation
+  const capacityInfo = useMemo(
+    () => computeRegisteredSchoolCapacity(sekolahPM, tigaBPM, manualSchoolCapacity),
+    [sekolahPM, tigaBPM, manualSchoolCapacity]
+  );
+
+  const activeSchoolPortions = useMemo(
+    () => computeActiveSchoolPortions(activeSasaran),
+    [activeSasaran]
+  );
+
+  const dayCapacityStatus = useMemo(() => {
+    const cap = capacityInfo.effectiveSchoolCapacity;
+    const usedSchool = activeSchoolPortions.schoolWithSampleTotal;
+    const pct = cap > 0 ? Math.round((usedSchool / cap) * 1000) / 10 : 0;
+    const excessSchool = cap > 0 ? Math.max(0, usedSchool - cap) : 0;
+    const isSchoolOver = cap > 0 && usedSchool > cap;
+
+    const combinedCap = capacityInfo.effectiveCombinedCapacity;
+    const isCombinedOver = combinedCap > 0 && totalPM > combinedCap;
+    const excessCombined = combinedCap > 0 ? Math.max(0, totalPM - combinedCap) : 0;
+    const isOver = isSchoolOver || isCombinedOver;
+    const isNear = cap > 0 && !isOver && pct >= 85;
+
+    return {
+      capacity: cap,
+      usedSchool,
+      pct,
+      excessSchool,
+      isSchoolOver,
+      combinedCap,
+      isCombinedOver,
+      excessCombined,
+      isOver,
+      isNear,
+    };
+  }, [capacityInfo, activeSchoolPortions, totalPM]);
+
+  // Live form validation for Panel Input Khusus (non-negative + capacity projection)
+  const formValidation = useMemo(() => {
+    const bumil =
+      inputMode === "tiga_b"
+        ? validatePortionString(formBumil, "Ibu Hamil (3B)")
+        : validatePortionString("", "Ibu Hamil (3B)");
+    const busui =
+      inputMode === "tiga_b"
+        ? validatePortionString(formBusui, "Ibu Menyusui (3B)")
+        : validatePortionString("", "Ibu Menyusui (3B)");
+    const porsiBesar =
+      inputMode !== "tiga_b" && inputMode !== "sampel"
+        ? validatePortionString(formPorsiBesar, "Porsi Besar")
+        : validatePortionString("", "Porsi Besar");
+    const porsiKecil =
+      inputMode !== "sampel"
+        ? validatePortionString(formPorsiKecil, "Porsi Kecil")
+        : validatePortionString("", "Porsi Kecil");
+    const alergiBesar =
+      inputMode !== "sampel"
+        ? validatePortionString(formAlergiBesar, "Alergi Porsi Besar")
+        : validatePortionString("", "Alergi Porsi Besar");
+    const alergiKecil =
+      inputMode !== "sampel"
+        ? validatePortionString(formAlergiKecil, "Alergi Porsi Kecil")
+        : validatePortionString("", "Alergi Porsi Kecil");
+    const sampelBesar =
+      formSampelChoice === "besar" || formSampelChoice === "both"
+        ? validatePortionString(formSampelBesar, "Sampel Porsi Besar")
+        : validatePortionString("", "Sampel Porsi Besar");
+    const sampelKecil =
+      formSampelChoice === "kecil" || formSampelChoice === "both"
+        ? validatePortionString(formSampelKecil, "Sampel Porsi Kecil")
+        : validatePortionString("", "Sampel Porsi Kecil");
+
+    const fields = {
+      bumil,
+      busui,
+      porsiBesar,
+      porsiKecil,
+      alergiBesar,
+      alergiKecil,
+      sampelBesar,
+      sampelKecil,
+    };
+
+    const invalidErrors = Object.values(fields)
+      .filter((f) => !f.isValid && f.error)
+      .map((f) => f.error as string);
+    const hasNegativeOrInvalid = invalidErrors.length > 0;
+
+    // Draft numeric values (safe >= 0)
+    const draftBesar =
+      inputMode === "tiga_b"
+        ? bumil.value + busui.value
+        : inputMode === "sampel"
+        ? 0
+        : porsiBesar.value;
+    const draftKecil = inputMode === "sampel" ? 0 : porsiKecil.value;
+    const draftAlergiBesar = inputMode === "sampel" ? 0 : alergiBesar.value;
+    const draftAlergiKecil = inputMode === "sampel" ? 0 : alergiKecil.value;
+    const draftSampelBesar = sampelBesar.value;
+    const draftSampelKecil = sampelKecil.value;
+    const draftSampelTotal = draftSampelBesar + draftSampelKecil;
+    const draftRowTotal =
+      draftBesar + draftKecil + draftAlergiBesar + draftAlergiKecil + draftSampelTotal;
+
+    const editingPrevRow = editingRowId
+      ? activeUraian.find((u) => u.id === editingRowId)
+      : undefined;
+    const prevRowTotal = editingPrevRow ? getUraianRowTotal(editingPrevRow) : 0;
+    const prevRowIsSchool = editingPrevRow
+      ? SCHOOL_URAIAN_KATEGORI.has(editingPrevRow.kategori)
+      : false;
+    const prevRowSchoolAndSample = editingPrevRow
+      ? prevRowIsSchool
+        ? prevRowTotal
+        : (Number(editingPrevRow.sampelBesar) || 0) +
+          (Number(editingPrevRow.sampelKecil) || 0) +
+          (editingPrevRow.kategori === "sampel"
+            ? (Number(editingPrevRow.porsiBesar) || 0) +
+              (Number(editingPrevRow.porsiKecil) || 0) +
+              (Number(editingPrevRow.alergiBesar) || 0) +
+              (Number(editingPrevRow.alergiKecil) || 0)
+            : 0)
+      : 0;
+
+    const draftIsSchool = inputMode === "sekolah" && SCHOOL_URAIAN_KATEGORI.has(formKategori);
+    const draftSchoolAndSample = draftIsSchool
+      ? draftRowTotal
+      : draftSampelTotal;
+
+    const projectedSchoolWithSample = Math.max(
+      0,
+      activeSchoolPortions.schoolWithSampleTotal - prevRowSchoolAndSample + draftSchoolAndSample
+    );
+    const projectedTotalPM = Math.max(0, totalPM - prevRowTotal + draftRowTotal);
+
+    const matchedSchool =
+      inputMode === "sekolah" && formNama.trim()
+        ? capacityInfo.byName.get(formNama.trim().toLowerCase()) || null
+        : null;
+
+    const perSchoolExceeds = Boolean(matchedSchool && draftRowTotal > matchedSchool.total);
+    const perSchoolExcess = matchedSchool
+      ? Math.max(0, draftRowTotal - matchedSchool.total)
+      : 0;
+
+    const cap = capacityInfo.effectiveSchoolCapacity;
+    const exceedsTotalSchoolCap =
+      cap > 0 && (projectedSchoolWithSample > cap || draftRowTotal > cap);
+    const totalSchoolExcess =
+      cap > 0 ? Math.max(0, Math.max(projectedSchoolWithSample, draftRowTotal) - cap) : 0;
+
+    const combinedCap = capacityInfo.effectiveCombinedCapacity;
+    const exceedsCombinedCap = combinedCap > 0 && projectedTotalPM > combinedCap;
+    const combinedExcess =
+      combinedCap > 0 ? Math.max(0, projectedTotalPM - combinedCap) : 0;
+
+    const hasCapacityWarning =
+      !hasNegativeOrInvalid &&
+      draftRowTotal > 0 &&
+      (perSchoolExceeds || exceedsTotalSchoolCap || exceedsCombinedCap);
+
+    return {
+      fields,
+      invalidErrors,
+      hasNegativeOrInvalid,
+      draftRowTotal,
+      projectedSchoolWithSample,
+      projectedTotalPM,
+      matchedSchool,
+      perSchoolExceeds,
+      perSchoolExcess,
+      exceedsTotalSchoolCap,
+      totalSchoolExcess,
+      exceedsCombinedCap,
+      combinedExcess,
+      hasCapacityWarning,
+    };
+  }, [
+    inputMode,
+    formNama,
+    formKategori,
+    formBumil,
+    formBusui,
+    formPorsiBesar,
+    formPorsiKecil,
+    formAlergiBesar,
+    formAlergiKecil,
+    formSampelChoice,
+    formSampelBesar,
+    formSampelKecil,
+    editingRowId,
+    activeUraian,
+    activeSchoolPortions.schoolWithSampleTotal,
+    totalPM,
+    capacityInfo,
+  ]);
+
+  const triggerInlineCellError = (
+    cellKey: string,
+    table: "tabel1" | "tabel2",
+    message: string
+  ) => {
+    setInlineCellError({ cellKey, table, message });
+    setTimeout(() => {
+      setInlineCellError((prev) => (prev?.cellKey === cellKey ? null : prev));
+    }, 4000);
+  };
+
+  // Prevent scientific notation & decimal characters in Panel Input Khusus (keep '-' so explicit red validation shows)
+  const handleFormNumericKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (["e", "E", "+", ".", ","].includes(e.key)) {
+      e.preventDefault();
+    }
+  };
+
+  // Strictly block negative sign & scientific notation in Tabel 1 & Tabel 2 inline cells with instant visual feedback
+  const handleTableNumericKeyDown = (
+    e: React.KeyboardEvent<HTMLInputElement>,
+    cellKey: string,
+    table: "tabel1" | "tabel2"
+  ) => {
+    if (e.key === "-") {
+      e.preventDefault();
+      triggerInlineCellError(
+        cellKey,
+        table,
+        "Nilai jumlah porsi tidak boleh negatif (minimal 0)."
+      );
+      return;
+    }
+    if (["e", "E", "+", ".", ","].includes(e.key)) {
+      e.preventDefault();
+    }
+  };
+
+  // 1-click fix for all negative / invalid fields in Panel Input Khusus
+  const handleFixNegativeFormFields = () => {
+    if (!formValidation.fields.bumil.isValid) setFormBumil("0");
+    if (!formValidation.fields.busui.isValid) setFormBusui("0");
+    if (!formValidation.fields.porsiBesar.isValid) setFormPorsiBesar("0");
+    if (!formValidation.fields.porsiKecil.isValid) setFormPorsiKecil("0");
+    if (!formValidation.fields.alergiBesar.isValid) setFormAlergiBesar("0");
+    if (!formValidation.fields.alergiKecil.isValid) setFormAlergiKecil("0");
+    if (!formValidation.fields.sampelBesar.isValid) setFormSampelBesar("0");
+    if (!formValidation.fields.sampelKecil.isValid) setFormSampelKecil("0");
+  };
+
+  const handleSaveManualCapacity = () => {
+    const check = validatePortionString(capacityInputDraft, "Kapasitas total sekolah");
+    if (!check.isValid) {
+      setCapacityInputError(check.error);
+      return;
+    }
+    if (check.value <= 0) {
+      setCapacityInputError("Masukkan kapasitas lebih dari 0, atau klik Reset untuk memakai data sekolah terdaftar.");
+      return;
+    }
+    setManualSchoolCapacity(check.value);
+    try {
+      localStorage.setItem("sisper_manual_school_capacity", String(check.value));
+    } catch {
+      // ignore storage errors
+    }
+    setCapacityInputError(null);
+    setShowCapacityEditor(false);
+    triggerAlert(
+      "success",
+      `Batas kapasitas total sekolah diatur ke ${check.value.toLocaleString("id-ID")} porsi.`
+    );
+  };
+
+  const handleResetManualCapacity = () => {
+    setManualSchoolCapacity(null);
+    try {
+      localStorage.removeItem("sisper_manual_school_capacity");
+    } catch {
+      // ignore storage errors
+    }
+    setCapacityInputDraft("");
+    setCapacityInputError(null);
+    setShowCapacityEditor(false);
+    triggerAlert(
+      "info",
+      capacityInfo.registeredTotal > 0
+        ? `Kapasitas dikembalikan ke data ${capacityInfo.schoolCount} sekolah terdaftar (${capacityInfo.registeredTotal.toLocaleString("id-ID")} porsi).`
+        : "Batas kapasitas manual telah dihapus."
+    );
+  };
+
   // Switch mode tab in Dedicated Input Panel
   const handleSelectInputMode = (mode: InputModeTab) => {
     setInputMode(mode);
@@ -518,25 +852,36 @@ export default function PenerimaManfaatTab({
       return;
     }
 
-    const parsedAlergiBesar = Math.max(0, parseInt(formAlergiBesar, 10) || 0);
-    const parsedAlergiKecil = Math.max(0, parseInt(formAlergiKecil, 10) || 0);
-    const parsedSampelBesar =
-      formSampelChoice === "besar" || formSampelChoice === "both"
-        ? Math.max(0, parseInt(formSampelBesar, 10) || 0)
-        : 0;
-    const parsedSampelKecil =
-      formSampelChoice === "kecil" || formSampelChoice === "both"
-        ? Math.max(0, parseInt(formSampelKecil, 10) || 0)
-        : 0;
+    // Strict non-negative & integer validation across all portion fields
+    if (formValidation.hasNegativeOrInvalid) {
+      triggerAlert(
+        "error",
+        `Gagal menyimpan — nilai tidak valid: ${formValidation.invalidErrors.join(" ")}`
+      );
+      return;
+    }
 
-    let finalPorsiBesar = Math.max(0, parseInt(formPorsiBesar, 10) || 0);
-    let finalPorsiKecil = Math.max(0, parseInt(formPorsiKecil, 10) || 0);
+    const parsedAlergiBesar = formValidation.fields.alergiBesar.value;
+    const parsedAlergiKecil = formValidation.fields.alergiKecil.value;
+    const parsedSampelBesar = formValidation.fields.sampelBesar.value;
+    const parsedSampelKecil = formValidation.fields.sampelKecil.value;
+
+    if (inputMode === "sampel" && parsedSampelBesar + parsedSampelKecil <= 0) {
+      triggerAlert(
+        "error",
+        "Mohon isi minimal 1 porsi Sampel (Porsi Besar atau Porsi Kecil) yang bernilai positif."
+      );
+      return;
+    }
+
+    let finalPorsiBesar = formValidation.fields.porsiBesar.value;
+    let finalPorsiKecil = formValidation.fields.porsiKecil.value;
     let bumilVal: number | undefined;
     let busuiVal: number | undefined;
 
     if (inputMode === "tiga_b") {
-      const b = Math.max(0, parseInt(formBumil, 10) || 0);
-      const s = Math.max(0, parseInt(formBusui, 10) || 0);
+      const b = formValidation.fields.bumil.value;
+      const s = formValidation.fields.busui.value;
       bumilVal = b;
       busuiVal = s;
       finalPorsiBesar = b + s;
@@ -570,12 +915,19 @@ export default function PenerimaManfaatTab({
     const nextSasaran = recalculateSasaranFromUraian(nextUraian);
     commitActiveDayUpdate(nextSasaran, nextUraian);
 
-    triggerAlert(
-      "success",
-      editingRowId
-        ? `Data "${cleanedName}" diperbarui & Tabel 2 Rekapitulasi otomatis tersinkron.`
-        : `"${cleanedName}" berhasil ditambahkan ke Tabel 1 & direkap otomatis ke Tabel 2!`
-    );
+    if (formValidation.hasCapacityWarning) {
+      triggerAlert(
+        "info",
+        `"${cleanedName}" disimpan, namun jumlah porsi saat ini melebihi kapasitas sekolah terdaftar. Mohon tinjau kembali peringatan kapasitas.`
+      );
+    } else {
+      triggerAlert(
+        "success",
+        editingRowId
+          ? `Data "${cleanedName}" diperbarui & Tabel 2 Rekapitulasi otomatis tersinkron.`
+          : `"${cleanedName}" berhasil ditambahkan ke Tabel 1 & direkap otomatis ke Tabel 2!`
+      );
+    }
     resetInputForm();
   };
 
@@ -606,12 +958,20 @@ export default function PenerimaManfaatTab({
     setFormSampelKecil(row.sampelKecil ? String(row.sampelKecil) : "");
   };
 
-  // Inline edit inside Tabel 1 -> auto-syncs Tabel 2 immediately
+  // Inline edit inside Tabel 1 -> auto-syncs Tabel 2 immediately with non-negative guard
   const handleUraianInlineChange = (
     rowId: string,
     field: "nama" | "porsiBesar" | "porsiKecil" | "alergiBesar" | "alergiKecil" | "sampelBesar" | "sampelKecil",
     rawValue: string
   ) => {
+    if (field !== "nama" && isRawNegativeInput(rawValue)) {
+      triggerInlineCellError(
+        `t1-${rowId}-${field}`,
+        "tabel1",
+        "Nilai jumlah porsi tidak boleh negatif (minimal 0)."
+      );
+      return;
+    }
     const nextUraian = activeUraian.map((u) => {
       if (u.id !== rowId) return u;
       if (field === "nama") {
@@ -719,14 +1079,23 @@ export default function PenerimaManfaatTab({
     triggerAlert("success", "Tabel 2 (Rekapitulasi Keseluruhan) berhasil disinkronkan 100% dari Tabel 1.");
   };
 
-  // Direct inline edit on Tabel 2 (Rekapitulasi Keseluruhan)
+  // Direct inline edit on Tabel 2 (Rekapitulasi Keseluruhan) with non-negative guard
   const handleCellChangeTable2 = (
     id: string,
     field: "porsiKecil" | "porsiBesar" | "alergiKecil" | "alergiBesar",
-    value: number
+    rawValue: string
   ) => {
+    if (isRawNegativeInput(rawValue)) {
+      triggerInlineCellError(
+        `t2-${id}-${field}`,
+        "tabel2",
+        "Nilai jumlah porsi tidak boleh negatif (minimal 0)."
+      );
+      return;
+    }
+    const cleanVal = Math.max(0, parseInt(rawValue, 10) || 0);
     const updatedSasaran = activeSasaran.map((s) =>
-      s.id === id ? { ...s, [field]: Math.max(0, value) } : s
+      s.id === id ? { ...s, [field]: cleanVal } : s
     );
     commitActiveDayUpdate(updatedSasaran, activeUraian);
   };
@@ -925,10 +1294,10 @@ export default function PenerimaManfaatTab({
 
                 return {
                   ...s,
-                  porsiKecil: Number(row["Porsi Kecil"] ?? s.porsiKecil) || 0,
-                  porsiBesar: Number(row["Porsi Besar"] ?? s.porsiBesar) || 0,
-                  alergiKecil: Number(importedAlergiKecil) || 0,
-                  alergiBesar: Number(importedAlergiBesar) || 0,
+                  porsiKecil: Math.max(0, Number(row["Porsi Kecil"] ?? s.porsiKecil) || 0),
+                  porsiBesar: Math.max(0, Number(row["Porsi Besar"] ?? s.porsiBesar) || 0),
+                  alergiKecil: Math.max(0, Number(importedAlergiKecil) || 0),
+                  alergiBesar: Math.max(0, Number(importedAlergiBesar) || 0),
                 };
               }
               return s;
@@ -978,10 +1347,92 @@ export default function PenerimaManfaatTab({
   // Helper to show blank on 0 in numeric inputs (matching Gambar 1 & Gambar 2 clean look)
   const numInputVal = (val: number) => (val > 0 ? String(val) : "");
 
-  const previewBesar3B = (parseInt(formBumil, 10) || 0) + (parseInt(formBusui, 10) || 0);
+  const previewBesar3B = formValidation.fields.bumil.value + formValidation.fields.busui.value;
+
+  const handleSavePmClick = async () => {
+    setIsSavingPM(true);
+    try {
+      if (onSavePM) {
+        await onSavePM();
+      }
+      setPmSavedDone(true);
+      triggerAlert(
+        "success",
+        "Data Penerima Manfaat (PM) berhasil disimpan & disinkronkan ke Cloud!"
+      );
+    } finally {
+      setIsSavingPM(false);
+    }
+  };
 
   return (
     <div id="penerima-manfaat-container" className="space-y-6 font-sans">
+      {/* Guided Onboarding Step 2 Banner */}
+      {isOnboardingStep && !pmSavedDone && (
+        <div
+          id="pm-onboarding-banner"
+          className="bg-gradient-to-r from-emerald-700 via-teal-700 to-cyan-700 rounded-2xl p-5 text-white shadow-sm flex flex-col lg:flex-row lg:items-center justify-between gap-4 no-print"
+        >
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-wider text-emerald-100">
+              <span>Langkah 2 dari 2 · Update Data Penerima Manfaat (PM)</span>
+              <span>·</span>
+              <span>Profil SPPG Tersimpan</span>
+            </div>
+            <h2 className="text-lg font-extrabold tracking-tight">
+              Sesuaikan Jumlah Penerima Manfaat Anda, Lalu Klik Simpan
+            </h2>
+            <p className="text-xs text-emerald-100 leading-relaxed max-w-2xl">
+              Silakan tambahkan atau sesuaikan data Sekolah, 3B (Desa/Posyandu), Porsi Besar/Kecil, Alergi, maupun Sampel pada hari perencanaan di bawah ini. Jika sudah sesuai, klik tombol <strong>Simpan Data PM</strong>.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              id="btn-onboarding-save-pm-top"
+              disabled={isSavingPM}
+              onClick={handleSavePmClick}
+              className="px-5 py-2.5 rounded-xl bg-amber-300 hover:bg-amber-200 text-slate-950 text-xs font-extrabold flex items-center gap-2 transition cursor-pointer whitespace-nowrap shadow-sm"
+            >
+              <Save className="w-4 h-4" />
+              <span>{isSavingPM ? "Menyimpan..." : "Simpan Data PM & Selesai"}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {pmSavedDone && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 no-print">
+          <div className="flex items-center gap-2.5 text-emerald-900 text-xs font-semibold">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+            <span>
+              Pengaturan awal Profil SPPG &amp; Data Penerima Manfaat sudah tersimpan. Anda dapat melanjutkan ke Master Menu atau melihat Dashboard.
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {onGoToMasterMenu && (
+              <button
+                type="button"
+                onClick={onGoToMasterMenu}
+                className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer transition"
+              >
+                <span>Lanjut ke Master Menu</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            )}
+            {onGoToDashboard && (
+              <button
+                type="button"
+                onClick={onGoToDashboard}
+                className="px-3.5 py-2 rounded-xl bg-white border border-emerald-300 hover:bg-emerald-100 text-emerald-900 text-xs font-bold cursor-pointer transition"
+              >
+                Buka Dashboard
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 no-print">
         <div>
@@ -992,6 +1443,28 @@ export default function PenerimaManfaatTab({
           <p className="text-sm text-slate-500">
             Input rincian Sekolah, 3B (Desa/Posyandu), Alergi, dan Sampel (Tabel 1) yang otomatis terekap ke Rekapitulasi Keseluruhan (Tabel 2).
           </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            id="btn-save-pm-header"
+            disabled={isSavingPM}
+            onClick={handleSavePmClick}
+            className={`px-4 py-2.5 rounded-xl text-xs font-extrabold flex items-center gap-2 transition cursor-pointer whitespace-nowrap shadow-xs ${
+              isOnboardingStep && !pmSavedDone
+                ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                : "bg-indigo-600 hover:bg-indigo-700 text-white"
+            }`}
+          >
+            <Save className="w-4 h-4" />
+            <span>
+              {isSavingPM
+                ? "Menyimpan..."
+                : isOnboardingStep && !pmSavedDone
+                  ? "Simpan Data PM & Selesai"
+                  : "Simpan Data PM"}
+            </span>
+          </button>
         </div>
       </div>
 
@@ -1209,7 +1682,13 @@ export default function PenerimaManfaatTab({
         {/* Row 2: 2 Wide Daily Hero Cards WITH DATE (Total PM Harian & Estimasi RAB Harian) */}
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
           {/* TOTAL PM HARIAN */}
-          <div className="bg-slate-900 p-4 rounded-2xl border border-slate-800 text-white space-y-3 shadow-xs">
+          <div
+            className={`bg-slate-900 p-4 rounded-2xl border text-white space-y-3 shadow-xs transition-colors ${
+              dayCapacityStatus.isOver
+                ? "border-amber-400 ring-2 ring-amber-400/30"
+                : "border-slate-800"
+            }`}
+          >
             <div className="flex items-start justify-between gap-3 flex-wrap">
               <div>
                 <div className="flex items-center gap-2 flex-wrap">
@@ -1220,6 +1699,17 @@ export default function PenerimaManfaatTab({
                     <CalendarDays className="w-3 h-3 text-indigo-400" />
                     {formattedActiveDateBanner}
                   </span>
+                  {dayCapacityStatus.isOver && (
+                    <span className="inline-flex items-center gap-1 text-[10px] font-extrabold text-amber-200 bg-amber-950/80 border border-amber-500/70 px-2 py-0.5 rounded-lg">
+                      <AlertTriangle className="w-3 h-3 text-amber-400" />
+                      Melebihi Kapasitas (+
+                      {(dayCapacityStatus.isSchoolOver
+                        ? dayCapacityStatus.excessSchool
+                        : dayCapacityStatus.excessCombined
+                      ).toLocaleString("id-ID")}
+                      )
+                    </span>
+                  )}
                 </div>
                 <div className="mt-1.5 flex items-baseline gap-2">
                   <span className="text-3xl font-black text-white tabular-nums tracking-tight">
@@ -1328,6 +1818,248 @@ export default function PenerimaManfaatTab({
         </div>
       </div>
 
+      {/* MONITOR KAPASITAS TOTAL SEKOLAH TERDAFTAR & PERINGATAN VISUAL */}
+      <div
+        className={`rounded-2xl border p-4 shadow-xs space-y-3 transition-colors no-print ${
+          dayCapacityStatus.isOver
+            ? "bg-rose-50/90 border-rose-300"
+            : dayCapacityStatus.isNear
+            ? "bg-amber-50/80 border-amber-300"
+            : "bg-white border-slate-200"
+        }`}
+      >
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div className="flex items-start gap-2.5">
+            {dayCapacityStatus.isOver ? (
+              <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+            ) : dayCapacityStatus.isNear ? (
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            ) : (
+              <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+            )}
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-xs font-extrabold uppercase tracking-wider text-slate-900">
+                  Kapasitas Total Sekolah Terdaftar
+                </span>
+                {capacityInfo.capacitySource === "registered" && (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-100 text-emerald-800 border border-emerald-200">
+                    {capacityInfo.schoolCount} Sekolah Terdaftar ·{" "}
+                    {capacityInfo.registeredTotal.toLocaleString("id-ID")} Porsi
+                  </span>
+                )}
+                {capacityInfo.capacitySource === "manual" && (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-indigo-100 text-indigo-800 border border-indigo-200">
+                    Batas Manual: {capacityInfo.effectiveSchoolCapacity.toLocaleString("id-ID")} Porsi
+                  </span>
+                )}
+                {capacityInfo.capacitySource === "unset" && (
+                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-slate-100 text-slate-600 border border-slate-200">
+                    Belum Ada Batas Kapasitas Terdaftar
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-600">
+                {capacityInfo.capacitySource === "registered" ? (
+                  <>
+                    Rincian terdaftar: Besar{" "}
+                    <strong>{capacityInfo.registeredBesar.toLocaleString("id-ID")}</strong> · Kecil{" "}
+                    <strong>{capacityInfo.registeredKecil.toLocaleString("id-ID")}</strong> · Alergi{" "}
+                    <strong>{capacityInfo.registeredAlergi.toLocaleString("id-ID")}</strong>
+                    {capacityInfo.registered3BTotal > 0 && (
+                      <>
+                        {" "}
+                        · 3B Terdaftar:{" "}
+                        <strong>{capacityInfo.registered3BTotal.toLocaleString("id-ID")}</strong>
+                      </>
+                    )}
+                  </>
+                ) : capacityInfo.capacitySource === "manual" ? (
+                  <>
+                    Menggunakan batas manual sebagai acuan validasi kapasitas porsi sekolah &amp; sampel harian.
+                  </>
+                ) : (
+                  <>
+                    Daftar master sekolah belum terisi. Klik <strong>Atur Kapasitas</strong> untuk menetapkan batas kapasitas total sekolah agar peringatan otomatis aktif.
+                  </>
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3 shrink-0">
+            {dayCapacityStatus.capacity > 0 && (
+              <div className="text-right">
+                <div className="text-xs font-bold text-slate-800 tabular-nums">
+                  Terpakai (Sekolah &amp; Sampel):{" "}
+                  <span
+                    className={
+                      dayCapacityStatus.isSchoolOver
+                        ? "text-rose-700 font-black"
+                        : dayCapacityStatus.isNear
+                        ? "text-amber-700 font-black"
+                        : "text-emerald-700 font-black"
+                    }
+                  >
+                    {dayCapacityStatus.usedSchool.toLocaleString("id-ID")}
+                  </span>{" "}
+                  / {dayCapacityStatus.capacity.toLocaleString("id-ID")} Porsi (
+                  {dayCapacityStatus.pct}%)
+                </div>
+                {capacityInfo.registered3BTotal > 0 && (
+                  <div className="text-[10px] text-slate-500 tabular-nums">
+                    Total PM Gabungan (incl. 3B/Tendik):{" "}
+                    <strong className={dayCapacityStatus.isCombinedOver ? "text-rose-700" : "text-slate-700"}>
+                      {totalPM.toLocaleString("id-ID")}
+                    </strong>{" "}
+                    / {dayCapacityStatus.combinedCap.toLocaleString("id-ID")} Porsi
+                  </div>
+                )}
+              </div>
+            )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setCapacityInputDraft(
+                  dayCapacityStatus.capacity > 0 ? String(dayCapacityStatus.capacity) : ""
+                );
+                setCapacityInputError(null);
+                setShowCapacityEditor((prev) => !prev);
+              }}
+              className="px-3 py-1.5 rounded-xl text-xs font-bold bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 flex items-center gap-1.5 cursor-pointer transition"
+            >
+              <SlidersHorizontal className="w-3.5 h-3.5 text-indigo-600" />
+              Atur Kapasitas
+            </button>
+          </div>
+        </div>
+
+        {/* Visual Utilization Progress Bar */}
+        {dayCapacityStatus.capacity > 0 && (
+          <div className="w-full h-2 rounded-full bg-slate-200/80 overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all duration-300 ${
+                dayCapacityStatus.isOver
+                  ? "bg-rose-600"
+                  : dayCapacityStatus.isNear
+                  ? "bg-amber-500"
+                  : "bg-emerald-500"
+              }`}
+              style={{ width: `${Math.min(100, dayCapacityStatus.pct)}%` }}
+            />
+          </div>
+        )}
+
+        {/* Prominent Visual Warning When Daily Portions Exceed Registered School Capacity */}
+        {dayCapacityStatus.isOver && (
+          <div
+            role="alert"
+            className="flex items-start gap-2.5 p-3 rounded-xl bg-rose-100/90 border border-rose-300 text-rose-950 text-xs"
+          >
+            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              <p className="font-extrabold">
+                Peringatan: Jumlah porsi melebihi kapasitas total sekolah yang terdaftar!
+              </p>
+              <p className="text-rose-900">
+                {dayCapacityStatus.isSchoolOver ? (
+                  <>
+                    Total porsi Sekolah &amp; Sampel pada Hari Ke-{selectedDay} sebesar{" "}
+                    <strong>{dayCapacityStatus.usedSchool.toLocaleString("id-ID")} porsi</strong>{" "}
+                    melebihi kapasitas terdaftar{" "}
+                    <strong>{dayCapacityStatus.capacity.toLocaleString("id-ID")} porsi</strong>{" "}
+                    (kelebihan{" "}
+                    <strong>+{dayCapacityStatus.excessSchool.toLocaleString("id-ID")} porsi</strong>).
+                  </>
+                ) : (
+                  <>
+                    Total seluruh PM pada Hari Ke-{selectedDay} sebesar{" "}
+                    <strong>{totalPM.toLocaleString("id-ID")} porsi</strong> melebihi kapasitas
+                    gabungan terdaftar{" "}
+                    <strong>{dayCapacityStatus.combinedCap.toLocaleString("id-ID")} porsi</strong>{" "}
+                    (kelebihan{" "}
+                    <strong>+{dayCapacityStatus.excessCombined.toLocaleString("id-ID")} porsi</strong>).
+                  </>
+                )}{" "}
+                Harap periksa kembali input porsi kecil, besar, alergi, dan sampel.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Optional Inline Capacity Override Editor */}
+        {showCapacityEditor && (
+          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+            <div className="flex-1 space-y-1">
+              <label className="block text-[11px] font-bold text-slate-700">
+                Batas Kapasitas Total Sekolah (Porsi)
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="number"
+                  min="1"
+                  value={capacityInputDraft}
+                  onKeyDown={handleFormNumericKeyDown}
+                  onChange={(e) => {
+                    setCapacityInputDraft(e.target.value);
+                    const check = validatePortionString(e.target.value, "Kapasitas");
+                    setCapacityInputError(check.isValid ? null : check.error);
+                  }}
+                  placeholder="Contoh: 2500"
+                  className={`w-40 px-3 py-1.5 text-sm font-bold font-mono rounded-lg border bg-white focus:outline-none ${
+                    capacityInputError
+                      ? "border-rose-500 ring-2 ring-rose-500/20"
+                      : "border-slate-300 focus:border-indigo-500"
+                  }`}
+                />
+                <button
+                  type="button"
+                  onClick={handleSaveManualCapacity}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer"
+                >
+                  Simpan Batas
+                </button>
+                {activeSchoolPortions.schoolWithSampleTotal > 0 && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setCapacityInputDraft(String(activeSchoolPortions.schoolWithSampleTotal));
+                      setCapacityInputError(null);
+                    }}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 cursor-pointer"
+                  >
+                    Pakai Total Hari Ini ({activeSchoolPortions.schoolWithSampleTotal.toLocaleString("id-ID")})
+                  </button>
+                )}
+                {manualSchoolCapacity !== null && (
+                  <button
+                    type="button"
+                    onClick={handleResetManualCapacity}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-50 text-rose-700 hover:bg-rose-100 cursor-pointer"
+                  >
+                    Reset ke Data Terdaftar
+                  </button>
+                )}
+              </div>
+              {capacityInputError && (
+                <p className="text-[11px] font-bold text-rose-600 flex items-center gap-1">
+                  <AlertCircle className="w-3.5 h-3.5" />
+                  {capacityInputError}
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowCapacityEditor(false)}
+              className="text-xs font-semibold text-slate-500 hover:text-slate-800 self-start sm:self-end cursor-pointer"
+            >
+              Tutup
+            </button>
+          </div>
+        )}
+      </div>
+
       {/* PANEL INPUT KHUSUS: SEKOLAH, 3B (DESA/POSYANDU), TENAGA PENDIDIKAN, & SAMPEL */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden no-print">
         <div className="px-5 py-4 bg-slate-50 border-b border-slate-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
@@ -1396,7 +2128,7 @@ export default function PenerimaManfaatTab({
           </div>
         </div>
 
-        <form onSubmit={handleSubmitUraianForm} className="p-5 space-y-4">
+        <form noValidate onSubmit={handleSubmitUraianForm} className="p-5 space-y-4">
           {/* Row 1: Unit Name + Category Mapping */}
           <div className="grid grid-cols-1 md:grid-cols-12 gap-4">
             <div className="md:col-span-7">
@@ -1411,6 +2143,7 @@ export default function PenerimaManfaatTab({
               </label>
               <input
                 type="text"
+                list={inputMode === "sekolah" && sekolahPM.length > 0 ? "registered-schools-datalist" : undefined}
                 value={formNama}
                 onChange={(e) => {
                   const val = e.target.value;
@@ -1430,6 +2163,36 @@ export default function PenerimaManfaatTab({
                 }
                 className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600 font-medium"
               />
+              {inputMode === "sekolah" && sekolahPM.length > 0 && (
+                <datalist id="registered-schools-datalist">
+                  {sekolahPM.map((s) => (
+                    <option key={s.id} value={s.namaSekolah} />
+                  ))}
+                </datalist>
+              )}
+              {formValidation.matchedSchool && (
+                <div
+                  className={`mt-1.5 px-2.5 py-1.5 rounded-lg border text-[11px] flex items-center gap-1.5 ${
+                    formValidation.perSchoolExceeds
+                      ? "bg-amber-50 border-amber-300 text-amber-900 font-bold"
+                      : "bg-emerald-50/70 border-emerald-200 text-emerald-800 font-medium"
+                  }`}
+                >
+                  {formValidation.perSchoolExceeds ? (
+                    <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                  ) : (
+                    <ShieldCheck className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                  )}
+                  <span>
+                    Kapasitas terdaftar <strong>{formValidation.matchedSchool.sekolah.namaSekolah}</strong>:{" "}
+                    <strong>{formValidation.matchedSchool.total.toLocaleString("id-ID")} porsi</strong>{" "}
+                    (Besar {formValidation.matchedSchool.besar}, Kecil {formValidation.matchedSchool.kecil}, Alergi {formValidation.matchedSchool.alergi})
+                    {formValidation.perSchoolExceeds && (
+                      <> — input saat ini melebihi +{formValidation.perSchoolExcess.toLocaleString("id-ID")} porsi!</>
+                    )}
+                  </span>
+                </div>
+              )}
             </div>
 
             <div className="md:col-span-5">
@@ -1509,10 +2272,18 @@ export default function PenerimaManfaatTab({
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
               {inputMode === "tiga_b" ? (
                 <>
-                  <div className="bg-emerald-50/60 p-3 rounded-xl border border-emerald-200 space-y-2">
+                  <div
+                    className={`p-3 rounded-xl border space-y-2 transition-colors ${
+                      !formValidation.fields.bumil.isValid || !formValidation.fields.busui.isValid
+                        ? "bg-rose-50/70 border-rose-300"
+                        : formValidation.hasCapacityWarning && previewBesar3B > 0
+                        ? "bg-amber-50/70 border-amber-300"
+                        : "bg-emerald-50/60 border-emerald-200"
+                    }`}
+                  >
                     <div className="flex items-center justify-between">
                       <span className="text-[11px] font-bold text-emerald-900 uppercase">
-                        Porsi Besar 3B (Bumil & Busui)
+                        Porsi Besar 3B (Bumil &amp; Busui)
                       </span>
                       <span className="text-[11px] font-black text-emerald-700 tabular-nums">
                         Total: {previewBesar3B}
@@ -1526,10 +2297,19 @@ export default function PenerimaManfaatTab({
                         <input
                           type="number"
                           min="0"
+                          step="1"
                           value={formBumil}
+                          onKeyDown={handleFormNumericKeyDown}
                           onChange={(e) => setFormBumil(e.target.value)}
                           placeholder="0"
-                          className="w-full px-2.5 py-1.5 text-sm font-bold font-mono text-center bg-white border border-emerald-300 rounded-lg focus:outline-none focus:border-emerald-600"
+                          aria-invalid={!formValidation.fields.bumil.isValid}
+                          className={`w-full px-2.5 py-1.5 text-sm font-bold font-mono text-center bg-white border rounded-lg focus:outline-none ${
+                            !formValidation.fields.bumil.isValid
+                              ? "border-rose-500 ring-2 ring-rose-500/20 text-rose-900 bg-rose-50/40"
+                              : formValidation.hasCapacityWarning && formValidation.fields.bumil.value > 0
+                              ? "border-amber-500 ring-2 ring-amber-400/25"
+                              : "border-emerald-300 focus:border-emerald-600"
+                          }`}
                         />
                       </div>
                       <div>
@@ -1539,103 +2319,247 @@ export default function PenerimaManfaatTab({
                         <input
                           type="number"
                           min="0"
+                          step="1"
                           value={formBusui}
+                          onKeyDown={handleFormNumericKeyDown}
                           onChange={(e) => setFormBusui(e.target.value)}
                           placeholder="0"
-                          className="w-full px-2.5 py-1.5 text-sm font-bold font-mono text-center bg-white border border-emerald-300 rounded-lg focus:outline-none focus:border-emerald-600"
+                          aria-invalid={!formValidation.fields.busui.isValid}
+                          className={`w-full px-2.5 py-1.5 text-sm font-bold font-mono text-center bg-white border rounded-lg focus:outline-none ${
+                            !formValidation.fields.busui.isValid
+                              ? "border-rose-500 ring-2 ring-rose-500/20 text-rose-900 bg-rose-50/40"
+                              : formValidation.hasCapacityWarning && formValidation.fields.busui.value > 0
+                              ? "border-amber-500 ring-2 ring-amber-400/25"
+                              : "border-emerald-300 focus:border-emerald-600"
+                          }`}
                         />
                       </div>
                     </div>
+                    {(!formValidation.fields.bumil.isValid || !formValidation.fields.busui.isValid) && (
+                      <p className="text-[11px] font-bold text-rose-600 flex items-center gap-1">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        {formValidation.fields.bumil.error || formValidation.fields.busui.error}
+                      </p>
+                    )}
                   </div>
 
-                  <div className="bg-emerald-50/60 p-3 rounded-xl border border-emerald-200 flex flex-col justify-between">
+                  <div
+                    className={`p-3 rounded-xl border flex flex-col justify-between transition-colors ${
+                      !formValidation.fields.porsiKecil.isValid
+                        ? "bg-rose-50/70 border-rose-300"
+                        : formValidation.hasCapacityWarning && formValidation.fields.porsiKecil.value > 0
+                        ? "bg-amber-50/70 border-amber-300"
+                        : "bg-emerald-50/60 border-emerald-200"
+                    }`}
+                  >
                     <label className="block text-[11px] font-bold text-emerald-900 uppercase mb-1">
                       Jumlah Porsi Kecil (Balita)
                     </label>
                     <input
                       type="number"
                       min="0"
+                      step="1"
                       value={formPorsiKecil}
+                      onKeyDown={handleFormNumericKeyDown}
                       onChange={(e) => setFormPorsiKecil(e.target.value)}
                       placeholder="0"
-                      className="w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border border-emerald-300 rounded-lg focus:outline-none focus:border-emerald-600"
+                      aria-invalid={!formValidation.fields.porsiKecil.isValid}
+                      className={`w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border rounded-lg focus:outline-none ${
+                        !formValidation.fields.porsiKecil.isValid
+                          ? "border-rose-500 ring-2 ring-rose-500/20 text-rose-900 bg-rose-50/40"
+                          : formValidation.hasCapacityWarning && formValidation.fields.porsiKecil.value > 0
+                          ? "border-amber-500 ring-2 ring-amber-400/25"
+                          : "border-emerald-300 focus:border-emerald-600"
+                      }`}
                     />
+                    {!formValidation.fields.porsiKecil.isValid && (
+                      <p className="text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        {formValidation.fields.porsiKecil.error}
+                      </p>
+                    )}
                   </div>
                 </>
               ) : (
                 <>
-                  <div className="bg-emerald-50/60 p-3 rounded-xl border border-emerald-200">
+                  <div
+                    className={`p-3 rounded-xl border transition-colors ${
+                      !formValidation.fields.porsiBesar.isValid
+                        ? "bg-rose-50/70 border-rose-300"
+                        : formValidation.hasCapacityWarning && formValidation.fields.porsiBesar.value > 0
+                        ? "bg-amber-50/70 border-amber-300"
+                        : "bg-emerald-50/60 border-emerald-200"
+                    }`}
+                  >
                     <label className="block text-[11px] font-bold text-emerald-900 uppercase mb-1">
                       Jumlah Porsi Besar (Tanpa Alergi)
                     </label>
                     <input
                       type="number"
                       min="0"
+                      step="1"
                       value={formPorsiBesar}
+                      onKeyDown={handleFormNumericKeyDown}
                       onChange={(e) => setFormPorsiBesar(e.target.value)}
                       placeholder="0"
-                      className="w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border border-emerald-300 rounded-lg focus:outline-none focus:border-emerald-600"
+                      aria-invalid={!formValidation.fields.porsiBesar.isValid}
+                      className={`w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border rounded-lg focus:outline-none ${
+                        !formValidation.fields.porsiBesar.isValid
+                          ? "border-rose-500 ring-2 ring-rose-500/20 text-rose-900 bg-rose-50/40"
+                          : formValidation.hasCapacityWarning && formValidation.fields.porsiBesar.value > 0
+                          ? "border-amber-500 ring-2 ring-amber-400/25"
+                          : "border-emerald-300 focus:border-emerald-600"
+                      }`}
                     />
-                    {inputMode === "sekolah" && formKategori === "sd_mi_slb" && (
-                      <span className="block text-[10px] text-emerald-700 mt-1">
-                        Otomatis masuk SD Kelas 4-6
-                      </span>
+                    {!formValidation.fields.porsiBesar.isValid ? (
+                      <p className="text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        {formValidation.fields.porsiBesar.error}
+                      </p>
+                    ) : (
+                      inputMode === "sekolah" &&
+                      formKategori === "sd_mi_slb" && (
+                        <span className="block text-[10px] text-emerald-700 mt-1">
+                          Otomatis masuk SD Kelas 4-6
+                        </span>
+                      )
                     )}
                   </div>
 
-                  <div className="bg-emerald-50/60 p-3 rounded-xl border border-emerald-200">
+                  <div
+                    className={`p-3 rounded-xl border transition-colors ${
+                      !formValidation.fields.porsiKecil.isValid
+                        ? "bg-rose-50/70 border-rose-300"
+                        : formValidation.hasCapacityWarning && formValidation.fields.porsiKecil.value > 0
+                        ? "bg-amber-50/70 border-amber-300"
+                        : "bg-emerald-50/60 border-emerald-200"
+                    }`}
+                  >
                     <label className="block text-[11px] font-bold text-emerald-900 uppercase mb-1">
                       Jumlah Porsi Kecil (Tanpa Alergi)
                     </label>
                     <input
                       type="number"
                       min="0"
+                      step="1"
                       value={formPorsiKecil}
+                      onKeyDown={handleFormNumericKeyDown}
                       onChange={(e) => setFormPorsiKecil(e.target.value)}
                       placeholder="0"
-                      className="w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border border-emerald-300 rounded-lg focus:outline-none focus:border-emerald-600"
+                      aria-invalid={!formValidation.fields.porsiKecil.isValid}
+                      className={`w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border rounded-lg focus:outline-none ${
+                        !formValidation.fields.porsiKecil.isValid
+                          ? "border-rose-500 ring-2 ring-rose-500/20 text-rose-900 bg-rose-50/40"
+                          : formValidation.hasCapacityWarning && formValidation.fields.porsiKecil.value > 0
+                          ? "border-amber-500 ring-2 ring-amber-400/25"
+                          : "border-emerald-300 focus:border-emerald-600"
+                      }`}
                     />
-                    {inputMode === "sekolah" && formKategori === "sd_mi_slb" && (
-                      <span className="block text-[10px] text-emerald-700 mt-1">
-                        Otomatis masuk SD Kelas 1-3
-                      </span>
+                    {!formValidation.fields.porsiKecil.isValid ? (
+                      <p className="text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1">
+                        <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                        {formValidation.fields.porsiKecil.error}
+                      </p>
+                    ) : (
+                      inputMode === "sekolah" &&
+                      formKategori === "sd_mi_slb" && (
+                        <span className="block text-[10px] text-emerald-700 mt-1">
+                          Otomatis masuk SD Kelas 1-3
+                        </span>
+                      )
                     )}
                   </div>
                 </>
               )}
 
-              <div className="bg-orange-50/70 p-3 rounded-xl border border-orange-200">
+              <div
+                className={`p-3 rounded-xl border transition-colors ${
+                  !formValidation.fields.alergiBesar.isValid
+                    ? "bg-rose-50/70 border-rose-300"
+                    : formValidation.hasCapacityWarning && formValidation.fields.alergiBesar.value > 0
+                    ? "bg-amber-50/80 border-amber-400"
+                    : "bg-orange-50/70 border-orange-200"
+                }`}
+              >
                 <label className="block text-[11px] font-bold text-orange-900 uppercase mb-1">
                   Alergi Porsi Besar
                 </label>
                 <input
                   type="number"
                   min="0"
+                  step="1"
                   value={formAlergiBesar}
+                  onKeyDown={handleFormNumericKeyDown}
                   onChange={(e) => setFormAlergiBesar(e.target.value)}
                   placeholder="0"
-                  className="w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border border-orange-300 rounded-lg focus:outline-none focus:border-orange-500 text-orange-950"
+                  aria-invalid={!formValidation.fields.alergiBesar.isValid}
+                  className={`w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border rounded-lg focus:outline-none ${
+                    !formValidation.fields.alergiBesar.isValid
+                      ? "border-rose-500 ring-2 ring-rose-500/20 text-rose-900 bg-rose-50/40"
+                      : formValidation.hasCapacityWarning && formValidation.fields.alergiBesar.value > 0
+                      ? "border-amber-500 ring-2 ring-amber-400/25 text-orange-950"
+                      : "border-orange-300 focus:border-orange-500 text-orange-950"
+                  }`}
                 />
+                {!formValidation.fields.alergiBesar.isValid && (
+                  <p className="text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    {formValidation.fields.alergiBesar.error}
+                  </p>
+                )}
               </div>
 
-              <div className="bg-orange-50/70 p-3 rounded-xl border border-orange-200">
+              <div
+                className={`p-3 rounded-xl border transition-colors ${
+                  !formValidation.fields.alergiKecil.isValid
+                    ? "bg-rose-50/70 border-rose-300"
+                    : formValidation.hasCapacityWarning && formValidation.fields.alergiKecil.value > 0
+                    ? "bg-amber-50/80 border-amber-400"
+                    : "bg-orange-50/70 border-orange-200"
+                }`}
+              >
                 <label className="block text-[11px] font-bold text-orange-900 uppercase mb-1">
                   Alergi Porsi Kecil
                 </label>
                 <input
                   type="number"
                   min="0"
+                  step="1"
                   value={formAlergiKecil}
+                  onKeyDown={handleFormNumericKeyDown}
                   onChange={(e) => setFormAlergiKecil(e.target.value)}
                   placeholder="0"
-                  className="w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border border-orange-300 rounded-lg focus:outline-none focus:border-orange-500 text-orange-950"
+                  aria-invalid={!formValidation.fields.alergiKecil.isValid}
+                  className={`w-full px-3 py-2 text-sm font-bold font-mono text-center bg-white border rounded-lg focus:outline-none ${
+                    !formValidation.fields.alergiKecil.isValid
+                      ? "border-rose-500 ring-2 ring-rose-500/20 text-rose-900 bg-rose-50/40"
+                      : formValidation.hasCapacityWarning && formValidation.fields.alergiKecil.value > 0
+                      ? "border-amber-500 ring-2 ring-amber-400/25 text-orange-950"
+                      : "border-orange-300 focus:border-orange-500 text-orange-950"
+                  }`}
                 />
+                {!formValidation.fields.alergiKecil.isValid && (
+                  <p className="text-[11px] font-bold text-rose-600 mt-1 flex items-center gap-1">
+                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                    {formValidation.fields.alergiKecil.error}
+                  </p>
+                )}
               </div>
             </div>
           )}
 
           {/* Row 3: Sampel Selector (Porsi Kecil / Porsi Besar / Keduanya) */}
-          <div className="p-3.5 rounded-xl bg-blue-50/70 border border-blue-200 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+          <div
+            className={`p-3.5 rounded-xl border flex flex-col lg:flex-row lg:items-center justify-between gap-3 transition-colors ${
+              !formValidation.fields.sampelBesar.isValid || !formValidation.fields.sampelKecil.isValid
+                ? "bg-rose-50/70 border-rose-300"
+                : formValidation.hasCapacityWarning &&
+                  (formValidation.fields.sampelBesar.value > 0 ||
+                    formValidation.fields.sampelKecil.value > 0)
+                ? "bg-amber-50/70 border-amber-300"
+                : "bg-blue-50/70 border-blue-200"
+            }`}
+          >
             <div className="space-y-1.5">
               <div className="flex items-center gap-1.5 text-xs font-bold text-blue-900">
                 <FlaskConical className="w-4 h-4 text-blue-600" />
@@ -1667,51 +2591,189 @@ export default function PenerimaManfaatTab({
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-3">
-              {(formSampelChoice === "besar" || formSampelChoice === "both") && (
-                <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-blue-200">
-                  <label className="text-[11px] font-bold text-blue-900 whitespace-nowrap">
-                    Sampel Porsi Besar:
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={formSampelBesar}
-                    onChange={(e) => setFormSampelBesar(e.target.value)}
-                    placeholder="0"
-                    className="w-20 px-2 py-1 text-sm font-bold font-mono text-center bg-blue-50/40 border border-blue-300 rounded-md focus:outline-none focus:border-blue-600"
-                  />
-                </div>
-              )}
+            <div className="flex flex-col items-start lg:items-end gap-1.5">
+              <div className="flex flex-wrap items-center gap-3">
+                {(formSampelChoice === "besar" || formSampelChoice === "both") && (
+                  <div
+                    className={`flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border ${
+                      !formValidation.fields.sampelBesar.isValid
+                        ? "border-rose-500 ring-2 ring-rose-500/20"
+                        : formValidation.hasCapacityWarning && formValidation.fields.sampelBesar.value > 0
+                        ? "border-amber-500 ring-2 ring-amber-400/25"
+                        : "border-blue-200"
+                    }`}
+                  >
+                    <label className="text-[11px] font-bold text-blue-900 whitespace-nowrap">
+                      Sampel Porsi Besar:
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={formSampelBesar}
+                      onKeyDown={handleFormNumericKeyDown}
+                      onChange={(e) => setFormSampelBesar(e.target.value)}
+                      placeholder="0"
+                      aria-invalid={!formValidation.fields.sampelBesar.isValid}
+                      className={`w-20 px-2 py-1 text-sm font-bold font-mono text-center border rounded-md focus:outline-none ${
+                        !formValidation.fields.sampelBesar.isValid
+                          ? "bg-rose-50 border-rose-500 text-rose-900"
+                          : "bg-blue-50/40 border-blue-300 focus:border-blue-600"
+                      }`}
+                    />
+                  </div>
+                )}
 
-              {(formSampelChoice === "kecil" || formSampelChoice === "both") && (
-                <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border border-blue-200">
-                  <label className="text-[11px] font-bold text-blue-900 whitespace-nowrap">
-                    Sampel Porsi Kecil:
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    value={formSampelKecil}
-                    onChange={(e) => setFormSampelKecil(e.target.value)}
-                    placeholder="0"
-                    className="w-20 px-2 py-1 text-sm font-bold font-mono text-center bg-blue-50/40 border border-blue-300 rounded-md focus:outline-none focus:border-blue-600"
-                  />
-                </div>
+                {(formSampelChoice === "kecil" || formSampelChoice === "both") && (
+                  <div
+                    className={`flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border ${
+                      !formValidation.fields.sampelKecil.isValid
+                        ? "border-rose-500 ring-2 ring-rose-500/20"
+                        : formValidation.hasCapacityWarning && formValidation.fields.sampelKecil.value > 0
+                        ? "border-amber-500 ring-2 ring-amber-400/25"
+                        : "border-blue-200"
+                    }`}
+                  >
+                    <label className="text-[11px] font-bold text-blue-900 whitespace-nowrap">
+                      Sampel Porsi Kecil:
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={formSampelKecil}
+                      onKeyDown={handleFormNumericKeyDown}
+                      onChange={(e) => setFormSampelKecil(e.target.value)}
+                      placeholder="0"
+                      aria-invalid={!formValidation.fields.sampelKecil.isValid}
+                      className={`w-20 px-2 py-1 text-sm font-bold font-mono text-center border rounded-md focus:outline-none ${
+                        !formValidation.fields.sampelKecil.isValid
+                          ? "bg-rose-50 border-rose-500 text-rose-900"
+                          : "bg-blue-50/40 border-blue-300 focus:border-blue-600"
+                      }`}
+                    />
+                  </div>
+                )}
+              </div>
+              {(!formValidation.fields.sampelBesar.isValid ||
+                !formValidation.fields.sampelKecil.isValid) && (
+                <p className="text-[11px] font-bold text-rose-600 flex items-center gap-1">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  {formValidation.fields.sampelBesar.error ||
+                    formValidation.fields.sampelKecil.error}
+                </p>
               )}
             </div>
           </div>
+
+          {/* Live Validation Error Summary (Negative / Invalid Input Blocker) */}
+          {formValidation.hasNegativeOrInvalid && (
+            <div
+              role="alert"
+              className="p-3.5 rounded-xl bg-rose-50 border border-rose-300 text-rose-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+            >
+              <div className="flex items-start gap-2 text-xs">
+                <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                <div>
+                  <p className="font-extrabold">
+                    Input porsi tidak valid — nilai negatif atau desimal tidak diperbolehkan:
+                  </p>
+                  <ul className="list-disc list-inside mt-0.5 space-y-0.5 text-rose-800">
+                    {formValidation.invalidErrors.map((err, i) => (
+                      <li key={i}>{err}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleFixNegativeFormFields}
+                className="px-3 py-1.5 rounded-lg text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white shrink-0 cursor-pointer transition"
+              >
+                Perbaiki ke 0
+              </button>
+            </div>
+          )}
+
+          {/* Live Visual Capacity Overrun Warning (Non-Blocking Visual Alert) */}
+          {formValidation.hasCapacityWarning && (
+            <div
+              role="alert"
+              className="p-3.5 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 flex items-start gap-2.5 text-xs"
+            >
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <p className="font-extrabold text-amber-950">
+                  Peringatan Kapasitas Sekolah Terlampaui
+                </p>
+                {formValidation.perSchoolExceeds && formValidation.matchedSchool && (
+                  <p>
+                    • Input untuk <strong>{formValidation.matchedSchool.sekolah.namaSekolah}</strong>{" "}
+                    ({formValidation.draftRowTotal.toLocaleString("id-ID")} porsi) melebihi kapasitas
+                    terdaftar sekolah tersebut (
+                    <strong>{formValidation.matchedSchool.total.toLocaleString("id-ID")} porsi</strong>
+                    , kelebihan{" "}
+                    <strong>+{formValidation.perSchoolExcess.toLocaleString("id-ID")} porsi</strong>).
+                  </p>
+                )}
+                {formValidation.exceedsTotalSchoolCap && (
+                  <p>
+                    • Estimasi total porsi sekolah &amp; sampel (
+                    <strong>
+                      {Math.max(
+                        formValidation.projectedSchoolWithSample,
+                        formValidation.draftRowTotal
+                      ).toLocaleString("id-ID")}{" "}
+                      porsi
+                    </strong>
+                    ) melebihi kapasitas total{" "}
+                    {capacityInfo.capacitySource === "registered"
+                      ? `${capacityInfo.schoolCount} sekolah terdaftar`
+                      : "sekolah yang ditetapkan"}{" "}
+                    (<strong>{capacityInfo.effectiveSchoolCapacity.toLocaleString("id-ID")} porsi</strong>
+                    , kelebihan{" "}
+                    <strong>+{formValidation.totalSchoolExcess.toLocaleString("id-ID")} porsi</strong>).
+                  </p>
+                )}
+                {!formValidation.exceedsTotalSchoolCap && formValidation.exceedsCombinedCap && (
+                  <p>
+                    • Proyeksi total seluruh PM harian (
+                    <strong>{formValidation.projectedTotalPM.toLocaleString("id-ID")} porsi</strong>)
+                    melebihi total kapasitas gabungan terdaftar (
+                    <strong>{capacityInfo.effectiveCombinedCapacity.toLocaleString("id-ID")} porsi</strong>
+                    , kelebihan{" "}
+                    <strong>+{formValidation.combinedExcess.toLocaleString("id-ID")} porsi</strong>).
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Form Action Footer */}
           <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="submit"
-                className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                disabled={formValidation.hasNegativeOrInvalid}
+                className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-xs transition cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+                  formValidation.hasCapacityWarning
+                    ? "bg-amber-600 hover:bg-amber-700 text-white"
+                    : "bg-emerald-600 hover:bg-emerald-700 text-white"
+                }`}
               >
-                {editingRowId ? <Check className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
+                {formValidation.hasCapacityWarning ? (
+                  <AlertTriangle className="w-4 h-4" />
+                ) : editingRowId ? (
+                  <Check className="w-4 h-4" />
+                ) : (
+                  <Plus className="w-4 h-4" />
+                )}
                 {editingRowId
-                  ? "Simpan Perubahan Baris"
+                  ? formValidation.hasCapacityWarning
+                    ? "Simpan Perubahan (Melebihi Kapasitas)"
+                    : "Simpan Perubahan Baris"
+                  : formValidation.hasCapacityWarning
+                  ? "Tetap Tambahkan (Melebihi Kapasitas)"
                   : "Tambah ke Tabel 1 & Rekap Otomatis"}
               </button>
 
@@ -1742,7 +2804,7 @@ export default function PenerimaManfaatTab({
                   className="px-3.5 py-2.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
                 >
                   <Database className="w-3.5 h-3.5" />
-                  Muat {sekolahPM.length} Sekolah & {tigaBPM.length} Desa 3B
+                  Muat {sekolahPM.length} Sekolah &amp; {tigaBPM.length} Desa 3B
                 </button>
               )}
             </div>
@@ -1951,10 +3013,33 @@ export default function PenerimaManfaatTab({
                 {formattedActiveDateBanner} · Rincian per Sekolah, 3B (Desa / Posyandu), Pendidik/Tenaga Pendidikan &amp; Sampel
               </p>
             </div>
-            <span className="text-xs font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg no-print self-start">
-              {activeUraian.length} Unit Sasaran
-            </span>
+            <div className="flex items-center gap-2 flex-wrap no-print self-start">
+              {dayCapacityStatus.isOver && (
+                <span className="inline-flex items-center gap-1 text-xs font-bold text-rose-800 bg-rose-50 border border-rose-300 px-2.5 py-1 rounded-lg">
+                  <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
+                  Melebihi Kapasitas (+
+                  {(dayCapacityStatus.isSchoolOver
+                    ? dayCapacityStatus.excessSchool
+                    : dayCapacityStatus.excessCombined
+                  ).toLocaleString("id-ID")}{" "}
+                  Porsi)
+                </span>
+              )}
+              <span className="text-xs font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg">
+                {activeUraian.length} Unit Sasaran
+              </span>
+            </div>
           </div>
+
+          {inlineCellError?.table === "tabel1" && (
+            <div
+              role="alert"
+              className="flex items-center gap-2 px-3 py-2 rounded-xl bg-rose-50 border border-rose-300 text-rose-800 text-xs font-bold no-print"
+            >
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{inlineCellError.message}</span>
+            </div>
+          )}
 
           <div className="overflow-x-auto">
             <table
@@ -2096,6 +3181,13 @@ export default function PenerimaManfaatTab({
                       (Number(u.sampelKecil) || 0);
                     const badge = KATEGORI_BADGE_MAP[u.kategori];
                     const isEditingThis = editingRowId === u.id;
+                    const matchedRowSchool =
+                      u.tipeUnit === "sekolah" && u.nama?.trim()
+                        ? capacityInfo.byName.get(u.nama.trim().toLowerCase()) || null
+                        : null;
+                    const isRowOverSchoolCap = Boolean(
+                      matchedRowSchool && rowTotal > matchedRowSchool.total
+                    );
 
                     return (
                       <tr key={u.id}>
@@ -2117,13 +3209,24 @@ export default function PenerimaManfaatTab({
                               placeholder="Nama sekolah / desa / posyandu..."
                               className="w-full bg-transparent text-xs text-black focus:outline-none focus:bg-indigo-50/60 px-1 py-0.5 rounded"
                             />
-                            {badge && (
-                              <span
-                                className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap shrink-0 no-print ${badge.color}`}
-                              >
-                                {badge.label}
-                              </span>
-                            )}
+                            <div className="flex items-center gap-1 shrink-0 no-print">
+                              {isRowOverSchoolCap && matchedRowSchool && (
+                                <span
+                                  className="inline-flex items-center gap-0.5 text-[10px] font-bold px-1.5 py-0.5 rounded border border-amber-300 bg-amber-50 text-amber-800 whitespace-nowrap"
+                                  title={`Melebihi kapasitas terdaftar ${matchedRowSchool.sekolah.namaSekolah} (${matchedRowSchool.total} porsi)`}
+                                >
+                                  <AlertTriangle className="w-3 h-3 text-amber-600" />
+                                  &gt; Kapasitas ({rowTotal}/{matchedRowSchool.total})
+                                </span>
+                              )}
+                              {badge && (
+                                <span
+                                  className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border whitespace-nowrap ${badge.color}`}
+                                >
+                                  {badge.label}
+                                </span>
+                              )}
+                            </div>
                           </div>
                           {u.kategori === "posyandu_3b" &&
                             ((u.bumil || 0) > 0 || (u.busui || 0) > 0) && (
@@ -2139,11 +3242,19 @@ export default function PenerimaManfaatTab({
                           <input
                             type="number"
                             min="0"
+                            step="1"
                             value={numInputVal(u.porsiBesar)}
+                            onKeyDown={(e) =>
+                              handleTableNumericKeyDown(e, `t1-${u.id}-porsiBesar`, "tabel1")
+                            }
                             onChange={(e) =>
                               handleUraianInlineChange(u.id, "porsiBesar", e.target.value)
                             }
-                            className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums"
+                            className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums ${
+                              inlineCellError?.cellKey === `t1-${u.id}-porsiBesar`
+                                ? "ring-2 ring-rose-500 bg-rose-50"
+                                : ""
+                            }`}
                           />
                         </td>
                         <td
@@ -2153,11 +3264,19 @@ export default function PenerimaManfaatTab({
                           <input
                             type="number"
                             min="0"
+                            step="1"
                             value={numInputVal(u.porsiKecil)}
+                            onKeyDown={(e) =>
+                              handleTableNumericKeyDown(e, `t1-${u.id}-porsiKecil`, "tabel1")
+                            }
                             onChange={(e) =>
                               handleUraianInlineChange(u.id, "porsiKecil", e.target.value)
                             }
-                            className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums"
+                            className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums ${
+                              inlineCellError?.cellKey === `t1-${u.id}-porsiKecil`
+                                ? "ring-2 ring-rose-500 bg-rose-50"
+                                : ""
+                            }`}
                           />
                         </td>
                         <td
@@ -2167,11 +3286,19 @@ export default function PenerimaManfaatTab({
                           <input
                             type="number"
                             min="0"
+                            step="1"
                             value={numInputVal(u.alergiBesar)}
+                            onKeyDown={(e) =>
+                              handleTableNumericKeyDown(e, `t1-${u.id}-alergiBesar`, "tabel1")
+                            }
                             onChange={(e) =>
                               handleUraianInlineChange(u.id, "alergiBesar", e.target.value)
                             }
-                            className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums"
+                            className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums ${
+                              inlineCellError?.cellKey === `t1-${u.id}-alergiBesar`
+                                ? "ring-2 ring-rose-500 bg-rose-50"
+                                : ""
+                            }`}
                           />
                         </td>
                         <td
@@ -2181,11 +3308,19 @@ export default function PenerimaManfaatTab({
                           <input
                             type="number"
                             min="0"
+                            step="1"
                             value={numInputVal(u.alergiKecil)}
+                            onKeyDown={(e) =>
+                              handleTableNumericKeyDown(e, `t1-${u.id}-alergiKecil`, "tabel1")
+                            }
                             onChange={(e) =>
                               handleUraianInlineChange(u.id, "alergiKecil", e.target.value)
                             }
-                            className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums"
+                            className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums ${
+                              inlineCellError?.cellKey === `t1-${u.id}-alergiKecil`
+                                ? "ring-2 ring-rose-500 bg-rose-50"
+                                : ""
+                            }`}
                           />
                         </td>
                         {showSampelColInTable1 && (
@@ -2197,11 +3332,19 @@ export default function PenerimaManfaatTab({
                               <input
                                 type="number"
                                 min="0"
+                                step="1"
                                 value={numInputVal(u.sampelBesar)}
+                                onKeyDown={(e) =>
+                                  handleTableNumericKeyDown(e, `t1-${u.id}-sampelBesar`, "tabel1")
+                                }
                                 onChange={(e) =>
                                   handleUraianInlineChange(u.id, "sampelBesar", e.target.value)
                                 }
-                                className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-blue-100/70 py-0.5 rounded tabular-nums"
+                                className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-blue-100/70 py-0.5 rounded tabular-nums ${
+                                  inlineCellError?.cellKey === `t1-${u.id}-sampelBesar`
+                                    ? "ring-2 ring-rose-500 bg-rose-50"
+                                    : ""
+                                }`}
                               />
                             </td>
                             <td
@@ -2211,17 +3354,27 @@ export default function PenerimaManfaatTab({
                               <input
                                 type="number"
                                 min="0"
+                                step="1"
                                 value={numInputVal(u.sampelKecil)}
+                                onKeyDown={(e) =>
+                                  handleTableNumericKeyDown(e, `t1-${u.id}-sampelKecil`, "tabel1")
+                                }
                                 onChange={(e) =>
                                   handleUraianInlineChange(u.id, "sampelKecil", e.target.value)
                                 }
-                                className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-blue-100/70 py-0.5 rounded tabular-nums"
+                                className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-blue-100/70 py-0.5 rounded tabular-nums ${
+                                  inlineCellError?.cellKey === `t1-${u.id}-sampelKecil`
+                                    ? "ring-2 ring-rose-500 bg-rose-50"
+                                    : ""
+                                }`}
                               />
                             </td>
                           </>
                         )}
                         <td
-                          className="border border-black px-2 py-1.5 text-center font-medium text-black align-middle tabular-nums"
+                          className={`border border-black px-2 py-1.5 text-center font-medium align-middle tabular-nums ${
+                            isRowOverSchoolCap ? "text-amber-900 font-bold" : "text-black"
+                          }`}
                           style={{ backgroundColor: isEditingThis ? "#FEF9C3" : "#FFFFFF" }}
                         >
                           {rowTotal}
@@ -2353,10 +3506,28 @@ export default function PenerimaManfaatTab({
                 TABEL 2. REKAPITULASI KESELURUHAN PENERIMA MANFAAT (HARI KE-{selectedDay})
               </h3>
             </div>
-            <span className="text-xs font-bold text-indigo-800 bg-indigo-50 border border-indigo-200 px-2.5 py-1 rounded-lg no-print self-start">
-              13 Kelompok Sasaran (termasuk Sampel)
-            </span>
+            <div className="flex items-center gap-2 flex-wrap no-print self-start">
+              {dayCapacityStatus.isOver && (
+                <span className="inline-flex items-center gap-1 text-xs font-bold text-rose-800 bg-rose-50 border border-rose-300 px-2.5 py-1 rounded-lg">
+                  <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
+                  Melebihi Kapasitas Sekolah Terdaftar
+                </span>
+              )}
+              <span className="text-xs font-bold text-indigo-800 bg-indigo-50 border border-indigo-200 px-2.5 py-1 rounded-lg">
+                13 Kelompok Sasaran (termasuk Sampel)
+              </span>
+            </div>
           </div>
+
+          {inlineCellError?.table === "tabel2" && (
+            <div
+              role="alert"
+              className="flex items-center gap-2 px-3 py-2 rounded-xl bg-rose-50 border border-rose-300 text-rose-800 text-xs font-bold no-print"
+            >
+              <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span>{inlineCellError.message}</span>
+            </div>
+          )}
 
           <div className="overflow-x-auto">
             <table
@@ -2485,15 +3656,19 @@ export default function PenerimaManfaatTab({
                           id={`input-pm-besar-${s.id}`}
                           type="number"
                           min="0"
+                          step="1"
                           value={numInputVal(s.porsiBesar)}
-                          onChange={(e) =>
-                            handleCellChangeTable2(
-                              s.id,
-                              "porsiBesar",
-                              Math.max(0, parseInt(e.target.value, 10) || 0)
-                            )
+                          onKeyDown={(e) =>
+                            handleTableNumericKeyDown(e, `t2-${s.id}-porsiBesar`, "tabel2")
                           }
-                          className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums"
+                          onChange={(e) =>
+                            handleCellChangeTable2(s.id, "porsiBesar", e.target.value)
+                          }
+                          className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums ${
+                            inlineCellError?.cellKey === `t2-${s.id}-porsiBesar`
+                              ? "ring-2 ring-rose-500 bg-rose-50"
+                              : ""
+                          }`}
                         />
                       </td>
                       <td
@@ -2504,15 +3679,19 @@ export default function PenerimaManfaatTab({
                           id={`input-pm-kecil-${s.id}`}
                           type="number"
                           min="0"
+                          step="1"
                           value={numInputVal(s.porsiKecil)}
-                          onChange={(e) =>
-                            handleCellChangeTable2(
-                              s.id,
-                              "porsiKecil",
-                              Math.max(0, parseInt(e.target.value, 10) || 0)
-                            )
+                          onKeyDown={(e) =>
+                            handleTableNumericKeyDown(e, `t2-${s.id}-porsiKecil`, "tabel2")
                           }
-                          className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums"
+                          onChange={(e) =>
+                            handleCellChangeTable2(s.id, "porsiKecil", e.target.value)
+                          }
+                          className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-emerald-50 py-0.5 rounded tabular-nums ${
+                            inlineCellError?.cellKey === `t2-${s.id}-porsiKecil`
+                              ? "ring-2 ring-rose-500 bg-rose-50"
+                              : ""
+                          }`}
                         />
                       </td>
                       <td
@@ -2523,15 +3702,19 @@ export default function PenerimaManfaatTab({
                           id={`input-pm-alergi-besar-${s.id}`}
                           type="number"
                           min="0"
+                          step="1"
                           value={numInputVal(s.alergiBesar)}
-                          onChange={(e) =>
-                            handleCellChangeTable2(
-                              s.id,
-                              "alergiBesar",
-                              Math.max(0, parseInt(e.target.value, 10) || 0)
-                            )
+                          onKeyDown={(e) =>
+                            handleTableNumericKeyDown(e, `t2-${s.id}-alergiBesar`, "tabel2")
                           }
-                          className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums"
+                          onChange={(e) =>
+                            handleCellChangeTable2(s.id, "alergiBesar", e.target.value)
+                          }
+                          className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums ${
+                            inlineCellError?.cellKey === `t2-${s.id}-alergiBesar`
+                              ? "ring-2 ring-rose-500 bg-rose-50"
+                              : ""
+                          }`}
                         />
                       </td>
                       <td
@@ -2542,15 +3725,19 @@ export default function PenerimaManfaatTab({
                           id={`input-pm-alergi-kecil-${s.id}`}
                           type="number"
                           min="0"
+                          step="1"
                           value={numInputVal(s.alergiKecil)}
-                          onChange={(e) =>
-                            handleCellChangeTable2(
-                              s.id,
-                              "alergiKecil",
-                              Math.max(0, parseInt(e.target.value, 10) || 0)
-                            )
+                          onKeyDown={(e) =>
+                            handleTableNumericKeyDown(e, `t2-${s.id}-alergiKecil`, "tabel2")
                           }
-                          className="w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums"
+                          onChange={(e) =>
+                            handleCellChangeTable2(s.id, "alergiKecil", e.target.value)
+                          }
+                          className={`w-full text-center bg-transparent text-xs text-black focus:outline-none focus:bg-orange-50 py-0.5 rounded tabular-nums ${
+                            inlineCellError?.cellKey === `t2-${s.id}-alergiKecil`
+                              ? "ring-2 ring-rose-500 bg-rose-50"
+                              : ""
+                          }`}
                         />
                       </td>
                       <td
@@ -2825,6 +4012,40 @@ export default function PenerimaManfaatTab({
             </div>
           </div>
         </div>
+      </div>
+
+      {/* Bottom Save Action Bar */}
+      <div className="bg-white rounded-2xl border border-slate-200 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-xs no-print">
+        <div className="text-xs text-slate-600">
+          <strong className="text-slate-900 block">
+            {isOnboardingStep && !pmSavedDone
+              ? "Sudah selesai menyesuaikan seluruh data Penerima Manfaat?"
+              : "Simpan & Sinkronkan Data Penerima Manfaat"}
+          </strong>
+          <span>
+            Total aktif Hari Ke-{selectedDay}:{" "}
+            <strong className="text-indigo-700 tabular-nums">
+              {totalPM.toLocaleString("id-ID")} porsi
+            </strong>{" "}
+            ({activeUraian.length} unit pada Tabel 1).
+          </span>
+        </div>
+        <button
+          type="button"
+          id="btn-save-pm-bottom"
+          disabled={isSavingPM}
+          onClick={handleSavePmClick}
+          className="px-5 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white text-xs font-extrabold flex items-center justify-center gap-2 transition cursor-pointer whitespace-nowrap shadow-xs"
+        >
+          <Save className="w-4 h-4" />
+          <span>
+            {isSavingPM
+              ? "Menyimpan Data PM..."
+              : isOnboardingStep && !pmSavedDone
+                ? "Simpan Data PM & Selesai"
+                : "Simpan Data Penerima Manfaat"}
+          </span>
+        </button>
       </div>
 
       <PrintPreviewModal

@@ -345,12 +345,12 @@ export const EMPTY_HARIAN_PM: HariPM[] = Array.from({ length: 10 }, (_, i) => ({
 }));
 
 export const EMPTY_MASTER_MENU: MasterMenu = {
-  usiaSekolah: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buahSusu: "" })),
-  tigaB: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buahSusu: "" })),
-  mpAsi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buahSusu: "" })),
-  usiaSekolahAlergi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buahSusu: "" })),
-  tigaBAlergi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buahSusu: "" })),
-  mpAsiAlergi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buahSusu: "" }))
+  usiaSekolah: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buah: "", susu: "", buahSusu: "" })),
+  tigaB: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buah: "", susu: "", buahSusu: "" })),
+  mpAsi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buah: "", susu: "", buahSusu: "" })),
+  usiaSekolahAlergi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buah: "", susu: "", buahSusu: "" })),
+  tigaBAlergi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buah: "", susu: "", buahSusu: "" })),
+  mpAsiAlergi: Array.from({ length: 10 }, () => ({ namaMenu: "", karbohidrat: "", laukHewani: "", laukNabati: "", sayur: "", buah: "", susu: "", buahSusu: "" }))
 };
 
 export const EMPTY_FOOD_COST_DAYS: FoodCostDay[] = Array.from({ length: 10 }, (_, i) => ({

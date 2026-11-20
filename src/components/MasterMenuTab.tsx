@@ -35,6 +35,7 @@ import {
   getDurationBadgeLabel,
   groupDatesIntoWeeks,
   normalizeMenuItem,
+  parseCommaMenuComponents,
   resizeMenuDays,
   syncMasterMenuToLegacy,
 } from "../utils/menuSchedule";
@@ -375,7 +376,38 @@ export default function MasterMenuTab({
       [field]: value,
     };
 
-    if (field === "buah" || field === "susu") {
+    if (field === "namaMenu") {
+      const otherComponentsEmpty =
+        !(current.laukHewani || "").trim() &&
+        !(current.laukNabati || "").trim() &&
+        !(current.sayur || "").trim() &&
+        !(current.buah || "").trim() &&
+        !(current.susu || "").trim();
+      const prevParsed = parseCommaMenuComponents(current.namaMenu || "");
+      const componentsMatchPrevNama =
+        (current.karbohidrat || "").trim() === prevParsed.karbohidrat &&
+        (current.laukHewani || "").trim() === prevParsed.laukHewani &&
+        (current.laukNabati || "").trim() === prevParsed.laukNabati &&
+        (current.sayur || "").trim() === prevParsed.sayur &&
+        (current.buah || "").trim() === prevParsed.buah &&
+        (current.susu || "").trim() === prevParsed.susu;
+
+      if (
+        value.includes(",") ||
+        (current.namaMenu || "").includes(",") ||
+        otherComponentsEmpty ||
+        componentsMatchPrevNama
+      ) {
+        const parsed = parseCommaMenuComponents(value);
+        updatedItem.karbohidrat = parsed.karbohidrat;
+        updatedItem.laukHewani = parsed.laukHewani;
+        updatedItem.laukNabati = parsed.laukNabati;
+        updatedItem.sayur = parsed.sayur;
+        updatedItem.buah = parsed.buah;
+        updatedItem.susu = parsed.susu;
+        updatedItem.buahSusu = parsed.buahSusu;
+      }
+    } else if (field === "buah" || field === "susu") {
       const buahVal = field === "buah" ? value : updatedItem.buah || "";
       const susuVal = field === "susu" ? value : updatedItem.susu || "";
       updatedItem.buahSusu = [buahVal.trim(), susuVal.trim()].filter(Boolean).join(" + ");
@@ -1126,25 +1158,48 @@ export default function MasterMenuTab({
                         type="text"
                         value={item.namaMenu}
                         onChange={(e) => handleDayFieldChange(idx, "namaMenu", e.target.value)}
-                        placeholder={autoComposed || "Otomatis dari gabungan komponen"}
+                        placeholder={
+                          autoComposed ||
+                          "Ketik dipisah koma: Nasi Putih, Ikan Goreng, Tahu, Sayur, Buah, Susu"
+                        }
                         className="w-full px-2.5 py-1.5 bg-indigo-50/40 border border-indigo-200 rounded-lg text-xs font-bold text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                       />
+                      <p className="text-[10px] text-slate-500 mt-1 leading-tight">
+                        Pisahkan dengan tanda koma (<span className="font-bold text-indigo-700">,</span>) untuk mengisi otomatis baris Makanan Pokok → Lauk Hewani → Lauk Nabati → Sayuran → Buah → Susu.
+                      </p>
                     </div>
 
-                    {MENU_COMPONENT_ROWS.map((row) => (
-                      <div key={row.key} className="grid grid-cols-12 items-center gap-2">
-                        <span className="col-span-4 text-[11px] font-semibold text-slate-600">
-                          {row.label}
-                        </span>
-                        <input
-                          type="text"
-                          value={item[row.key] || ""}
-                          onChange={(e) => handleDayFieldChange(idx, row.key, e.target.value)}
-                          placeholder={row.placeholder}
-                          className="col-span-8 px-2.5 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:bg-white"
-                        />
-                      </div>
-                    ))}
+                    {MENU_COMPONENT_ROWS.map((row, rowIdx) => {
+                      const hasCommaDraft = (item.namaMenu || "").includes(",");
+                      const activeCommaStep = hasCommaDraft
+                        ? Math.min(MENU_COMPONENT_ROWS.length - 1, (item.namaMenu || "").split(",").length - 1)
+                        : -1;
+                      const isActiveStep = activeCommaStep === rowIdx;
+                      return (
+                        <div key={row.key} className="grid grid-cols-12 items-center gap-2">
+                          <span
+                            className={`col-span-4 text-[11px] font-semibold ${
+                              isActiveStep ? "text-indigo-700 font-bold" : "text-slate-600"
+                            }`}
+                          >
+                            {row.label}
+                          </span>
+                          <input
+                            type="text"
+                            value={item[row.key] || ""}
+                            onChange={(e) => handleDayFieldChange(idx, row.key, e.target.value)}
+                            placeholder={row.placeholder}
+                            className={`col-span-8 px-2.5 py-1.5 rounded-lg text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:bg-white border ${
+                              isActiveStep
+                                ? "bg-indigo-50/50 border-indigo-300"
+                                : (item[row.key] || "").trim()
+                                  ? "bg-emerald-50/35 border-emerald-200"
+                                  : "bg-slate-50 border-slate-200"
+                            }`}
+                          />
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
               </div>

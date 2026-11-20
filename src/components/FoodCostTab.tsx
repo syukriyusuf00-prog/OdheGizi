@@ -8,7 +8,7 @@ import { TKPIItem, BahanMakananInput, FoodCostDay, MasterMenu, HariPM, UnifiedKo
 import { calculateDay, formatRupiah, getCountsForDay, CalcIngredientResult } from "../utils/calc";
 import SearchableTkpiDropdown from "./SearchableTkpiDropdown";
 import { PriceCalculatorPopover } from "./PriceCalculatorPopover";
-import { Plus, Trash2, HelpCircle, Sparkles, AlertTriangle, CheckCircle2, Calculator, Info, Sliders, Printer, Download, FileSpreadsheet, Edit3, RefreshCw, Image as ImageIcon, Settings, Eye, Layers, Tag, ChevronDown, ChevronUp, X, Check } from "lucide-react";
+import { Plus, Trash2, HelpCircle, Sparkles, AlertTriangle, CheckCircle2, Calculator, Info, Sliders, Printer, Download, FileSpreadsheet, Edit3, RefreshCw, Image as ImageIcon, Settings, Eye, Layers, Tag, ChevronDown, ChevronUp, X, Check, Send } from "lucide-react";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import * as XLSX from "xlsx";
@@ -59,6 +59,7 @@ interface FoodCostTabProps {
   setPmSettings?: (val: any) => void;
   onNavigateToMasterMenu?: () => void;
   onNavigateToPM?: () => void;
+  onSendToNotaPesanan?: () => void;
   isAdmin?: boolean;
 }
 
@@ -167,7 +168,8 @@ export default function FoodCostTab({
   setBumbuPct: propSetBumbuPct,
   pmSettings,
   onNavigateToMasterMenu,
-  onNavigateToPM
+  onNavigateToPM,
+  onSendToNotaPesanan
 }: FoodCostTabProps) {
   const normalizedMasterMenu = React.useMemo(
     () => ensureMasterMenuPlans(masterMenu, profile?.periodeDates),
@@ -3436,29 +3438,46 @@ export default function FoodCostTab({
             Kalkulasi unit cost, kecukupan gizi rujukan AKG, penyusutan (buffer), dan ekspor A4 Landscape presisi.
           </p>
         </div>
-        <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 shadow-xs shrink-0 self-end sm:self-center items-center gap-1.5">
-          <button
-            type="button"
-            id="btn-mode-fc-edit"
-            onClick={() => setViewMode("edit")}
-            className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
-              viewMode === "edit" ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-800"
-            }`}
-          >
-            <Edit3 className="w-3.5 h-3.5" />
-            Mode Edit Kalkulator
-          </button>
-          <button
-            type="button"
-            id="btn-mode-fc-print"
-            onClick={() => setViewMode("print")}
-            className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
-              viewMode === "print" ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-800"
-            }`}
-          >
-            <Printer className="w-3.5 h-3.5" />
-            Pratinjau Cetak {paperSize} / Ekspor
-          </button>
+        <div className="flex flex-wrap items-center gap-2 shrink-0 self-end sm:self-center">
+          {onSendToNotaPesanan && (
+            <button
+              type="button"
+              id="btn-send-fc-to-nota"
+              onClick={() => {
+                onFoodCostDaysChange([...foodCostDays]);
+                onSendToNotaPesanan();
+              }}
+              className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 transition cursor-pointer whitespace-nowrap shadow-xs"
+              title="Kirim perencanaan Food Cost dan langsung menuju ke panel Nota Pesanan"
+            >
+              <Send className="w-3.5 h-3.5" />
+              Kirim Perencanaan
+            </button>
+          )}
+          <div className="flex bg-slate-100 p-1 rounded-xl border border-slate-200 shadow-xs items-center gap-1.5">
+            <button
+              type="button"
+              id="btn-mode-fc-edit"
+              onClick={() => setViewMode("edit")}
+              className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+                viewMode === "edit" ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              <Edit3 className="w-3.5 h-3.5" />
+              Mode Edit Kalkulator
+            </button>
+            <button
+              type="button"
+              id="btn-mode-fc-print"
+              onClick={() => setViewMode("print")}
+              className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 cursor-pointer ${
+                viewMode === "print" ? "bg-white text-indigo-600 shadow-sm" : "text-slate-500 hover:text-slate-800"
+              }`}
+            >
+              <Printer className="w-3.5 h-3.5" />
+              Pratinjau Cetak {paperSize} / Ekspor
+            </button>
+          </div>
         </div>
       </div>
 

@@ -3,10 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { GoogleAuthProvider, signInWithPopup } from "firebase/auth";
-import { auth } from "./firebase";
+import { getApps, initializeApp } from "firebase/app";
+import {
+  getAuth,
+  GoogleAuthProvider,
+  inMemoryPersistence,
+  setPersistence,
+  signInWithPopup,
+  signOut,
+} from "firebase/auth";
+import firebaseConfig from "../../firebase-applet-config.json";
 
 export const GOOGLE_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive.file";
+export const DRIVE_FIREBASE_PROJECT_ID = firebaseConfig.projectId;
+export const DRIVE_OAUTH_AUDIENCE_URL = `https://console.cloud.google.com/auth/audience?project=${encodeURIComponent(
+  DRIVE_FIREBASE_PROJECT_ID
+)}`;
 
 export interface DriveSessionInfo {
   accessToken: string;
@@ -23,9 +35,46 @@ export interface DriveUploadResult {
   folderWebViewLink?: string;
 }
 
+export type DriveAuthErrorCode =
+  | "testing_access_denied"
+  | "unauthorized_domain"
+  | "popup_blocked"
+  | "popup_closed"
+  | "popup_timeout"
+  | "cancelled"
+  | "network_blocked"
+  | "missing_token"
+  | "unknown";
+
+export class DriveConnectionError extends Error {
+  code: DriveAuthErrorCode;
+  attemptedEmail?: string;
+
+  constructor(code: DriveAuthErrorCode, message: string, attemptedEmail?: string) {
+    super(message);
+    this.name = "DriveConnectionError";
+    this.code = code;
+    this.attemptedEmail = attemptedEmail;
+  }
+}
+
+export interface ConnectDriveOptions {
+  skipLoginHint?: boolean;
+}
+
+// Dedicated secondary Firebase App with strictly in-memory persistence so connecting Drive
+// never overwrites or hijacks the user's primary SISPERMBG authentication session.
+const DRIVE_APP_NAME = "sisper_drive_oauth";
+function getDriveAuthInstance() {
+  const existing = getApps().find((a) => a.name === DRIVE_APP_NAME);
+  const driveApp = existing || initializeApp(firebaseConfig, DRIVE_APP_NAME);
+  return getAuth(driveApp);
+}
+
 // Strict in-memory OAuth token storage (never persisted to localStorage or sessionStorage)
 let inMemoryDriveSession: DriveSessionInfo | null = null;
 let isDriveConnectingFlag = false;
+let activeCancelReject: ((err: DriveConnectionError) => void) | null = null;
 
 export function getDriveSession(): DriveSessionInfo | null {
   return inMemoryDriveSession;
@@ -33,10 +82,32 @@ export function getDriveSession(): DriveSessionInfo | null {
 
 export function clearDriveSession(): void {
   inMemoryDriveSession = null;
+  try {
+    const driveAuth = getDriveAuthInstance();
+    void signOut(driveAuth).catch(() => {});
+  } catch {
+    // ignore secondary auth cleanup errors
+  }
 }
 
 export function getIsDriveConnecting(): boolean {
   return isDriveConnectingFlag;
+}
+
+export function cancelGoogleDriveConnect(): void {
+  if (activeCancelReject) {
+    const rejectFn = activeCancelReject;
+    activeCancelReject = null;
+    isDriveConnectingFlag = false;
+    rejectFn(
+      new DriveConnectionError(
+        "cancelled",
+        "Proses menghubungkan Google Drive dibatalkan. Anda dapat mencoba lagi kapan saja."
+      )
+    );
+  } else {
+    isDriveConnectingFlag = false;
+  }
 }
 
 export function sanitizeDriveName(name: string, fallback = "Arsip"): string {
@@ -48,65 +119,158 @@ export function sanitizeDriveName(name: string, fallback = "Arsip"): string {
   return cleaned.slice(0, 90);
 }
 
+function classifyDriveAuthError(err: any, attemptedEmail?: string): DriveConnectionError {
+  if (err instanceof DriveConnectionError) return err;
+
+  const code = String(err?.code || "").toLowerCase();
+  const rawMsg = String(err?.message || err || "");
+  const lowerMsg = rawMsg.toLowerCase();
+
+  if (
+    lowerMsg.includes("access_denied") ||
+    lowerMsg.includes("403") ||
+    lowerMsg.includes("verification process") ||
+    lowerMsg.includes("being tested") ||
+    lowerMsg.includes("developer-approved") ||
+    lowerMsg.includes("org_internal") ||
+    lowerMsg.includes("admin_policy_enforced") ||
+    code === "auth/admin-restricted-operation"
+  ) {
+    const emailLabel = attemptedEmail ? ` (${attemptedEmail})` : "";
+    return new DriveConnectionError(
+      "testing_access_denied",
+      `Akses Google Drive diblokir (Error 403: access_denied) untuk akun${emailLabel} karena aplikasi OAuth Google (${DRIVE_FIREBASE_PROJECT_ID}) masih berstatus Testing. Tambahkan email tersebut di Google Auth Platform → Audience → Test users (atau klik Publish App), lalu coba lagi atau pilih akun developer yang sudah terdaftar.`,
+      attemptedEmail
+    );
+  }
+
+  if (code === "auth/unauthorized-domain") {
+    const host = typeof window !== "undefined" ? window.location.hostname : "domain ini";
+    return new DriveConnectionError(
+      "unauthorized_domain",
+      `Domain "${host}" belum terdaftar di Firebase Authentication → Settings → Authorized domains. Tambahkan domain tersebut di Firebase Console lalu coba hubungkan Google Drive kembali.`,
+      attemptedEmail
+    );
+  }
+
+  if (code === "auth/popup-blocked") {
+    return new DriveConnectionError(
+      "popup_blocked",
+      "Pop-up Google Drive diblokir browser. Izinkan pop-up untuk situs ini atau buka aplikasi di Tab Baru lalu coba kembali.",
+      attemptedEmail
+    );
+  }
+
+  if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
+    return new DriveConnectionError(
+      "popup_closed",
+      "Jendela login Google Drive ditutup sebelum otorisasi selesai. Jika di pop-up muncul pesan 'Access blocked / Error 403', tambahkan email Anda ke daftar Test Users Google Cloud atau pilih akun Google lain.",
+      attemptedEmail
+    );
+  }
+
+  if (code === "auth/network-request-failed") {
+    return new DriveConnectionError(
+      "network_blocked",
+      "Koneksi ke Google Auth terhalang iframe atau jaringan. Silakan buka aplikasi di Tab Baru lalu hubungkan Google Drive.",
+      attemptedEmail
+    );
+  }
+
+  return new DriveConnectionError(
+    "unknown",
+    rawMsg || "Gagal menghubungkan Google Drive. Silakan coba lagi.",
+    attemptedEmail
+  );
+}
+
 /**
- * Connects user's active Google account for Google Drive access using Firebase Auth popup.
- * Uses only the existing Firebase app/auth instance and stores the OAuth access token in memory.
+ * Connects user's Google account for Google Drive access using an isolated in-memory Firebase Auth popup.
+ * Stores the OAuth access token strictly in memory so it never clobbers the primary SISPERMBG session.
  */
-export async function connectGoogleDrive(hintEmail?: string): Promise<DriveSessionInfo> {
+export async function connectGoogleDrive(
+  hintEmail?: string,
+  options?: ConnectDriveOptions
+): Promise<DriveSessionInfo> {
+  // Clean up any stale in-flight connection first so UI can never stay stuck
+  if (activeCancelReject) {
+    try {
+      activeCancelReject(
+        new DriveConnectionError("cancelled", "Permintaan login sebelumnya digantikan permintaan baru.")
+      );
+    } catch {
+      // ignore
+    }
+    activeCancelReject = null;
+  }
+
+  const cleanHint =
+    !options?.skipLoginHint &&
+    hintEmail &&
+    hintEmail.includes("@") &&
+    !hintEmail.endsWith("@sispermbg.id")
+      ? hintEmail.trim()
+      : undefined;
+
   const provider = new GoogleAuthProvider();
   provider.addScope(GOOGLE_DRIVE_SCOPE);
 
   const customParams: Record<string, string> = {
-    prompt: "select_account",
+    prompt: "select_account consent",
   };
-  if (hintEmail && hintEmail.includes("@") && !hintEmail.endsWith("@sispermbg.id")) {
-    customParams.login_hint = hintEmail.trim();
+  if (cleanHint) {
+    customParams.login_hint = cleanHint;
   }
   provider.setCustomParameters(customParams);
 
+  const driveAuth = getDriveAuthInstance();
   isDriveConnectingFlag = true;
+
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
   try {
-    const result = await signInWithPopup(auth, provider);
+    await setPersistence(driveAuth, inMemoryPersistence).catch(() => {});
+
+    const popupPromise = signInWithPopup(driveAuth, provider);
+    const guardPromise = new Promise<never>((_, reject) => {
+      activeCancelReject = reject;
+      timeoutId = setTimeout(() => {
+        activeCancelReject = null;
+        reject(
+          new DriveConnectionError(
+            "popup_timeout",
+            "Waktu tunggu otorisasi Google Drive habis (popup tertutup atau tertahan). Silakan klik Hubungkan ulang atau pilih akun Google lain.",
+            cleanHint
+          )
+        );
+      }, 120_000);
+    });
+
+    const result = await Promise.race([popupPromise, guardPromise]);
     const credential = GoogleAuthProvider.credentialFromResult(result);
     const accessToken = credential?.accessToken;
 
     if (!accessToken) {
-      throw new Error(
-        "Token akses Google Drive tidak diterima. Pastikan izin akses Google Drive dicentang saat login Google."
+      throw new DriveConnectionError(
+        "missing_token",
+        "Token akses Google Drive tidak diterima. Pastikan kotak izin Google Drive dicentang saat login Google.",
+        result.user?.email || cleanHint
       );
     }
 
     const session: DriveSessionInfo = {
       accessToken,
-      email: result.user?.email || hintEmail || "Akun Google Terhubung",
+      email: result.user?.email || cleanHint || "Akun Google Terhubung",
       displayName: result.user?.displayName || undefined,
       connectedAt: Date.now(),
     };
     inMemoryDriveSession = session;
     return session;
   } catch (err: any) {
-    const code = err?.code || "";
-    if (code === "auth/unauthorized-domain") {
-      const host = typeof window !== "undefined" ? window.location.hostname : "domain ini";
-      throw new Error(
-        `Domain "${host}" belum terdaftar di Firebase Authentication → Settings → Authorized domains. Tambahkan domain tersebut di Firebase Console lalu coba hubungkan Google Drive kembali.`
-      );
-    }
-    if (code === "auth/popup-blocked") {
-      throw new Error(
-        "Pop-up Google Drive diblokir browser. Izinkan pop-up atau klik 'Buka di Tab Baru' di kanan atas pratinjau."
-      );
-    }
-    if (code === "auth/popup-closed-by-user") {
-      throw new Error("Jendela login Google Drive ditutup sebelum otorisasi selesai.");
-    }
-    if (code === "auth/network-request-failed") {
-      throw new Error(
-        "Koneksi ke Google Auth terhalang iframe browser. Silakan buka aplikasi di Tab Baru lalu hubungkan Google Drive."
-      );
-    }
-    throw err;
+    throw classifyDriveAuthError(err, cleanHint);
   } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+    activeCancelReject = null;
     isDriveConnectingFlag = false;
   }
 }

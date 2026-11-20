@@ -142,6 +142,8 @@ export interface SopDataState {
   dateMode?: "bulan_aktif" | "siklus";
   workDaysPerWeek?: 5 | 6 | 7;
   selectedPlanId?: string;
+  selectedPlanIds?: string[];
+  selectedSubTabs?: ("organoleptik" | "sampel" | "penyimpanan")[];
   showKop?: boolean;
   showDigitalTtd?: boolean;
   organoleptikSignatureMode?: "petugas" | "ttd_profil";
@@ -181,6 +183,39 @@ export interface IkssDailyPostMeta {
   updatedAt?: string;
 }
 
+export interface IkssIdentityOverride {
+  namaLembaga?: string;
+  idSPPG?: string;
+  alamat?: string;
+  kabKota?: string;
+  provinsi?: string;
+  namaAhliGizi?: string;
+  noHpSPPI?: string;
+}
+
+export interface IkssDayOverride {
+  tanggal?: string;
+  namaMenu?: string;
+  namaSppg?: string;
+  idSppg?: string;
+  energi?: number;
+  protein?: number;
+  lemak?: number;
+  kh?: number;
+  serat?: number;
+  jumlahManfaat?: number;
+  updatedAt?: string;
+}
+
+export interface IkssWorksheetConfig {
+  id: string;
+  title: string;
+  sasaranIds: string[];
+  foodCostTypes: string[];
+  customDayCount?: number;
+  akgOverride?: IkssAkgOverride;
+}
+
 export interface IkssDataState {
   selectedFoodCostTypes: string[];
   selectedSasaranIds: string[];
@@ -188,6 +223,14 @@ export interface IkssDataState {
   customPeriodeLabel?: string;
   showKopOnIkss?: boolean;
   akgOverride?: IkssAkgOverride;
+  /** Multi-worksheet configurations so users can view/print/archive several Kelompok Sasaran worksheets at once */
+  worksheetConfigs?: IkssWorksheetConfig[];
+  /** Optional IKSS-only overrides for SPPG identity block (defaults to SPPGProfile) */
+  identityOverride?: IkssIdentityOverride;
+  /** Manual per-day overrides for nutrition, PM count, menu name, date, and SPPG identity keyed by `${groupKey}__day_${hariKe}` */
+  dayOverrides?: Record<string, IkssDayOverride>;
+  /** Optional custom number of rows when user adds/adjusts rows manually */
+  customDayCount?: number;
   /** Legacy inline photo map — automatically migrated into async IndexedDB + chunked cloud batches */
   photos: Record<string, string>;
   /** Lightweight per-day posting metadata keyed by `${groupKey}__day_${hariKe}` */
@@ -214,6 +257,10 @@ export interface SPPGProfile {
   periodeDates: string[]; // dynamic dates synchronized from Master Menu
   awalPeriodeBerikutnya: string;
   ttdConfig?: SPPGSignatureConfig;
+  onboardingStep?: "sppg" | "penerima" | "done";
+  onboardingCompleted?: boolean;
+  sppgSavedAt?: string;
+  pmSavedAt?: string;
 }
 
 export interface SekolahPM {
@@ -407,4 +454,42 @@ export interface TargetAKG {
   proteinMin: number;
   lemakMin: number;
   khMin: number;
+}
+
+export interface SavedDocArchiveWorksheet {
+  id?: string;
+  title: string;
+  subtitle?: string;
+  subLabel?: string;
+  sasaranLabel?: string;
+  subType?: string;
+  headers?: string[];
+  columns?: string[];
+  rows: Array<Array<string | number>>;
+  summaryRows?: Array<Array<string | number>>;
+  footerSummary?: string[];
+  metaLines?: Array<{ label: string; value: string }>;
+}
+
+export interface SavedDocArchive {
+  id: string;
+  source: "ikss" | "sop";
+  subType: string;
+  title: string;
+  periodeLabel: string;
+  sppgName?: string;
+  idSppg?: string;
+  savedAt?: string;
+  createdAt?: string;
+  createdAtIso?: string;
+  worksheetCount?: number;
+  sasaranSummary: string;
+  worksheetConfigs?: IkssWorksheetConfig[];
+  selectedPlanIds?: string[];
+  selectedSubTabs?: ("organoleptik" | "sampel" | "penyimpanan")[];
+  worksheets: SavedDocArchiveWorksheet[];
+  restoreConfig?: {
+    ikssDataPatch?: Partial<IkssDataState>;
+    sopDataPatch?: Partial<SopDataState>;
+  };
 }

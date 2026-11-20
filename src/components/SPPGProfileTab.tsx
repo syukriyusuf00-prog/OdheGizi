@@ -27,14 +27,40 @@ import {
   Printer,
   Upload,
   X,
+  ArrowRight,
+  Save,
 } from "lucide-react";
 import AutoSignatureBlock, { resolveSignatureConfig } from "./AutoSignatureBlock";
 import { KopSuratRenderHeader } from "./KopSuratConfigSection";
 import { printElementSmart } from "../lib/printUtils";
 
+const REQUIRED_SPPG_FIELDS: Array<{
+  key: keyof SPPGProfile;
+  label: string;
+  inputId: string;
+}> = [
+  { key: "idSPPG", label: "ID SPPG", inputId: "input-id-sppg" },
+  { key: "namaLembaga", label: "Nama Lembaga / SPPG", inputId: "input-nama-lembaga" },
+  { key: "alamat", label: "Alamat Lengkap", inputId: "input-alamat" },
+  { key: "kabKota", label: "Kabupaten / Kota", inputId: "input-kab-kota" },
+  { key: "provinsi", label: "Provinsi", inputId: "input-provinsi" },
+  { key: "noHpSPPI", label: "Nomor Handphone (SPPI / AG)", inputId: "input-no-hp-sppi" },
+  { key: "namaKepala", label: "Nama Kepala SPPG", inputId: "input-kepala" },
+  { key: "namaAhliGizi", label: "Nama Ahli Gizi / SPPI", inputId: "input-ahli-gizi" },
+  { key: "namaYayasan", label: "Nama Yayasan", inputId: "input-yayasan" },
+  { key: "ketuaYayasan", label: "Ketua Yayasan", inputId: "input-ketua-yayasan" },
+  { key: "namaAkuntan", label: "Nama Akuntan", inputId: "input-nama-akuntan" },
+  { key: "tahunAnggaran", label: "Tahun Anggaran", inputId: "input-tahun-anggaran" },
+];
+
 interface SPPGProfileTabProps {
   profile: SPPGProfile;
   onChange: (updated: SPPGProfile) => void;
+  isOnboardingStep?: boolean;
+  onSaveProfile?: (
+    updated: SPPGProfile,
+    options?: { continueToPm?: boolean }
+  ) => Promise<void> | void;
   kopLine1?: string;
   setKopLine1?: (val: string) => void;
   kopLine2?: string;
@@ -132,6 +158,8 @@ async function compressSignatureImage(file: File): Promise<string> {
 export default function SPPGProfileTab({
   profile,
   onChange,
+  isOnboardingStep = false,
+  onSaveProfile,
   kopLine1 = "BADAN GIZI NASIONAL",
   setKopLine1,
   kopLine2 = "SATUAN PELAYANAN PEMENUHAN GIZI",
@@ -156,16 +184,65 @@ export default function SPPGProfileTab({
   const [kopSubSection, setKopSubSection] = useState<"kop" | "ttd">("kop");
   const [showLeftWidthSlider, setShowLeftWidthSlider] = useState(false);
   const [showRightWidthSlider, setShowRightWidthSlider] = useState(false);
+  const [showMissingHighlight, setShowMissingHighlight] = useState(false);
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
+
+  const missingFields = REQUIRED_SPPG_FIELDS.filter(
+    (f) => !String(profile[f.key] || "").trim()
+  );
+  const filledFieldCount = REQUIRED_SPPG_FIELDS.length - missingFields.length;
+  const isAllProfileFilled = missingFields.length === 0;
+  const isFieldMissing = (key: keyof SPPGProfile) =>
+    showMissingHighlight && !String(profile[key] || "").trim();
 
   const showToast = (type: "success" | "warning", text: string) => {
     setFeedbackBanner({ type, text });
     setTimeout(() => {
       setFeedbackBanner((prev) => (prev?.text === text ? null : prev));
-    }, 4000);
+    }, 4500);
   };
 
   const handleChange = (field: keyof SPPGProfile, value: any) => {
     onChange({ ...profile, [field]: value });
+  };
+
+  const handleSaveAndProceed = async (continueToPm: boolean) => {
+    if (!isAllProfileFilled) {
+      setShowMissingHighlight(true);
+      const firstMissing = missingFields[0];
+      showToast(
+        "warning",
+        `Mohon lengkapi semua kolom Profil SPPG (${missingFields.length} kolom belum terisi: ${missingFields
+          .slice(0, 3)
+          .map((m) => m.label)
+          .join(", ")}${missingFields.length > 3 ? ", ..." : ""}).`
+      );
+      if (firstMissing) {
+        const el = document.getElementById(firstMissing.inputId);
+        el?.scrollIntoView({ behavior: "smooth", block: "center" });
+        setTimeout(() => el?.focus(), 250);
+      }
+      return;
+    }
+
+    setShowMissingHighlight(false);
+    setIsSavingProfile(true);
+    try {
+      if (setKopLine3 && !kopLine3.trim() && profile.namaLembaga?.trim()) {
+        setKopLine3(profile.namaLembaga.trim().toUpperCase());
+      }
+      if (setKopLine4 && !kopLine4.trim() && profile.alamat?.trim()) {
+        setKopLine4(`Alamat : ${profile.alamat.trim()}`);
+      }
+      if (onSaveProfile) {
+        await onSaveProfile(profile, { continueToPm });
+      }
+      if (!continueToPm) {
+        showToast("success", "Seluruh data Profil SPPG berhasil disimpan & disinkronkan ke Cloud.");
+      }
+    } finally {
+      setIsSavingProfile(false);
+    }
   };
 
   const ttdConfig = resolveSignatureConfig(profile);
@@ -330,6 +407,53 @@ export default function SPPGProfileTab({
 
   return (
     <div id="sppg-profile-container" className="space-y-6 font-sans">
+      {/* Guided First-Login Onboarding Step 1 Banner */}
+      {isOnboardingStep && (
+        <div
+          id="sppg-onboarding-banner"
+          className="bg-gradient-to-r from-indigo-700 via-blue-700 to-emerald-700 rounded-2xl p-5 text-white shadow-sm flex flex-col lg:flex-row lg:items-center justify-between gap-4 no-print"
+        >
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-wider text-indigo-100">
+              <span>Langkah 1 dari 2 · Pengaturan Awal Akun SPPG</span>
+              <span>·</span>
+              <span className="font-mono">
+                {filledFieldCount}/{REQUIRED_SPPG_FIELDS.length} Kolom Terisi
+              </span>
+            </div>
+            <h2 className="text-lg font-extrabold tracking-tight">
+              Lengkapi Seluruh Profil SPPG Anda Terlebih Dahulu
+            </h2>
+            <p className="text-xs text-indigo-100 leading-relaxed max-w-2xl">
+              Isi seluruh 12 kolom Informasi Lembaga SPPG di bawah ini (ID SPPG, Nama Lembaga, Alamat, Kab/Kota, Provinsi, No. HP, Kepala SPPG, Ahli Gizi, Yayasan, Ketua Yayasan, Akuntan, Tahun Anggaran). Setelah lengkap, klik tombol <strong>Simpan Profil &amp; Lanjut Update PM</strong> untuk langsung diarahkan ke menu Penerima Manfaat.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              id="btn-onboarding-save-sppg-top"
+              disabled={isSavingProfile}
+              onClick={() => handleSaveAndProceed(true)}
+              className={`px-4 py-2.5 rounded-xl text-xs font-extrabold flex items-center gap-2 transition cursor-pointer whitespace-nowrap shadow-sm ${
+                isAllProfileFilled
+                  ? "bg-emerald-400 hover:bg-emerald-300 text-slate-950"
+                  : "bg-white/20 hover:bg-white/30 text-white border border-white/30"
+              }`}
+            >
+              <Save className="w-4 h-4" />
+              <span>
+                {isSavingProfile
+                  ? "Menyimpan..."
+                  : isAllProfileFilled
+                    ? "Simpan Profil & Lanjut Update PM"
+                    : `Lengkapi (${filledFieldCount}/${REQUIRED_SPPG_FIELDS.length})`}
+              </span>
+              <ArrowRight className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Global Non-blocking Status Banner */}
       {feedbackBanner && (
         <div
@@ -369,6 +493,15 @@ export default function SPPGProfileTab({
               Identitas di bawah ini terisi otomatis ke seluruh lembar kerja cetak, Master Menu, Food Cost, Nota Pesanan, Menu IKSS, Form SOP, serta footer ID SPPG dan blok TTD.
             </p>
           </div>
+          <span
+            className={`text-xs font-bold tabular-nums px-3 py-1 rounded-lg border shrink-0 self-start sm:self-auto ${
+              isAllProfileFilled
+                ? "bg-emerald-50 border-emerald-200 text-emerald-700"
+                : "bg-amber-50 border-amber-200 text-amber-800"
+            }`}
+          >
+            {filledFieldCount}/{REQUIRED_SPPG_FIELDS.length} Data Terisi
+          </span>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -381,7 +514,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.idSPPG || ""}
               onChange={(e) => handleChange("idSPPG", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-semibold tabular-nums placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-semibold tabular-nums placeholder:text-slate-400 ${
+                isFieldMissing("idSPPG") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200"
+              }`}
               placeholder="Contoh: AT9ENIQ6"
             />
           </div>
@@ -395,7 +530,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.namaLembaga}
               onChange={(e) => handleChange("namaLembaga", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("namaLembaga") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200"
+              }`}
               placeholder="SPPG Muna Barat Sawerigadi Ondoke"
             />
           </div>
@@ -409,7 +546,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.alamat}
               onChange={(e) => handleChange("alamat", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("alamat") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200"
+              }`}
               placeholder="Jl. Poros Sawerigadi No. 12, Ondoke, Muna Barat, Sulawesi Tenggara"
             />
           </div>
@@ -423,7 +562,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.kabKota || ""}
               onChange={(e) => handleChange("kabKota", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("kabKota") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200"
+              }`}
               placeholder="Contoh: MUNA BARAT"
             />
           </div>
@@ -437,7 +578,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.provinsi || ""}
               onChange={(e) => handleChange("provinsi", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("provinsi") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200"
+              }`}
               placeholder="Contoh: SULAWESI TENGGARA"
             />
           </div>
@@ -451,7 +594,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.noHpSPPI || ""}
               onChange={(e) => handleChange("noHpSPPI", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 tabular-nums"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 tabular-nums ${
+                isFieldMissing("noHpSPPI") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200"
+              }`}
               placeholder="Contoh: 082271095251"
             />
           </div>
@@ -465,7 +610,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.namaKepala}
               onChange={(e) => handleChange("namaKepala", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium bg-slate-50/60 placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("namaKepala") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200 bg-slate-50/60"
+              }`}
               placeholder="JABARNUR SALIM, S. H."
             />
           </div>
@@ -479,7 +626,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.namaAhliGizi}
               onChange={(e) => handleChange("namaAhliGizi", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium bg-slate-50/60 placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("namaAhliGizi") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200 bg-slate-50/60"
+              }`}
               placeholder="LA ODE MUHAMMAD SUKRI YUSUF, S.Tr.Gz"
             />
           </div>
@@ -493,7 +642,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.namaYayasan}
               onChange={(e) => handleChange("namaYayasan", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium bg-slate-50/60 placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("namaYayasan") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200 bg-slate-50/60"
+              }`}
               placeholder="LAWOROKU"
             />
           </div>
@@ -507,7 +658,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.ketuaYayasan}
               onChange={(e) => handleChange("ketuaYayasan", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium bg-slate-50/60 placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("ketuaYayasan") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200 bg-slate-50/60"
+              }`}
               placeholder="ALI SAMDIN"
             />
           </div>
@@ -521,7 +674,9 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.namaAkuntan}
               onChange={(e) => handleChange("namaAkuntan", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium bg-slate-50/60 placeholder:text-slate-400"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 ${
+                isFieldMissing("namaAkuntan") ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300" : "border-slate-200 bg-slate-50/60"
+              }`}
               placeholder="NUR ANISSA SA'BAN RINDO, S.Ak"
             />
           </div>
@@ -535,9 +690,64 @@ export default function SPPGProfileTab({
               type="text"
               value={profile.tahunAnggaran}
               onChange={(e) => handleChange("tahunAnggaran", e.target.value)}
-              className="w-full px-3.5 py-2.5 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 tabular-nums"
+              className={`w-full px-3.5 py-2.5 border rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 text-slate-800 font-medium placeholder:text-slate-400 tabular-nums ${
+                isFieldMissing("tahunAnggaran")
+                  ? "border-amber-400 bg-amber-50/50 ring-1 ring-amber-300"
+                  : "border-slate-200"
+              }`}
               placeholder="2026"
             />
+          </div>
+        </div>
+
+        {/* Save Action Bar right below Informasi Lembaga SPPG */}
+        <div className="mt-6 pt-5 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="text-xs text-slate-600">
+            {isAllProfileFilled ? (
+              <span className="inline-flex items-center gap-1.5 font-semibold text-emerald-700">
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                Semua 12 kolom Profil SPPG sudah lengkap dan siap disimpan.
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 font-medium text-amber-700">
+                <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+                Masih ada <strong>{missingFields.length}</strong> kolom Profil SPPG yang belum diisi.
+              </span>
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              id="btn-save-sppg-profile"
+              disabled={isSavingProfile}
+              onClick={() => handleSaveAndProceed(Boolean(isOnboardingStep))}
+              className={`px-5 py-2.5 rounded-xl text-xs font-extrabold flex items-center gap-2 transition cursor-pointer whitespace-nowrap shadow-xs ${
+                isAllProfileFilled
+                  ? "bg-emerald-600 hover:bg-emerald-700 text-white"
+                  : "bg-indigo-600 hover:bg-indigo-700 text-white"
+              }`}
+            >
+              <Save className="w-4 h-4" />
+              <span>
+                {isSavingProfile
+                  ? "Menyimpan..."
+                  : isOnboardingStep
+                    ? "Simpan Profil SPPG & Lanjut Update PM"
+                    : "Simpan Profil SPPG"}
+              </span>
+              {isOnboardingStep && <ArrowRight className="w-4 h-4" />}
+            </button>
+            {!isOnboardingStep && onSaveProfile && (
+              <button
+                type="button"
+                disabled={isSavingProfile}
+                onClick={() => handleSaveAndProceed(true)}
+                className="px-4 py-2.5 rounded-xl text-xs font-bold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 flex items-center gap-1.5 transition cursor-pointer whitespace-nowrap"
+              >
+                <span>Simpan &amp; Buka Penerima Manfaat</span>
+                <ArrowRight className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         </div>
       </div>

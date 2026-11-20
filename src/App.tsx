@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG, IkssDataState, SopDataState } from "./types";
+import { SPPGProfile, SekolahPM, TigaBPM, MasterMenu, FoodCostDay, TKPIItem, KelompokSasaranPM, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG, IkssDataState, SopDataState, SavedDocArchive } from "./types";
 import { 
   INITIAL_SPPG_PROFILE, 
   INITIAL_SEKOLAH_PM, 
@@ -308,6 +308,18 @@ export default function App() {
     return [];
   });
 
+  // Arsip Lembar Kerja Menu IKSS & Form SOP
+  const [docArchives, setDocArchives] = useState<SavedDocArchive[]>(() => {
+    const saved = safeReadStorage("sisper_doc_archives");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        return Array.isArray(parsed) ? parsed : [];
+      } catch (e) {}
+    }
+    return [];
+  });
+
   // Pengaturan Target Harga & Klasifikasi Sasaran PM
   const [pmSettings, setPmSettings] = useState<any>(() => {
     const saved = safeReadStorage("sisper_pm_settings");
@@ -463,6 +475,24 @@ export default function App() {
       user?.uid === "admin_syukriyusuf82" ||
       user?.uid === "admin_sukriyusuf82");
 
+  const resolveOnboardingStep = (
+    p: SPPGProfile,
+    isMainAdmin: boolean,
+    isDemoAcct: boolean
+  ): "sppg" | "penerima" | null => {
+    if (isMainAdmin || isDemoAcct) return null;
+    if (p.onboardingCompleted === true || p.onboardingStep === "done") return null;
+    if (p.onboardingStep === "penerima") return "penerima";
+    if (p.onboardingStep === "sppg") return "sppg";
+    const hasAnyExistingIdentity = Boolean(
+      p.namaLembaga?.trim() ||
+        p.namaKepala?.trim() ||
+        p.namaAhliGizi?.trim() ||
+        p.alamat?.trim()
+    );
+    return hasAnyExistingIdentity ? null : "sppg";
+  };
+
   const getDefaultTabForProfesi = (profesi?: string, peran?: string) => {
     if (peran === "ADMIN") return "dashboard";
     const p = (profesi || "").toLowerCase();
@@ -473,16 +503,6 @@ export default function App() {
     if (p.includes("kesehatan") || p.includes("pengawas") || p.includes("lapangan")) return "penerima";
     return "dashboard";
   };
-
-  useEffect(() => {
-    if (userProfile?.profesi && userProfile?.statusPersetujuan === "aktif") {
-      const hasChosen = sessionStorage.getItem("sisper_user_tab_chosen");
-      if (!hasChosen) {
-        const roleTab = getDefaultTabForProfesi(userProfile.profesi, userProfile.peran);
-        setActiveTab(roleTab);
-      }
-    }
-  }, [userProfile?.profesi, userProfile?.peran, userProfile?.statusPersetujuan]);
 
   // Google Email Sign-In & Waiting-for-ACC UI states
   const [isGoogleSigningIn, setIsGoogleSigningIn] = useState(false);
@@ -642,6 +662,7 @@ export default function App() {
           { id: "item_3", namaMenu: "Menu Uji Coba", tkpiId: "wortel_segar", berat: 30, urt: "1/2 gelas" }
         ]);
         setSavedPeriods([]);
+        setDocArchives([]);
         setActiveTab("dashboard");
       }
       return;
@@ -678,6 +699,7 @@ export default function App() {
             cloudKopLine4,
             cloudCekGiziItems,
             cloudSavedPeriods,
+            cloudDocArchives,
             cloudPmSettings,
             cloudKopConfig,
             cloudKopLeftLogo,
@@ -700,6 +722,7 @@ export default function App() {
             loadStateFromCloud("kopLine4"),
             loadStateFromCloud("cekGiziItems"),
             loadStateFromCloud("savedPeriods"),
+            loadStateFromCloud("docArchives"),
             loadStateFromCloud("pmSettings"),
             loadStateFromCloud("kopConfig"),
             loadStateFromCloud("kopLeftLogo"),
@@ -842,8 +865,7 @@ export default function App() {
           if (cloudMenu) {
             setMasterMenu(cloudMenu);
           } else {
-            const initialMenu = isMainAdminAccount ? INITIAL_MASTER_MENU : EMPTY_MASTER_MENU;
-            setMasterMenu(initialMenu);
+            setMasterMenu(EMPTY_MASTER_MENU);
           }
 
           if (cloudFoodCost) {
@@ -919,6 +941,15 @@ export default function App() {
             setSavedPeriods([]);
           }
 
+          if (Array.isArray(cloudDocArchives)) {
+            setDocArchives(cloudDocArchives);
+            try {
+              localStorage.setItem("sisper_doc_archives", JSON.stringify(cloudDocArchives));
+            } catch {}
+          } else {
+            setDocArchives([]);
+          }
+
           if (cloudPmSettings) {
             setPmSettings(cloudPmSettings);
           } else {
@@ -932,6 +963,27 @@ export default function App() {
           }
 
           if (!cancelled) {
+            const resolvedLoadedProfile: SPPGProfile = cloudProfile
+              ? cloudProfile
+              : isMainAdminAccount
+                ? INITIAL_SPPG_PROFILE
+                : EMPTY_SPPG_PROFILE;
+            const initialOnboardingStep = resolveOnboardingStep(
+              resolvedLoadedProfile,
+              isMainAdminAccount,
+              false
+            );
+            if (initialOnboardingStep === "sppg") {
+              setActiveTab("sppg");
+              try {
+                sessionStorage.removeItem("sisper_user_tab_chosen");
+              } catch {}
+            } else if (initialOnboardingStep === "penerima") {
+              setActiveTab("penerima");
+              try {
+                sessionStorage.removeItem("sisper_user_tab_chosen");
+              } catch {}
+            }
             localStorage.setItem("sisper_loaded_uid", user.uid);
             setLoadedCloudUid(user.uid);
             setCloudStatusMessage("Awan Aktif");
@@ -949,6 +1001,9 @@ export default function App() {
     } else {
       setLoadedCloudUid(null);
       setCloudStatusMessage("Mode Lokal");
+      try {
+        sessionStorage.removeItem("sisper_user_tab_chosen");
+      } catch {}
       // Reset all worksheet states to completely empty on logout while keeping the Admin Global Logo for Login screen
       setProfile(EMPTY_SPPG_PROFILE);
       setSekolahPM(EMPTY_SEKOLAH_PM);
@@ -974,6 +1029,8 @@ export default function App() {
       localStorage.removeItem("sisper_sop_data");
       setCekGiziItems([]);
       setSavedPeriods([]);
+      setDocArchives([]);
+      localStorage.removeItem("sisper_doc_archives");
       setPmSettings({
         porsiKecilHarga: 8000,
         porsiBesarHarga: 10000,
@@ -987,6 +1044,34 @@ export default function App() {
       cancelled = true;
     };
   }, [user?.uid, isDemoUser, userProfile?.statusPersetujuan, isMainAdminAccount]);
+
+  const activeOnboardingStep =
+    user?.uid && loadedCloudUid === user.uid
+      ? resolveOnboardingStep(profile, isMainAdminAccount, isDemoUser)
+      : null;
+
+  useEffect(() => {
+    if (
+      userProfile?.profesi &&
+      userProfile?.statusPersetujuan === "aktif" &&
+      user?.uid &&
+      loadedCloudUid === user.uid &&
+      !activeOnboardingStep
+    ) {
+      const hasChosen = sessionStorage.getItem("sisper_user_tab_chosen");
+      if (!hasChosen) {
+        const roleTab = getDefaultTabForProfesi(userProfile.profesi, userProfile.peran);
+        setActiveTab(roleTab);
+      }
+    }
+  }, [
+    userProfile?.profesi,
+    userProfile?.peran,
+    userProfile?.statusPersetujuan,
+    user?.uid,
+    loadedCloudUid,
+    activeOnboardingStep,
+  ]);
 
   const canAutoSyncCloud = Boolean(
     isCloudActive &&
@@ -1023,6 +1108,7 @@ export default function App() {
         kopLine4: kopLine4,
         cekGiziItems: JSON.stringify(cekGiziItems),
         savedPeriods: JSON.stringify(savedPeriods),
+        docArchives: JSON.stringify(docArchives),
         pmSettings: JSON.stringify(pmSettings),
         kopConfig: JSON.stringify(kopConfig),
         bumbuPct: JSON.stringify(bumbuPct),
@@ -1172,6 +1258,20 @@ export default function App() {
     const timer = scheduleCloudSaveIfChanged("savedPeriods", savedPeriods);
     return () => { if (timer) clearTimeout(timer); };
   }, [user, savedPeriods, canAutoSyncCloud]);
+
+  useEffect(() => {
+    if (!user) return;
+    try {
+      const serialized = JSON.stringify(docArchives);
+      if (serialized.length < 1_500_000) {
+        localStorage.setItem("sisper_doc_archives", serialized);
+      }
+      if (serialized.length < 900_000) {
+        const timer = scheduleCloudSaveIfChanged("docArchives", docArchives, serialized);
+        return () => { if (timer) clearTimeout(timer); };
+      }
+    } catch {}
+  }, [user, docArchives, canAutoSyncCloud]);
 
   useEffect(() => {
     if (!user) return;
@@ -1713,6 +1813,44 @@ export default function App() {
     setTimeout(() => {
       setAutoArchiveToast((cur) => (cur?.includes(firstFmt) ? null : cur));
     }, 6000);
+  };
+
+  const handleSaveDocArchive = (archive: SavedDocArchive) => {
+    setDocArchives((prev) => [archive, ...prev]);
+  };
+
+  const handleOpenDocArchive = (archive: SavedDocArchive) => {
+    if (archive.source === "ikss") {
+      setIkssData((prev) => ({
+        ...prev,
+        activeSubView:
+          archive.subType === "foto_menu" ? "foto_menu" : "nilai_gizi",
+        worksheetConfigs:
+          archive.worksheetConfigs && archive.worksheetConfigs.length > 0
+            ? archive.worksheetConfigs
+            : archive.restoreConfig?.ikssDataPatch?.worksheetConfigs || prev.worksheetConfigs,
+        ...(archive.restoreConfig?.ikssDataPatch || {}),
+      }));
+      setActiveTab("ikss");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (archive.source === "sop") {
+      setSopData((prev) => ({
+        ...prev,
+        selectedPlanIds:
+          archive.selectedPlanIds && archive.selectedPlanIds.length > 0
+            ? archive.selectedPlanIds
+            : prev.selectedPlanIds,
+        selectedSubTabs:
+          archive.selectedSubTabs && archive.selectedSubTabs.length > 0
+            ? archive.selectedSubTabs
+            : prev.selectedSubTabs,
+        activeSubTab:
+          archive.selectedSubTabs?.[0] || prev.activeSubTab || "organoleptik",
+        ...(archive.restoreConfig?.sopDataPatch || {}),
+      }));
+      setActiveTab("sop");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
   };
 
   const buildOdheGiziWhatsAppUrl = (opts?: {
@@ -3356,6 +3494,11 @@ export default function App() {
             bumbuPct={bumbuPct}
             cloudUserId={user?.uid || "local"}
             isCloudActive={canAutoSyncCloud}
+            onSaveToArchive={handleSaveDocArchive}
+            onGoToArsip={() => {
+              setActiveTab("arsip");
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
           />
         )}
 
@@ -3376,6 +3519,11 @@ export default function App() {
             rightLogoCrop={rightLogoCrop}
             kopConfig={kopConfig}
             paperSize={paperSize}
+            onSaveToArchive={handleSaveDocArchive}
+            onGoToArsip={() => {
+              setActiveTab("arsip");
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
           />
         )}
 
@@ -3407,6 +3555,9 @@ export default function App() {
             bumbuPct={bumbuPct}
             userEmail={user?.email}
             isDemo={isDemoUser}
+            docArchives={docArchives}
+            setDocArchives={setDocArchives}
+            onOpenDocArchive={handleOpenDocArchive}
           />
         )}
 
@@ -3414,6 +3565,59 @@ export default function App() {
           <SPPGProfileTab
             profile={profile}
             onChange={setProfile}
+            isOnboardingStep={activeOnboardingStep === "sppg"}
+            onSaveProfile={async (updatedProfile, options) => {
+              const continueToPm = Boolean(options?.continueToPm);
+              const nextProfile: SPPGProfile = {
+                ...updatedProfile,
+                sppgSavedAt: new Date().toISOString(),
+                onboardingStep: updatedProfile.onboardingCompleted
+                  ? "done"
+                  : continueToPm
+                    ? "penerima"
+                    : updatedProfile.onboardingStep || "sppg",
+              };
+              const nextKop3 =
+                !kopLine3.trim() && nextProfile.namaLembaga?.trim()
+                  ? nextProfile.namaLembaga.trim().toUpperCase()
+                  : kopLine3;
+              const nextKop4 =
+                !kopLine4.trim() && nextProfile.alamat?.trim()
+                  ? `Alamat : ${nextProfile.alamat.trim()}`
+                  : kopLine4;
+
+              setProfile(nextProfile);
+              if (nextKop3 !== kopLine3) setKopLine3(nextKop3);
+              if (nextKop4 !== kopLine4) setKopLine4(nextKop4);
+
+              try {
+                localStorage.setItem("sisper_profile", JSON.stringify(nextProfile));
+                if (nextKop3 !== kopLine3) localStorage.setItem("kop_line3", nextKop3);
+                if (nextKop4 !== kopLine4) localStorage.setItem("kop_line4", nextKop4);
+              } catch {}
+
+              if (canAutoSyncCloud) {
+                syncedBaselineRef.current.profile = JSON.stringify(nextProfile);
+                const writes: Promise<any>[] = [saveStateToCloud("profile", nextProfile)];
+                if (nextKop3 !== kopLine3) {
+                  syncedBaselineRef.current.kopLine3 = nextKop3;
+                  writes.push(saveStateToCloud("kopLine3", nextKop3));
+                }
+                if (nextKop4 !== kopLine4) {
+                  syncedBaselineRef.current.kopLine4 = nextKop4;
+                  writes.push(saveStateToCloud("kopLine4", nextKop4));
+                }
+                await Promise.all(writes).catch(() => {});
+              }
+
+              if (continueToPm) {
+                setActiveTab("penerima");
+                try {
+                  sessionStorage.setItem("sisper_user_tab_chosen", "true");
+                } catch {}
+                window.scrollTo({ top: 0, behavior: "smooth" });
+              }
+            }}
             kopLine1={kopLine1}
             setKopLine1={setKopLine1}
             kopLine2={kopLine2}
@@ -3462,6 +3666,46 @@ export default function App() {
             paperSize={paperSize}
             setPaperSize={setPaperSize}
             isAdmin={isAdminUser}
+            isOnboardingStep={activeOnboardingStep === "penerima"}
+            onSavePM={async () => {
+              const nextProfile: SPPGProfile = {
+                ...profile,
+                onboardingStep: "done",
+                onboardingCompleted: true,
+                pmSavedAt: new Date().toISOString(),
+              };
+              setProfile(nextProfile);
+              try {
+                localStorage.setItem("sisper_profile", JSON.stringify(nextProfile));
+                localStorage.setItem("sisper_harian_pm", JSON.stringify(harianPM));
+                localStorage.setItem("sisper_pm_settings", JSON.stringify(pmSettings));
+              } catch {}
+
+              if (canAutoSyncCloud) {
+                syncedBaselineRef.current.profile = JSON.stringify(nextProfile);
+                syncedBaselineRef.current.harianPM = JSON.stringify(harianPM);
+                syncedBaselineRef.current.pmSettings = JSON.stringify(pmSettings);
+                await Promise.all([
+                  saveStateToCloud("harianPM", harianPM),
+                  saveStateToCloud("pmSettings", pmSettings),
+                  saveStateToCloud("profile", nextProfile),
+                ]).catch(() => {});
+              }
+            }}
+            onGoToMasterMenu={() => {
+              setActiveTab("menu");
+              try {
+                sessionStorage.setItem("sisper_user_tab_chosen", "true");
+              } catch {}
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
+            onGoToDashboard={() => {
+              setActiveTab("dashboard");
+              try {
+                sessionStorage.setItem("sisper_user_tab_chosen", "true");
+              } catch {}
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
           />
         )}
 
@@ -3628,6 +3872,10 @@ export default function App() {
             setPmSettings={setPmSettings}
             onNavigateToMasterMenu={() => setActiveTab("menu")}
             onNavigateToPM={() => setActiveTab("penerima")}
+            onSendToNotaPesanan={() => {
+              setActiveTab("notalogistik");
+              window.scrollTo({ top: 0, behavior: "smooth" });
+            }}
             isAdmin={isAdminUser}
           />
         )}

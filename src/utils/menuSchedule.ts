@@ -59,13 +59,63 @@ export function createEmptyMenuItem(): MenuItem {
   };
 }
 
+export interface ParsedCommaMenuComponents {
+  karbohidrat: string;
+  laukHewani: string;
+  laukNabati: string;
+  sayur: string;
+  buah: string;
+  susu: string;
+  buahSusu: string;
+}
+
+/**
+ * Splits a comma-separated menu string ("Nasi Putih, Ikan Goreng, Tahu Kecap, Sayur Asem, Semangka, Susu UHT")
+ * sequentially into the 6 Master Menu component fields:
+ * 0: Makanan Pokok (karbohidrat)
+ * 1: Lauk Hewani (laukHewani)
+ * 2: Lauk Nabati (laukNabati)
+ * 3: Sayuran (sayur)
+ * 4: Buah (buah)
+ * 5+: Susu (susu)
+ */
+export function parseCommaMenuComponents(rawNamaMenu: string): ParsedCommaMenuComponents {
+  const parts = (rawNamaMenu || "").split(",").map((p) => p.trim());
+  const karbohidrat = parts[0] || "";
+  const laukHewani = parts[1] || "";
+  const laukNabati = parts[2] || "";
+  const sayur = parts[3] || "";
+  const buah = parts[4] || "";
+  const susu =
+    parts.length > 6
+      ? parts
+          .slice(5)
+          .filter(Boolean)
+          .join(", ")
+      : parts[5] || "";
+  const buahSusu = [buah, susu].filter(Boolean).join(" + ");
+  return {
+    karbohidrat,
+    laukHewani,
+    laukNabati,
+    sayur,
+    buah,
+    susu,
+    buahSusu,
+  };
+}
+
 export function normalizeMenuItem(item?: Partial<MenuItem>): MenuItem {
   const base = createEmptyMenuItem();
   if (!item) return base;
 
+  let karbohidrat = item.karbohidrat || "";
+  let laukHewani = item.laukHewani || "";
+  let laukNabati = item.laukNabati || "";
+  let sayur = item.sayur || "";
   let buah = item.buah ?? "";
   let susu = item.susu ?? "";
-  const rawBuahSusu = (item.buahSusu || "").trim();
+  let rawBuahSusu = (item.buahSusu || "").trim();
 
   // Backfill buah / susu from legacy combined buahSusu if needed
   if (!buah && !susu && rawBuahSusu) {
@@ -83,15 +133,34 @@ export function normalizeMenuItem(item?: Partial<MenuItem>): MenuItem {
     susu = susuParts.join(" + ");
   }
 
+  // If namaMenu already contains comma-separated segments and all 6 component fields are empty, auto-populate them
+  const allComponentsEmpty =
+    !karbohidrat.trim() &&
+    !laukHewani.trim() &&
+    !laukNabati.trim() &&
+    !sayur.trim() &&
+    !buah.trim() &&
+    !susu.trim();
+  if (allComponentsEmpty && (item.namaMenu || "").includes(",")) {
+    const parsed = parseCommaMenuComponents(item.namaMenu || "");
+    karbohidrat = parsed.karbohidrat;
+    laukHewani = parsed.laukHewani;
+    laukNabati = parsed.laukNabati;
+    sayur = parsed.sayur;
+    buah = parsed.buah;
+    susu = parsed.susu;
+    rawBuahSusu = parsed.buahSusu;
+  }
+
   const combinedBuahSusu =
     rawBuahSusu || [buah.trim(), susu.trim()].filter(Boolean).join(" + ");
 
   return {
     namaMenu: item.namaMenu || "",
-    karbohidrat: item.karbohidrat || "",
-    laukHewani: item.laukHewani || "",
-    laukNabati: item.laukNabati || "",
-    sayur: item.sayur || "",
+    karbohidrat,
+    laukHewani,
+    laukNabati,
+    sayur,
     buah,
     susu,
     buahSusu: combinedBuahSusu,
