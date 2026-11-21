@@ -683,9 +683,73 @@ export default function NotaPesananLogistikTab({
         const matchingDays = foodCostDays.filter((d) => d.hariKe === dayNum);
 
         matchingDays.forEach((dayData) => {
+          const isAlergi = dayData.jenisMenu.includes("Alergi");
+
+          const getCategoryPmCount = (sId: string, porsi: "besar" | "kecil"): number => {
+            const sasItem = dayPM.sasaran?.find((item) => item.id === sId);
+            if (!sasItem) return 0;
+            const isShared =
+              sId === "sampel" ||
+              (besarSasaranIds.includes(sId) && kecilSasaranIds.includes(sId));
+            if (isAlergi) {
+              const cAlergi =
+                porsi === "besar"
+                  ? Number(sasItem.alergiBesar) || 0
+                  : Number(sasItem.alergiKecil) || 0;
+              const cNormal = isShared
+                ? Number(porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
+                : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+              return cAlergi > 0 ? cAlergi : cNormal;
+            }
+            return isShared
+              ? Number(porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
+              : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+          };
+
+          if (
+            dayData.activeMode === "kategori" &&
+            Array.isArray(dayData.categoryEntries) &&
+            dayData.categoryEntries.length > 0
+          ) {
+            dayData.categoryEntries.forEach((ce) => {
+              if (!ce.bahanList || ce.bahanList.length === 0) return;
+              const entryPm =
+                ce.customPmCount !== undefined
+                  ? ce.customPmCount
+                  : (ce.sasaranIds || []).reduce(
+                      (sum, sId) => sum + getCategoryPmCount(sId, ce.porsi),
+                      0
+                    );
+              const entryBuf = ce.bufferPct !== undefined ? ce.bufferPct : dayData.bufferPct;
+              const resCat =
+                ce.porsi === "besar"
+                  ? calculateDay(
+                      ce.bahanList,
+                      [],
+                      entryPm,
+                      0,
+                      entryBuf,
+                      tkpiList,
+                      dayData.bumbuPct ?? bumbuPct
+                    )
+                  : calculateDay(
+                      [],
+                      ce.bahanList,
+                      0,
+                      entryPm,
+                      entryBuf,
+                      tkpiList,
+                      dayData.bumbuPct ?? bumbuPct
+                    );
+              const itemsCat =
+                ce.porsi === "besar" ? resCat.porsiBesarItems : resCat.porsiKecilItems;
+              processItems(itemsCat, entryPm, entryBuf);
+            });
+            return;
+          }
+
           let pmBesar = 0;
           let pmKecil = 0;
-          const isAlergi = dayData.jenisMenu.includes("Alergi");
 
           besarSasaranIds.forEach((sId: string) => {
             const sasItem = dayPM.sasaran?.find((item) => item.id === sId);

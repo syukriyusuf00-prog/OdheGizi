@@ -299,6 +299,160 @@ export default function DashboardOutputs({
     return fromLegacy || `Menu Hari ${dayIdx + 1}`;
   };
 
+  const SEKOLAH_IDS_SET = new Set([
+    "tk_paud_lb",
+    "sd_kelas_1_3",
+    "sd_kelas_4_6",
+    "smp_mts_smplb",
+    "sma_smk_ma",
+    "pendidik",
+    "tenaga_kependidikan",
+    "sampel",
+  ]);
+  const THREEB_IDS_SET = new Set([
+    "anak_balita",
+    "anak_balita_13_59",
+    "balita_6_11",
+    "ibu_hamil",
+    "ibu_menyusui",
+  ]);
+
+  const computeDashboardGroupResult = (
+    dayNum: number,
+    fcDay: Partial<FoodCostDay>,
+    pmBesarFallback: number,
+    pmKecilFallback: number,
+    targetIdsSet: Set<string>
+  ) => {
+    const entries = fcDay.activeMode === "kategori" ? fcDay.categoryEntries : undefined;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return calculateDay(
+        fcDay.porsiBesarBahan || [],
+        fcDay.porsiKecilBahan || [],
+        pmBesarFallback,
+        pmKecilFallback,
+        fcDay.bufferPct ?? 5,
+        tkpiList,
+        fcDay.bumbuPct ?? bumbuPct
+      );
+    }
+
+    const dayPM = harianPM.find((h) => h.hariKe === dayNum) || harianPM[0];
+    const matching = entries.filter((ce) => (ce.sasaranIds || []).some((id) => targetIdsSet.has(id)));
+    const targetEntries = matching.length > 0 ? matching : entries;
+
+    const baseRes = calculateDay(
+      [],
+      [],
+      pmBesarFallback,
+      pmKecilFallback,
+      fcDay.bufferPct ?? 5,
+      tkpiList,
+      fcDay.bumbuPct ?? bumbuPct
+    );
+
+    let subtotalBesarCost = 0;
+    let subtotalKecilCost = 0;
+    let totalBesarBahanCost = 0;
+    let totalKecilBahanCost = 0;
+    let bufferBesarCost = 0;
+    let bufferKecilCost = 0;
+    let bumbuBesarCost = 0;
+    let bumbuKecilCost = 0;
+    let sumPmBesar = 0;
+    let sumPmKecil = 0;
+    const porsiBesarItems: typeof baseRes.porsiBesarItems = [];
+    const porsiKecilItems: typeof baseRes.porsiKecilItems = [];
+    let wBesar = 0;
+    let eBesar = 0, pBesar = 0, lBesar = 0, khBesar = 0, sBesar = 0;
+    let wKecil = 0;
+    let eKecil = 0, pKecil = 0, lKecil = 0, khKecil = 0, sKecil = 0;
+
+    targetEntries.forEach((ce) => {
+      if (!ce.bahanList || ce.bahanList.length === 0) return;
+      const entryPm =
+        ce.customPmCount !== undefined
+          ? Math.max(0, Number(ce.customPmCount) || 0)
+          : (ce.sasaranIds || []).reduce((sum, sId) => {
+              const sas = dayPM?.sasaran?.find((x) => x.id === sId);
+              if (!sas) return sum;
+              return sum + (ce.porsi === "besar" ? Number(sas.porsiBesar) || 0 : Number(sas.porsiKecil) || 0);
+            }, 0);
+      const entryBuf = ce.bufferPct ?? fcDay.bufferPct ?? 5;
+      const res =
+        ce.porsi === "besar"
+          ? calculateDay(ce.bahanList, [], entryPm, 0, entryBuf, tkpiList, fcDay.bumbuPct ?? bumbuPct)
+          : calculateDay([], ce.bahanList, 0, entryPm, entryBuf, tkpiList, fcDay.bumbuPct ?? bumbuPct);
+
+      if (ce.porsi === "besar") {
+        subtotalBesarCost += res.subtotalBesarCost;
+        totalBesarBahanCost += res.totalBesarBahanCost;
+        bufferBesarCost += res.bufferBesarCost;
+        bumbuBesarCost += res.bumbuBesarCost;
+        sumPmBesar += entryPm;
+        porsiBesarItems.push(...res.porsiBesarItems);
+        const w = Math.max(entryPm, 1);
+        wBesar += w;
+        eBesar += (res.nutrisiPorsiBesar.energi || 0) * w;
+        pBesar += (res.nutrisiPorsiBesar.protein || 0) * w;
+        lBesar += (res.nutrisiPorsiBesar.lemak || 0) * w;
+        khBesar += (res.nutrisiPorsiBesar.kh || 0) * w;
+        sBesar += (res.nutrisiPorsiBesar.serat || 0) * w;
+      } else {
+        subtotalKecilCost += res.subtotalKecilCost;
+        totalKecilBahanCost += res.totalKecilBahanCost;
+        bufferKecilCost += res.bufferKecilCost;
+        bumbuKecilCost += res.bumbuKecilCost;
+        sumPmKecil += entryPm;
+        porsiKecilItems.push(...res.porsiKecilItems);
+        const w = Math.max(entryPm, 1);
+        wKecil += w;
+        eKecil += (res.nutrisiPorsiKecil.energi || 0) * w;
+        pKecil += (res.nutrisiPorsiKecil.protein || 0) * w;
+        lKecil += (res.nutrisiPorsiKecil.lemak || 0) * w;
+        khKecil += (res.nutrisiPorsiKecil.kh || 0) * w;
+        sKecil += (res.nutrisiPorsiKecil.serat || 0) * w;
+      }
+    });
+
+    const finalPmBesar = sumPmBesar > 0 ? sumPmBesar : pmBesarFallback;
+    const finalPmKecil = sumPmKecil > 0 ? sumPmKecil : pmKecilFallback;
+
+    return {
+      ...baseRes,
+      jumlahPMBesar: finalPmBesar,
+      jumlahPMKecil: finalPmKecil,
+      porsiBesarItems,
+      porsiKecilItems,
+      subtotalBesarCost,
+      subtotalKecilCost,
+      totalBesarBahanCost,
+      totalKecilBahanCost,
+      bufferBesarCost,
+      bufferKecilCost,
+      bumbuBesarCost,
+      bumbuKecilCost,
+      costPerPorsiBesar: finalPmBesar > 0 ? subtotalBesarCost / finalPmBesar : 0,
+      costPerPorsiKecil: finalPmKecil > 0 ? subtotalKecilCost / finalPmKecil : 0,
+      nutrisiPorsiBesar: {
+        ...baseRes.nutrisiPorsiBesar,
+        energi: wBesar > 0 ? eBesar / wBesar : 0,
+        protein: wBesar > 0 ? pBesar / wBesar : 0,
+        lemak: wBesar > 0 ? lBesar / wBesar : 0,
+        kh: wBesar > 0 ? khBesar / wBesar : 0,
+        serat: wBesar > 0 ? sBesar / wBesar : 0,
+      },
+      nutrisiPorsiKecil: {
+        ...baseRes.nutrisiPorsiKecil,
+        energi: wKecil > 0 ? eKecil / wKecil : 0,
+        protein: wKecil > 0 ? pKecil / wKecil : 0,
+        lemak: wKecil > 0 ? lKecil / wKecil : 0,
+        kh: wKecil > 0 ? khKecil / wKecil : 0,
+        serat: wKecil > 0 ? sKecil / wKecil : 0,
+      },
+    };
+  };
+
   // Precalculate all planned days to render Rekap with day-specific recipient counts
   const calculatedDays = Array.from({ length: totalDays }).map((_, idx) => {
     const dayNum = idx + 1;
@@ -313,14 +467,12 @@ export default function DashboardOutputs({
       bufferPct: 5
     };
     
-    const schoolResult = calculateDay(
-      schoolDayData.porsiBesarBahan,
-      schoolDayData.porsiKecilBahan,
+    const schoolResult = computeDashboardGroupResult(
+      dayNum,
+      schoolDayData,
       dayCounts.pmBesarSekolah,
       dayCounts.pmKecilSekolah,
-      schoolDayData.bufferPct,
-      tkpiList,
-      (schoolDayData as FoodCostDay).bumbuPct ?? bumbuPct
+      SEKOLAH_IDS_SET
     );
 
     // 3B Group (MP-ASI)
@@ -332,14 +484,12 @@ export default function DashboardOutputs({
       bufferPct: 5
     };
 
-    const threeBResult = calculateDay(
-      threeBDayData.porsiBesarBahan,
-      threeBDayData.porsiKecilBahan,
+    const threeBResult = computeDashboardGroupResult(
+      dayNum,
+      threeBDayData,
       dayCounts.pmBesar3B,
       dayCounts.pmKecil3B,
-      threeBDayData.bufferPct,
-      tkpiList,
-      (threeBDayData as FoodCostDay).bumbuPct ?? bumbuPct
+      THREEB_IDS_SET
     );
 
     return {
@@ -392,15 +542,12 @@ export default function DashboardOutputs({
 
     const dayCounts = getCountsForDay(harianPM, dayNum);
 
-    // Calculate details
-    const result = calculateDay(
-      dayData.porsiBesarBahan,
-      dayData.porsiKecilBahan,
+    const result = computeDashboardGroupResult(
+      dayNum,
+      dayData,
       group === "sekolah" ? dayCounts.pmBesarSekolah : dayCounts.pmBesar3B,
       group === "sekolah" ? dayCounts.pmKecilSekolah : dayCounts.pmKecil3B,
-      dayData.bufferPct,
-      tkpiList,
-      dayData.bumbuPct ?? bumbuPct
+      group === "sekolah" ? SEKOLAH_IDS_SET : THREEB_IDS_SET
     );
 
     // Group items by tkpiId to avoid multiple entries of the same food

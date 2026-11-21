@@ -804,7 +804,13 @@ export default function IkssMenuTab({
   const populatedFcTypes = useMemo(() => {
     const set = new Set<string>();
     foodCostDays.forEach((d) => {
+      const hasKategoriData =
+        d.activeMode === "kategori" &&
+        (d.categoryEntries || []).some((ce) =>
+          (ce.bahanList || []).some((b) => (b.beratBB || 0) > 0 && b.nama?.trim())
+        );
       const hasData =
+        hasKategoriData ||
         (d.porsiBesarBahan || []).some((b) => (b.beratBB || 0) > 0 && b.nama?.trim()) ||
         (d.porsiKecilBahan || []).some((b) => (b.beratBB || 0) > 0 && b.nama?.trim());
       if (hasData) set.add(d.jenisMenu);
@@ -997,6 +1003,76 @@ export default function IkssMenuTab({
 
           for (let mIdx = 0; mIdx < matchedDays.length; mIdx++) {
             const fc = matchedDays[mIdx];
+
+            if (
+              fc.activeMode === "kategori" &&
+              Array.isArray(fc.categoryEntries) &&
+              fc.categoryEntries.length > 0
+            ) {
+              const matchingEntries = fc.categoryEntries.filter((ce) =>
+                (ce.sasaranIds || []).some((id) => wsSasaranSet.has(id))
+              );
+              const targetEntries = matchingEntries.length > 0 ? matchingEntries : fc.categoryEntries;
+              const dayPM = pmByDay.get(hariKe);
+              const isAlergi = fc.jenisMenu.toLowerCase().includes("alergi");
+
+              for (let eIdx = 0; eIdx < targetEntries.length; eIdx++) {
+                const ce = targetEntries[eIdx];
+                const hasCeBahan = (ce.bahanList || []).some(
+                  (b) => (Number(b.beratBB) || 0) > 0 && (b.nama?.trim() || b.tkpiId)
+                );
+                if (!hasCeBahan) continue;
+
+                let cePm = 0;
+                if (ce.customPmCount !== undefined) {
+                  cePm = Math.max(0, Number(ce.customPmCount) || 0);
+                } else if (dayPM?.sasaran) {
+                  (ce.sasaranIds || []).forEach((sId) => {
+                    const sas = dayPM.sasaran?.find((x) => x.id === sId);
+                    if (!sas) return;
+                    if (isAlergi) {
+                      const cA = ce.porsi === "besar" ? Number(sas.alergiBesar) || 0 : Number(sas.alergiKecil) || 0;
+                      const cN = ce.porsi === "besar" ? Number(sas.porsiBesar) || 0 : Number(sas.porsiKecil) || 0;
+                      cePm += cA > 0 ? cA : cN;
+                    } else {
+                      cePm += ce.porsi === "besar" ? Number(sas.porsiBesar) || 0 : Number(sas.porsiKecil) || 0;
+                    }
+                  });
+                }
+
+                const calcCat =
+                  ce.porsi === "besar"
+                    ? calculateDay(
+                        ce.bahanList || [],
+                        [],
+                        Math.max(cePm, 1),
+                        0,
+                        ce.bufferPct ?? fc.bufferPct ?? 5,
+                        tkpiMap,
+                        fc.bumbuPct ?? bumbuPct
+                      )
+                    : calculateDay(
+                        [],
+                        ce.bahanList || [],
+                        0,
+                        Math.max(cePm, 1),
+                        ce.bufferPct ?? fc.bufferPct ?? 5,
+                        tkpiMap,
+                        fc.bumbuPct ?? bumbuPct
+                      );
+                const nutCat = ce.porsi === "besar" ? calcCat.nutrisiPorsiBesar : calcCat.nutrisiPorsiKecil;
+                nutriSamples.push({
+                  energi: Number(nutCat.energi) || 0,
+                  protein: Number(nutCat.protein) || 0,
+                  lemak: Number(nutCat.lemak) || 0,
+                  kh: Number(nutCat.kh) || 0,
+                  serat: Number(nutCat.serat) || 0,
+                  weight: Math.max(cePm, 1),
+                });
+              }
+              continue;
+            }
+
             const hasBesarBahan = (fc.porsiBesarBahan || []).some(
               (b) => (Number(b.beratBB) || 0) > 0 && (b.nama?.trim() || b.tkpiId)
             );

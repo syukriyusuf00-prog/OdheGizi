@@ -4,11 +4,51 @@
  */
 
 import React, { useState, useEffect } from "react";
-import { TKPIItem, BahanMakananInput, FoodCostDay, MasterMenu, HariPM, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
+import {
+  TKPIItem,
+  BahanMakananInput,
+  FoodCostDay,
+  FoodCostCategoryGroup,
+  FoodCostCategoryEntry,
+  MasterMenu,
+  HariPM,
+  UnifiedKopConfig,
+  DEFAULT_UNIFIED_KOP_CONFIG,
+} from "../types";
 import { calculateDay, formatRupiah, getCountsForDay, CalcIngredientResult } from "../utils/calc";
 import SearchableTkpiDropdown from "./SearchableTkpiDropdown";
 import { PriceCalculatorPopover } from "./PriceCalculatorPopover";
-import { Plus, Trash2, HelpCircle, Sparkles, AlertTriangle, CheckCircle2, Calculator, Info, Sliders, Printer, Download, FileSpreadsheet, Edit3, RefreshCw, Image as ImageIcon, Settings, Eye, Layers, Tag, ChevronDown, ChevronUp, X, Check, Send } from "lucide-react";
+import {
+  Plus,
+  Trash2,
+  HelpCircle,
+  Sparkles,
+  AlertTriangle,
+  CheckCircle2,
+  Calculator,
+  Info,
+  Sliders,
+  Printer,
+  Download,
+  FileSpreadsheet,
+  Edit3,
+  RefreshCw,
+  Image as ImageIcon,
+  Settings,
+  Eye,
+  Layers,
+  Tag,
+  ChevronDown,
+  ChevronUp,
+  X,
+  Check,
+  Send,
+  Copy,
+  Clipboard,
+  ClipboardCheck,
+  Combine,
+  Split,
+} from "lucide-react";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import * as XLSX from "xlsx";
@@ -24,6 +64,7 @@ import {
   normalizeMenuItem,
   SASARAN_KATEGORI_LIST,
   SEKOLAH_SASARAN_IDS,
+  TIGAB_SASARAN_IDS,
 } from "../utils/menuSchedule";
 
 interface FoodCostTabProps {
@@ -82,6 +123,57 @@ const parseThousandSeparator = (value: string): number => {
   const clean = value.replace(/[^0-9]/g, "");
   return clean ? parseInt(clean, 10) : 0;
 };
+
+const SASARAN_AKG_PRESET_MAP: Record<string, string> = {
+  tk_paud_lb: "tk_paud",
+  sd_kelas_1_3: "sd_kecil",
+  sd_kelas_4_6: "sd_besar",
+  smp_mts_smplb: "smp",
+  sma_smk_ma: "sma_pendidik",
+  pendidik: "sma_pendidik",
+  tenaga_kependidikan: "sma_pendidik",
+  anak_balita: "balita",
+  anak_balita_13_59: "balita",
+  balita_6_11: "balita",
+  ibu_hamil: "bumil",
+  ibu_menyusui: "busui",
+  sampel: "sd_besar",
+};
+
+const getDefaultAkgTypeForGroup = (sasaranIds: string[], porsi: "besar" | "kecil"): string => {
+  for (const id of sasaranIds) {
+    if (SASARAN_AKG_PRESET_MAP[id]) return SASARAN_AKG_PRESET_MAP[id];
+  }
+  return porsi === "besar" ? "sd_besar" : "sd_kecil";
+};
+
+const cloneBahanListFresh = (list: BahanMakananInput[], prefix = "cp"): BahanMakananInput[] =>
+  (list || []).map((b, idx) => ({
+    id: `${prefix}_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`,
+    tkpiId: b.tkpiId || "",
+    nama: b.nama,
+    beratBB: Number(b.beratBB) || 0,
+    urt: b.urt || "",
+    hargaSatuan: Number(b.hargaSatuan) || 0,
+    bdd: b.bdd,
+    potong: b.potong,
+    ekor: b.ekor,
+    buah: b.buah,
+    butir: b.butir,
+    formula: b.formula,
+    bufferBase: b.bufferBase,
+    bufferCustomVal: b.bufferCustomVal,
+    jumlahBufferChoice: b.jumlahBufferChoice,
+    jumlahBufferCustomVal: b.jumlahBufferCustomVal,
+  }));
+
+interface CopiedFoodCostPayload {
+  sourceLabel: string;
+  sourcePorsi: "besar" | "kecil";
+  copiedAt: string;
+  bufferPct: number;
+  bahanList: BahanMakananInput[];
+}
 
 interface EditableBddCellProps {
   value: number; // resolved BDD
@@ -315,6 +407,8 @@ export default function FoodCostTab({
 
     if (porsi === "besar" || porsi === "kecil") {
       handleRowBatchChange(porsi, rowIndex, updates);
+    } else if (porsi.startsWith("cat:")) {
+      editIngredientInCategoryEntryBatch(porsi.slice(4), rowIndex, updates);
     } else {
       editIngredientInCustomTableBatch(porsi, rowIndex, updates);
     }
@@ -382,6 +476,8 @@ export default function FoodCostTab({
 
     if (porsi === "besar" || porsi === "kecil") {
       handleRowChange(porsi, rowIndex, field, finalVal);
+    } else if (porsi.startsWith("cat:")) {
+      editIngredientInCategoryEntry(porsi.slice(4), rowIndex, field, finalVal);
     } else {
       editIngredientInCustomTable(porsi, rowIndex, field, finalVal);
     }
@@ -451,45 +547,162 @@ export default function FoodCostTab({
     ? settings.porsiBesarSasaranIds
     : ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan", "ibu_hamil", "ibu_menyusui"];
 
-  // Food Cost display scope & category selection with explicit confirmation workflow
+  // Helper to resolve default porsi & label for any sasaran ID
+  const resolveDefaultPorsiForSasaran = (sId: string): "besar" | "kecil" => {
+    if (defaultKecilIds.includes(sId) && !defaultBesarIds.includes(sId)) return "kecil";
+    if (defaultBesarIds.includes(sId) && !defaultKecilIds.includes(sId)) return "besar";
+    if (
+      sId === "tk_paud_lb" ||
+      sId === "sd_kelas_1_3" ||
+      sId === "anak_balita" ||
+      sId === "anak_balita_13_59" ||
+      sId === "balita_6_11"
+    ) {
+      return "kecil";
+    }
+    return "besar";
+  };
+
+  const resolveStaticSasaranLabel = (sId: string): string => {
+    if (sId === "sampel") return "Sampel";
+    return SASARAN_KATEGORI_LIST.find((s) => s.id === sId)?.label || sId;
+  };
+
+  const buildDefaultGroupsForTabGroup = (tabGroup: "sekolah" | "tigaB" | "custom"): FoodCostCategoryGroup[] => {
+    const ids =
+      tabGroup === "sekolah"
+        ? SEKOLAH_SASARAN_IDS
+        : tabGroup === "tigaB"
+          ? [...TIGAB_SASARAN_IDS, ...MPASI_SASARAN_IDS]
+          : SASARAN_KATEGORI_LIST.map((s) => s.id);
+    return ids.map((sId) => ({
+      id: `cat_${sId}`,
+      title: resolveStaticSasaranLabel(sId),
+      porsi: resolveDefaultPorsiForSasaran(sId),
+      sasaranIds: [sId],
+    }));
+  };
+
+  // Food Cost display scope, per-category / merged-category grouping & confirmation workflow
   const [appliedConfig, setAppliedConfig] = useState<{
     confirmed: boolean;
+    layoutMode: "per_kategori" | "gabung_porsi";
     scope: "kecil" | "besar" | "all";
     kecilIds: string[];
     besarIds: string[];
+    categoryGroupsByGroup: Record<"sekolah" | "tigaB" | "custom", FoodCostCategoryGroup[]>;
   }>(() => {
+    const defaultGroupsByGroup: Record<"sekolah" | "tigaB" | "custom", FoodCostCategoryGroup[]> = {
+      sekolah: buildDefaultGroupsForTabGroup("sekolah"),
+      tigaB: buildDefaultGroupsForTabGroup("tigaB"),
+      custom: buildDefaultGroupsForTabGroup("custom"),
+    };
     try {
-      const saved = localStorage.getItem("sppg_fc_applied_config_v1");
-      if (saved) {
-        const parsed = JSON.parse(saved);
+      const savedV2 = localStorage.getItem("sppg_fc_applied_config_v2");
+      if (savedV2) {
+        const parsed = JSON.parse(savedV2);
         return {
-          confirmed: Boolean(parsed.confirmed),
+          confirmed: parsed.confirmed !== undefined ? Boolean(parsed.confirmed) : true,
+          layoutMode: parsed.layoutMode === "gabung_porsi" ? "gabung_porsi" : "per_kategori",
           scope: parsed.scope === "kecil" || parsed.scope === "besar" || parsed.scope === "all" ? parsed.scope : "all",
           kecilIds: Array.isArray(parsed.kecilIds) ? parsed.kecilIds : defaultKecilIds,
           besarIds: Array.isArray(parsed.besarIds) ? parsed.besarIds : defaultBesarIds,
+          categoryGroupsByGroup: {
+            sekolah:
+              Array.isArray(parsed.categoryGroupsByGroup?.sekolah) && parsed.categoryGroupsByGroup.sekolah.length > 0
+                ? parsed.categoryGroupsByGroup.sekolah
+                : defaultGroupsByGroup.sekolah,
+            tigaB:
+              Array.isArray(parsed.categoryGroupsByGroup?.tigaB) && parsed.categoryGroupsByGroup.tigaB.length > 0
+                ? parsed.categoryGroupsByGroup.tigaB
+                : defaultGroupsByGroup.tigaB,
+            custom:
+              Array.isArray(parsed.categoryGroupsByGroup?.custom) && parsed.categoryGroupsByGroup.custom.length > 0
+                ? parsed.categoryGroupsByGroup.custom
+                : defaultGroupsByGroup.custom,
+          },
+        };
+      }
+      const savedV1 = localStorage.getItem("sppg_fc_applied_config_v1");
+      if (savedV1) {
+        const parsed = JSON.parse(savedV1);
+        return {
+          confirmed: true,
+          layoutMode: "per_kategori",
+          scope: parsed.scope === "kecil" || parsed.scope === "besar" || parsed.scope === "all" ? parsed.scope : "all",
+          kecilIds: Array.isArray(parsed.kecilIds) ? parsed.kecilIds : defaultKecilIds,
+          besarIds: Array.isArray(parsed.besarIds) ? parsed.besarIds : defaultBesarIds,
+          categoryGroupsByGroup: defaultGroupsByGroup,
         };
       }
     } catch {
       // ignore corrupted storage
     }
     return {
-      confirmed: false,
+      confirmed: true,
+      layoutMode: "per_kategori",
       scope: "all",
       kecilIds: defaultKecilIds,
       besarIds: defaultBesarIds,
+      categoryGroupsByGroup: defaultGroupsByGroup,
     };
   });
 
+  const [draftLayoutMode, setDraftLayoutMode] = useState<"per_kategori" | "gabung_porsi">(appliedConfig.layoutMode);
   const [draftScope, setDraftScope] = useState<"kecil" | "besar" | "all">(appliedConfig.scope);
   const [draftKecilIds, setDraftKecilIds] = useState<string[]>(appliedConfig.kecilIds);
   const [draftBesarIds, setDraftBesarIds] = useState<string[]>(appliedConfig.besarIds);
-  const [isSelectorExpanded, setIsSelectorExpanded] = useState<boolean>(() => !appliedConfig.confirmed);
+  const [draftCategoryGroupsByGroup, setDraftCategoryGroupsByGroup] = useState<
+    Record<"sekolah" | "tigaB" | "custom", FoodCostCategoryGroup[]>
+  >(appliedConfig.categoryGroupsByGroup);
+  const [mergeSelectedGroupIds, setMergeSelectedGroupIds] = useState<string[]>([]);
+  const [mergeCustomTitle, setMergeCustomTitle] = useState<string>("");
+  const [mergeCustomPorsi, setMergeCustomPorsi] = useState<"auto" | "kecil" | "besar">("auto");
+  const [showCrossGroupPicker, setShowCrossGroupPicker] = useState<boolean>(false);
+  const [isSelectorExpanded, setIsSelectorExpanded] = useState<boolean>(true);
   const [showCategoryConfirmModal, setShowCategoryConfirmModal] = useState<boolean>(false);
   const [autoFillOnConfirm, setAutoFillOnConfirm] = useState<boolean>(true);
   const [fcNotice, setFcNotice] = useState<{ type: "info" | "success" | "warning"; text: string } | null>(null);
 
+  // Copy & Paste Food Cost clipboard (to quickly reuse all ingredients & descriptions across categories/days and just change BB)
+  const [copiedFoodCost, setCopiedFoodCost] = useState<CopiedFoodCostPayload | null>(() => {
+    try {
+      const saved = localStorage.getItem("sppg_fc_clipboard_v1");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && Array.isArray(parsed.bahanList) && parsed.bahanList.length > 0) {
+          return parsed;
+        }
+      }
+    } catch {
+      // ignore corrupted clipboard
+    }
+    return null;
+  });
+
   useEffect(() => {
-    localStorage.setItem("sppg_fc_applied_config_v1", JSON.stringify(appliedConfig));
+    if (copiedFoodCost) {
+      localStorage.setItem("sppg_fc_clipboard_v1", JSON.stringify(copiedFoodCost));
+    } else {
+      localStorage.removeItem("sppg_fc_clipboard_v1");
+    }
+  }, [copiedFoodCost]);
+
+  const [pastedHighlightMap, setPastedHighlightMap] = useState<
+    Record<string, { from: string; count: number }>
+  >({});
+
+  const [pasteConfirmModal, setPasteConfirmModal] = useState<{
+    isOpen: boolean;
+    targetKey: string;
+    targetLabel: string;
+    existingCount: number;
+    onReplace: () => void;
+    onAppend: () => void;
+  } | null>(null);
+
+  useEffect(() => {
+    localStorage.setItem("sppg_fc_applied_config_v2", JSON.stringify(appliedConfig));
   }, [appliedConfig]);
 
   // Keep selected category IDs synchronized with PM classification changes
@@ -522,7 +735,6 @@ export default function FoodCostTab({
   const handleSelectDraftScope = (nextScope: "kecil" | "besar" | "all") => {
     setDraftScope(nextScope);
     if (nextScope === "kecil") {
-      // Porsi Kecil automatically selects all chosen Porsi Kecil categories
       setDraftKecilIds(defaultKecilIds);
     } else if (nextScope === "besar") {
       setDraftBesarIds(defaultBesarIds);
@@ -916,11 +1128,97 @@ export default function FoodCostTab({
     defaultBesarIds.includes(id)
   );
 
+  const isPerKategoriMode = appliedConfig.layoutMode === "per_kategori";
+  const activeGroupKey: "sekolah" | "tigaB" | "custom" = selectedGroup;
+
+  const getEntryAutoPmCount = (sasaranIds: string[], porsi: "besar" | "kecil"): number => {
+    return (sasaranIds || []).reduce((sum, sId) => sum + getSasaranPmCount(sId, porsi), 0);
+  };
+
+  const getEntryEffectivePmCount = (entry: FoodCostCategoryEntry): number => {
+    if (entry.customPmCount !== undefined && entry.customPmCount !== null) {
+      return Math.max(0, Number(entry.customPmCount) || 0);
+    }
+    return getEntryAutoPmCount(entry.sasaranIds, entry.porsi);
+  };
+
+  const activeCategoryGroupsRaw =
+    appliedConfig.categoryGroupsByGroup?.[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+
+  const activeCategoryGroups = activeCategoryGroupsRaw.filter((g) => {
+    if (appliedConfig.scope !== "all" && g.porsi !== appliedConfig.scope) return false;
+    if (selectedGroup === "tigaB" && selectedType === "MP-ASI") {
+      const hasMpAsiGroup = activeCategoryGroupsRaw.some((x) =>
+        x.sasaranIds.some((id) => MPASI_SASARAN_IDS.includes(id))
+      );
+      if (hasMpAsiGroup) {
+        return g.sasaranIds.some((id) => MPASI_SASARAN_IDS.includes(id));
+      }
+    }
+    return true;
+  });
+
+  const resolvedCategoryEntries: FoodCostCategoryEntry[] = activeCategoryGroups.map((g) => {
+    const existingList = currentDayData.categoryEntries || [];
+    const existing =
+      existingList.find((e) => e.id === g.id) ||
+      (g.sasaranIds.length === 1
+        ? existingList.find((e) => e.sasaranIds.length === 1 && e.sasaranIds[0] === g.sasaranIds[0])
+        : undefined);
+
+    if (existing) {
+      return {
+        ...existing,
+        id: g.id,
+        title: g.title,
+        porsi: g.porsi,
+        sasaranIds: g.sasaranIds,
+        bahanList: existing.bahanList || [],
+        bufferPct: existing.bufferPct !== undefined ? existing.bufferPct : (currentDayData.bufferPct ?? 5),
+        akgType: existing.akgType || getDefaultAkgTypeForGroup(g.sasaranIds, g.porsi),
+        akgMode: existing.akgMode || "min",
+        nutrientModes: existing.nutrientModes || {
+          energi: "min",
+          protein: "min",
+          lemak: "min",
+          kh: "min",
+          serat: "min",
+        },
+        kriteriaPm: existing.kriteriaPm !== undefined ? existing.kriteriaPm : g.title,
+      };
+    }
+
+    return {
+      id: g.id,
+      title: g.title,
+      porsi: g.porsi,
+      sasaranIds: g.sasaranIds,
+      bahanList: [],
+      bufferPct: currentDayData.bufferPct ?? 5,
+      akgType: getDefaultAkgTypeForGroup(g.sasaranIds, g.porsi),
+      akgMode: "min",
+      nutrientModes: {
+        energi: "min",
+        protein: "min",
+        lemak: "min",
+        kh: "min",
+        serat: "min",
+      },
+      kriteriaPm: g.title,
+    };
+  });
+
   // Helper to compute dynamic combined/merged count and target price based on chosen categories
   const getPmCountAndTargetPrice = (porsi: "besar" | "kecil") => {
-    const targetIds = porsi === "besar" ? activeBesarIds : activeKecilIds;
     const targetPrice = porsi === "besar" ? settings.porsiBesarHarga : settings.porsiKecilHarga;
 
+    if (isPerKategoriMode) {
+      const matchingEntries = resolvedCategoryEntries.filter((e) => e.porsi === porsi);
+      const count = matchingEntries.reduce((sum, e) => sum + getEntryEffectivePmCount(e), 0);
+      return { count, targetPrice };
+    }
+
+    const targetIds = porsi === "besar" ? activeBesarIds : activeKecilIds;
     let count = 0;
     targetIds.forEach((sId: string) => {
       count += getSasaranPmCount(sId, porsi);
@@ -944,22 +1242,37 @@ export default function FoodCostTab({
   const activeTargetPriceBesar = pmBesarInfo.targetPrice;
   const activeTargetPriceKecil = pmKecilInfo.targetPrice;
 
-  const selectedKecilCategories = activeKecilIds.map((id) => ({
-    id,
-    label: getSasaranLabel(id),
-    count: getSasaranPmCount(id, "kecil"),
-  }));
-  const selectedBesarCategories = activeBesarIds.map((id) => ({
-    id,
-    label: getSasaranLabel(id),
-    count: getSasaranPmCount(id, "besar"),
-  }));
+  const selectedKecilCategories = isPerKategoriMode
+    ? resolvedCategoryEntries
+        .filter((e) => e.porsi === "kecil")
+        .map((e) => ({ id: e.id, label: e.title, count: getEntryEffectivePmCount(e) }))
+    : activeKecilIds.map((id) => ({
+        id,
+        label: getSasaranLabel(id),
+        count: getSasaranPmCount(id, "kecil"),
+      }));
+
+  const selectedBesarCategories = isPerKategoriMode
+    ? resolvedCategoryEntries
+        .filter((e) => e.porsi === "besar")
+        .map((e) => ({ id: e.id, label: e.title, count: getEntryEffectivePmCount(e) }))
+    : activeBesarIds.map((id) => ({
+        id,
+        label: getSasaranLabel(id),
+        count: getSasaranPmCount(id, "besar"),
+      }));
 
   const porsiKecilLabels = selectedKecilCategories.map((c) => c.label).join(", ");
   const porsiBesarLabels = selectedBesarCategories.map((c) => c.label).join(", ");
 
-  const showBesarTable = appliedConfig.confirmed && (appliedConfig.scope === "all" || appliedConfig.scope === "besar");
-  const showKecilTable = appliedConfig.confirmed && (appliedConfig.scope === "all" || appliedConfig.scope === "kecil");
+  const showBesarTable =
+    !isPerKategoriMode &&
+    appliedConfig.confirmed &&
+    (appliedConfig.scope === "all" || appliedConfig.scope === "besar");
+  const showKecilTable =
+    !isPerKategoriMode &&
+    appliedConfig.confirmed &&
+    (appliedConfig.scope === "all" || appliedConfig.scope === "kecil");
 
   const rabPorsiKecil = pmKecil * activeTargetPriceKecil;
   const rabPorsiBesar = pmBesar * activeTargetPriceBesar;
@@ -1030,7 +1343,7 @@ export default function FoodCostTab({
     ? formatScheduleIndonesianDate(rawDateStr)
     : `Hari Ke-${selectedDay}`;
 
-  // Calculate results for the day
+  // Calculate results for the day (Gabung per Porsi mode)
   const results = calculateDay(
     currentDayData.porsiBesarBahan,
     currentDayData.porsiKecilBahan,
@@ -1041,6 +1354,67 @@ export default function FoodCostTab({
     activeBumbuPct
   );
 
+  // Per-Category calculation results
+  const categoryCalcResultsMap = React.useMemo(() => {
+    const map: Record<
+      string,
+      {
+        pmCount: number;
+        targetPrice: number;
+        items: CalcIngredientResult[];
+        totalBahanCost: number;
+        bufferCost: number;
+        bumbuCost: number;
+        subtotalCost: number;
+        costPerPorsi: number;
+        calculatedCostPerPorsi: number;
+        actualTotalCost: number;
+      }
+    > = {};
+    resolvedCategoryEntries.forEach((entry) => {
+      const entryPm = getEntryEffectivePmCount(entry);
+      const entryTargetPrice = entry.porsi === "besar" ? activeTargetPriceBesar : activeTargetPriceKecil;
+      const entryBuffer = entry.bufferPct !== undefined ? entry.bufferPct : (currentDayData.bufferPct ?? 5);
+      const calc =
+        entry.porsi === "besar"
+          ? calculateDay(entry.bahanList || [], [], entryPm, 0, entryBuffer, tkpiList, activeBumbuPct)
+          : calculateDay([], entry.bahanList || [], 0, entryPm, entryBuffer, tkpiList, activeBumbuPct);
+      const items = entry.porsi === "besar" ? calc.porsiBesarItems : calc.porsiKecilItems;
+      const totalBahanCost = entry.porsi === "besar" ? calc.totalBesarBahanCost : calc.totalKecilBahanCost;
+      const bufferCost = entry.porsi === "besar" ? calc.bufferBesarCost : calc.bufferKecilCost;
+      const bumbuCost = entry.porsi === "besar" ? calc.bumbuBesarCost : calc.bumbuKecilCost;
+      const subtotalCost = entry.porsi === "besar" ? calc.subtotalBesarCost : calc.subtotalKecilCost;
+      const costPerPorsi = entry.porsi === "besar" ? calc.costPerPorsiBesar : calc.costPerPorsiKecil;
+      const calculatedCostPerPorsi =
+        planningMode === "all_ingredients" ? (entryPm > 0 ? totalBahanCost / entryPm : 0) : costPerPorsi;
+      const actualTotalCost = planningMode === "with_bumbu_10" ? subtotalCost : totalBahanCost;
+
+      map[entry.id] = {
+        pmCount: entryPm,
+        targetPrice: entryTargetPrice,
+        items,
+        totalBahanCost,
+        bufferCost,
+        bumbuCost,
+        subtotalCost,
+        costPerPorsi,
+        calculatedCostPerPorsi,
+        actualTotalCost,
+      };
+    });
+    return map;
+  }, [
+    resolvedCategoryEntries,
+    activeTargetPriceBesar,
+    activeTargetPriceKecil,
+    currentDayData.bufferPct,
+    tkpiList,
+    activeBumbuPct,
+    planningMode,
+    dayPMForLabels,
+    selectedType,
+  ]);
+
   // Custom tables RAB calculation
   const customTablesRABTotal = (customTables || []).reduce((acc, t) => {
     const pCount = Number(t.pmCount) || 0;
@@ -1048,8 +1422,12 @@ export default function FoodCostTab({
     return acc + (pCount * pPrice);
   }, 0);
 
-  const includeKecilInDashboard = !appliedConfig.confirmed || showKecilTable;
-  const includeBesarInDashboard = !appliedConfig.confirmed || showBesarTable;
+  const includeKecilInDashboard = isPerKategoriMode
+    ? resolvedCategoryEntries.some((e) => e.porsi === "kecil")
+    : !appliedConfig.confirmed || showKecilTable;
+  const includeBesarInDashboard = isPerKategoriMode
+    ? resolvedCategoryEntries.some((e) => e.porsi === "besar")
+    : !appliedConfig.confirmed || showBesarTable;
 
   const totalRAB =
     (includeKecilInDashboard ? rabPorsiKecil : 0) +
@@ -1057,19 +1435,35 @@ export default function FoodCostTab({
     customTablesRABTotal;
 
   // Realisasi Belanja (Actual) calculation
-  const porsiKecilActualCost = planningMode === "with_bumbu_10" 
-    ? results.subtotalKecilCost 
-    : results.totalKecilBahanCost;
+  const porsiKecilActualCost = isPerKategoriMode
+    ? resolvedCategoryEntries
+        .filter((e) => e.porsi === "kecil")
+        .reduce((s, e) => s + (categoryCalcResultsMap[e.id]?.actualTotalCost || 0), 0)
+    : planningMode === "with_bumbu_10"
+      ? results.subtotalKecilCost
+      : results.totalKecilBahanCost;
 
-  const porsiBesarActualCost = planningMode === "with_bumbu_10" 
-    ? results.subtotalBesarCost 
-    : results.totalBesarBahanCost;
+  const porsiBesarActualCost = isPerKategoriMode
+    ? resolvedCategoryEntries
+        .filter((e) => e.porsi === "besar")
+        .reduce((s, e) => s + (categoryCalcResultsMap[e.id]?.actualTotalCost || 0), 0)
+    : planningMode === "with_bumbu_10"
+      ? results.subtotalBesarCost
+      : results.totalBesarBahanCost;
 
   const porsiKecilPerPorsi = pmKecil > 0 ? Math.round(porsiKecilActualCost / pmKecil) : 0;
   const porsiBesarPerPorsi = pmBesar > 0 ? Math.round(porsiBesarActualCost / pmBesar) : 0;
 
-  const bumbuKecilNominal = results.bumbuKecilCost || 0;
-  const bumbuBesarNominal = results.bumbuBesarCost || 0;
+  const bumbuKecilNominal = isPerKategoriMode
+    ? resolvedCategoryEntries
+        .filter((e) => e.porsi === "kecil")
+        .reduce((s, e) => s + (categoryCalcResultsMap[e.id]?.bumbuCost || 0), 0)
+    : results.bumbuKecilCost || 0;
+  const bumbuBesarNominal = isPerKategoriMode
+    ? resolvedCategoryEntries
+        .filter((e) => e.porsi === "besar")
+        .reduce((s, e) => s + (categoryCalcResultsMap[e.id]?.bumbuCost || 0), 0)
+    : results.bumbuBesarCost || 0;
 
   // Custom tables actual cost & bumbu nominal
   let customTablesBumbuTotal = 0;
@@ -1113,7 +1507,635 @@ export default function FoodCostTab({
     onFoodCostDaysChange(updatedDays);
   };
 
+  // Category Entry CRUD helpers (for "per_kategori" & selective merged categories)
+  const commitCategoryEntries = (nextVisibleEntries: FoodCostCategoryEntry[], extraDayPatch?: Partial<FoodCostDay>) => {
+    const visibleMap = new Map(nextVisibleEntries.map((e) => [e.id, e]));
+    const existingList = currentDayData.categoryEntries || [];
+    const mergedList: FoodCostCategoryEntry[] = [];
+
+    activeCategoryGroupsRaw.forEach((g) => {
+      if (visibleMap.has(g.id)) {
+        mergedList.push(visibleMap.get(g.id)!);
+      } else {
+        const prevHidden = existingList.find((e) => e.id === g.id);
+        if (prevHidden) mergedList.push(prevHidden);
+      }
+    });
+
+    // Also include any custom entry in nextVisibleEntries not already in activeCategoryGroupsRaw
+    nextVisibleEntries.forEach((e) => {
+      if (!mergedList.some((m) => m.id === e.id)) {
+        mergedList.push(e);
+      }
+    });
+
+    updateDayData({
+      ...currentDayData,
+      ...extraDayPatch,
+      activeMode: "kategori",
+      categoryEntries: mergedList,
+    });
+  };
+
+  const updateCategoryEntry = (entryId: string, updater: (entry: FoodCostCategoryEntry) => FoodCostCategoryEntry) => {
+    const nextVisible = resolvedCategoryEntries.map((e) => (e.id === entryId ? updater(e) : e));
+    commitCategoryEntries(nextVisible);
+  };
+
+  const addIngredientToCategoryEntry = (entryId: string) => {
+    const newBahan: BahanMakananInput = {
+      id: `cat_${entryId}_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
+      tkpiId: "",
+      beratBB: 0,
+      urt: "",
+      hargaSatuan: 0,
+    };
+    updateCategoryEntry(entryId, (e) => ({
+      ...e,
+      bahanList: [...(e.bahanList || []), newBahan],
+    }));
+  };
+
+  const removeIngredientFromCategoryEntry = (entryId: string, rowId: string, index: number) => {
+    updateCategoryEntry(entryId, (e) => ({
+      ...e,
+      bahanList: (e.bahanList || []).filter((b, idx) => {
+        if (rowId && b.id && b.id === rowId) return false;
+        if (idx === index) return false;
+        return true;
+      }),
+    }));
+  };
+
+  const editIngredientInCategoryEntry = (
+    entryId: string,
+    rowIndex: number,
+    field: keyof BahanMakananInput,
+    value: any
+  ) => {
+    updateCategoryEntry(entryId, (e) => {
+      const nextList = [...(e.bahanList || [])];
+      if (!nextList[rowIndex]) return e;
+      nextList[rowIndex] = { ...nextList[rowIndex], [field]: value };
+      return { ...e, bahanList: nextList };
+    });
+  };
+
+  const editIngredientInCategoryEntryBatch = (
+    entryId: string,
+    rowIndex: number,
+    updates: Partial<BahanMakananInput>
+  ) => {
+    updateCategoryEntry(entryId, (e) => {
+      const nextList = [...(e.bahanList || [])];
+      if (!nextList[rowIndex]) return e;
+      nextList[rowIndex] = { ...nextList[rowIndex], ...updates };
+      return { ...e, bahanList: nextList };
+    });
+  };
+
+  const getCategoryEntryAkgTarget = (entry: FoodCostCategoryEntry, key: string): number => {
+    const type = entry.akgType || getDefaultAkgTypeForGroup(entry.sasaranIds, entry.porsi);
+    const mode = entry.nutrientModes?.[key] || entry.akgMode || "min";
+    if (!mode || mode === "") return 0;
+
+    if (type === "custom" || mode === "custom") {
+      if (entry.customAkgValues && entry.customAkgValues[key] !== undefined) {
+        return entry.customAkgValues[key];
+      }
+    }
+
+    const config = TARGET_AKG_LIMITS[type];
+    if (!config) {
+      return entry.customAkgValues?.[key] ?? (entry.porsi === "besar" ? customBesar[key] : customKecil[key]) ?? 0;
+    }
+
+    const minVal = key === "energi" ? config.energiMin : (config as any)[`${key}Min`] || 0;
+    const ratio = config.energiMax / config.energiMin;
+
+    if (mode === "min") return minVal;
+    if (mode === "max") {
+      if (key === "energi") return config.energiMax;
+      return Math.round(minVal * ratio * 10) / 10;
+    }
+    if (mode === "avg") {
+      if (key === "energi") return (config.energiMin + config.energiMax) / 2;
+      const maxVal = minVal * ratio;
+      return Math.round(((minVal + maxVal) / 2) * 10) / 10;
+    }
+    return entry.customAkgValues?.[key] || minVal || 0;
+  };
+
+  const handleCategoryEntryAkgValChange = (entry: FoodCostCategoryEntry, key: string, rawVal: number) => {
+    const val = isNaN(rawVal) ? 0 : rawVal;
+    const keys = ["energi", "protein", "lemak", "kh", "serat"];
+    const nextCustom: Record<string, number> = { ...(entry.customAkgValues || {}) };
+    keys.forEach((k) => {
+      if (k === key) {
+        nextCustom[k] = val;
+      } else if (nextCustom[k] === undefined) {
+        nextCustom[k] = getCategoryEntryAkgTarget(entry, k);
+      }
+    });
+    updateCategoryEntry(entry.id, (e) => ({
+      ...e,
+      akgMode: "custom",
+      nutrientModes: { ...(e.nutrientModes || {}), [key]: "custom" },
+      customAkgValues: nextCustom,
+    }));
+  };
+
+  const updateCategoryEntryNutrientMode = (entryId: string, key: string, mode: string) => {
+    updateCategoryEntry(entryId, (e) => ({
+      ...e,
+      nutrientModes: {
+        energi: e.nutrientModes?.energi || e.akgMode || "min",
+        protein: e.nutrientModes?.protein || e.akgMode || "min",
+        lemak: e.nutrientModes?.lemak || e.akgMode || "min",
+        kh: e.nutrientModes?.kh || e.akgMode || "min",
+        serat: e.nutrientModes?.serat || e.akgMode || "min",
+        [key]: mode,
+      },
+    }));
+  };
+
+  // Copy & Paste Food Cost workflow (copy all ingredients & descriptions, paste to next Food Cost and edit BB quickly)
+  const focusAndHighlightBb = (targetKey: string, sourceLabel: string, count: number) => {
+    setPastedHighlightMap((prev) => ({
+      ...prev,
+      [targetKey]: { from: sourceLabel, count },
+    }));
+    setTimeout(() => {
+      const el = document.getElementById(`fc-input-bb-${targetKey}-0`) as HTMLInputElement | null;
+      if (el) {
+        el.focus();
+        el.select();
+      }
+    }, 90);
+  };
+
+  const handleCopyFoodCost = (
+    sourceLabel: string,
+    sourcePorsi: "besar" | "kecil",
+    bahanList: BahanMakananInput[],
+    bufferPct?: number
+  ) => {
+    if (!bahanList || bahanList.length === 0) {
+      setFcNotice({
+        type: "warning",
+        text: `Isian "${sourceLabel}" masih kosong, belum ada bahan yang bisa disalin.`,
+      });
+      return;
+    }
+    const payload: CopiedFoodCostPayload = {
+      sourceLabel,
+      sourcePorsi,
+      copiedAt: new Date().toLocaleTimeString("id-ID", { hour: "2-digit", minute: "2-digit" }),
+      bufferPct: bufferPct !== undefined ? bufferPct : (currentDayData.bufferPct ?? 5),
+      bahanList: cloneBahanListFresh(bahanList, "clip"),
+    };
+    setCopiedFoodCost(payload);
+    setFcNotice({
+      type: "success",
+      text: `Berhasil menyalin ${payload.bahanList.length} bahan & uraian dari "${sourceLabel}". Silakan klik "Tempel Isian" pada kategori/hari berikutnya lalu ubah kolom BERAT (BB).`,
+    });
+  };
+
+  const executePastePayload = (
+    targetType: "category" | "porsi" | "custom",
+    targetId: string,
+    targetLabel: string,
+    payload: CopiedFoodCostPayload,
+    mode: "replace" | "append"
+  ) => {
+    const cloned = cloneBahanListFresh(payload.bahanList, `p_${targetId}`);
+    const highlightKey =
+      targetType === "category"
+        ? `cat_${targetId}`
+        : targetType === "custom"
+          ? `custom_${targetId}`
+          : targetId;
+
+    if (targetType === "category") {
+      updateCategoryEntry(targetId, (e) => ({
+        ...e,
+        bahanList: mode === "append" ? [...(e.bahanList || []), ...cloned] : cloned,
+        bufferPct: mode === "replace" ? payload.bufferPct : e.bufferPct,
+      }));
+    } else if (targetType === "porsi") {
+      const listKey = targetId === "besar" ? "porsiBesarBahan" : "porsiKecilBahan";
+      const existing = currentDayData[listKey] || [];
+      updateDayData({
+        ...currentDayData,
+        activeMode: "porsi",
+        [listKey]: mode === "append" ? [...existing, ...cloned] : cloned,
+      });
+    } else if (targetType === "custom") {
+      setCustomTables((prev) =>
+        prev.map((t) => {
+          if (t.id !== targetId) return t;
+          return {
+            ...t,
+            bahanList: mode === "append" ? [...(t.bahanList || []), ...cloned] : cloned,
+            bufferPct: mode === "replace" ? payload.bufferPct : t.bufferPct,
+          };
+        })
+      );
+    }
+
+    focusAndHighlightBb(highlightKey, payload.sourceLabel, cloned.length);
+    setFcNotice({
+      type: "success",
+      text: `Isian "${payload.sourceLabel}" (${cloned.length} bahan) ditempel ke "${targetLabel}". Silakan langsung ubah kolom BERAT (BB) dan tekan Enter untuk lanjut ke baris berikutnya.`,
+    });
+  };
+
+  const handlePasteToTarget = (
+    targetType: "category" | "porsi" | "custom",
+    targetId: string,
+    targetLabel: string,
+    existingCount: number,
+    explicitPayload?: CopiedFoodCostPayload
+  ) => {
+    const payload = explicitPayload || copiedFoodCost;
+    if (!payload || !payload.bahanList || payload.bahanList.length === 0) {
+      setFcNotice({
+        type: "warning",
+        text: 'Belum ada data Food Cost yang disalin. Klik tombol "Salin Semua Isian" pada salah satu Food Cost terlebih dahulu.',
+      });
+      return;
+    }
+
+    if (existingCount === 0) {
+      executePastePayload(targetType, targetId, targetLabel, payload, "replace");
+      return;
+    }
+
+    const highlightKey =
+      targetType === "category"
+        ? `cat_${targetId}`
+        : targetType === "custom"
+          ? `custom_${targetId}`
+          : targetId;
+
+    setPasteConfirmModal({
+      isOpen: true,
+      targetKey: highlightKey,
+      targetLabel,
+      existingCount,
+      onReplace: () => {
+        executePastePayload(targetType, targetId, targetLabel, payload, "replace");
+        setPasteConfirmModal(null);
+      },
+      onAppend: () => {
+        executePastePayload(targetType, targetId, targetLabel, payload, "append");
+        setPasteConfirmModal(null);
+      },
+    });
+  };
+
+  const handlePasteToAllEmptyCategoryEntries = () => {
+    if (!copiedFoodCost || copiedFoodCost.bahanList.length === 0) return;
+    const emptyTargets = resolvedCategoryEntries.filter((e) => (e.bahanList || []).length === 0);
+    if (emptyTargets.length === 0) {
+      setFcNotice({
+        type: "info",
+        text: "Semua tabel kategori yang tampil sudah memiliki isi bahan baku.",
+      });
+      return;
+    }
+
+    const nextEntries = resolvedCategoryEntries.map((e) => {
+      if ((e.bahanList || []).length > 0) return e;
+      return {
+        ...e,
+        bahanList: cloneBahanListFresh(copiedFoodCost.bahanList, `bulk_${e.id}`),
+        bufferPct: copiedFoodCost.bufferPct,
+      };
+    });
+    commitCategoryEntries(nextEntries);
+
+    const newHighlights: Record<string, { from: string; count: number }> = { ...pastedHighlightMap };
+    emptyTargets.forEach((e) => {
+      newHighlights[`cat_${e.id}`] = {
+        from: copiedFoodCost.sourceLabel,
+        count: copiedFoodCost.bahanList.length,
+      };
+    });
+    setPastedHighlightMap(newHighlights);
+
+    setFcNotice({
+      type: "success",
+      text: `Berhasil menempel isian "${copiedFoodCost.sourceLabel}" ke ${emptyTargets.length} tabel kategori kosong. Anda tinggal menyesuaikan BERAT (BB) di masing-masing kategori.`,
+    });
+  };
+
+  // Quick-pull sources available right from dropdown on each table
+  const copySourceOptions = React.useMemo(() => {
+    const opts: { key: string; label: string; porsi: "besar" | "kecil"; bufferPct: number; bahanList: BahanMakananInput[] }[] = [];
+    if (isPerKategoriMode) {
+      resolvedCategoryEntries.forEach((e) => {
+        if ((e.bahanList || []).length > 0) {
+          opts.push({
+            key: `cat:${e.id}`,
+            label: `${e.title} (${e.bahanList.length} bahan)`,
+            porsi: e.porsi,
+            bufferPct: e.bufferPct ?? currentDayData.bufferPct ?? 5,
+            bahanList: e.bahanList,
+          });
+        }
+      });
+    }
+    if ((currentDayData.porsiBesarBahan || []).length > 0) {
+      opts.push({
+        key: "porsi:besar",
+        label: `Porsi Besar Hari ${selectedDay} (${currentDayData.porsiBesarBahan.length} bahan)`,
+        porsi: "besar",
+        bufferPct: currentDayData.bufferPct ?? 5,
+        bahanList: currentDayData.porsiBesarBahan,
+      });
+    }
+    if ((currentDayData.porsiKecilBahan || []).length > 0) {
+      opts.push({
+        key: "porsi:kecil",
+        label: `Porsi Kecil Hari ${selectedDay} (${currentDayData.porsiKecilBahan.length} bahan)`,
+        porsi: "kecil",
+        bufferPct: currentDayData.bufferPct ?? 5,
+        bahanList: currentDayData.porsiKecilBahan,
+      });
+    }
+    // Also collect populated entries from other days in foodCostDays
+    foodCostDays.forEach((d) => {
+      if (d.hariKe === selectedDay && d.jenisMenu === activeDbType) return;
+      (d.categoryEntries || []).forEach((ce) => {
+        if ((ce.bahanList || []).length > 0) {
+          opts.push({
+            key: `day_${d.hariKe}_${d.jenisMenu}_cat_${ce.id}`,
+            label: `H${d.hariKe} (${d.jenisMenu}) · ${ce.title} (${ce.bahanList.length} bahan)`,
+            porsi: ce.porsi,
+            bufferPct: ce.bufferPct ?? d.bufferPct ?? 5,
+            bahanList: ce.bahanList,
+          });
+        }
+      });
+      if ((d.porsiBesarBahan || []).length > 0) {
+        opts.push({
+          key: `day_${d.hariKe}_${d.jenisMenu}_besar`,
+          label: `H${d.hariKe} (${d.jenisMenu}) · Porsi Besar (${d.porsiBesarBahan.length} bahan)`,
+          porsi: "besar",
+          bufferPct: d.bufferPct ?? 5,
+          bahanList: d.porsiBesarBahan,
+        });
+      }
+      if ((d.porsiKecilBahan || []).length > 0) {
+        opts.push({
+          key: `day_${d.hariKe}_${d.jenisMenu}_kecil`,
+          label: `H${d.hariKe} (${d.jenisMenu}) · Porsi Kecil (${d.porsiKecilBahan.length} bahan)`,
+          porsi: "kecil",
+          bufferPct: d.bufferPct ?? 5,
+          bahanList: d.porsiKecilBahan,
+        });
+      }
+    });
+    return opts;
+  }, [
+    isPerKategoriMode,
+    resolvedCategoryEntries,
+    currentDayData,
+    foodCostDays,
+    selectedDay,
+    activeDbType,
+  ]);
+
+  // Selective category grouping helpers (1 category each vs merge selected categories)
+  const syncGroupsState = (nextGroups: FoodCostCategoryGroup[], nextMode?: "per_kategori" | "gabung_porsi") => {
+    setDraftCategoryGroupsByGroup((prev) => ({
+      ...prev,
+      [activeGroupKey]: nextGroups,
+    }));
+    setAppliedConfig((prev) => ({
+      ...prev,
+      confirmed: true,
+      layoutMode: nextMode || prev.layoutMode,
+      categoryGroupsByGroup: {
+        ...prev.categoryGroupsByGroup,
+        [activeGroupKey]: nextGroups,
+      },
+    }));
+  };
+
+  const handleSwitchLayoutMode = (mode: "per_kategori" | "gabung_porsi") => {
+    setDraftLayoutMode(mode);
+    setMergeSelectedGroupIds([]);
+    setAppliedConfig((prev) => ({
+      ...prev,
+      confirmed: true,
+      layoutMode: mode,
+    }));
+    updateDayData({
+      ...currentDayData,
+      activeMode: mode === "per_kategori" ? "kategori" : "porsi",
+    });
+  };
+
+  const toggleMergeSelection = (groupId: string) => {
+    setMergeSelectedGroupIds((prev) =>
+      prev.includes(groupId) ? prev.filter((id) => id !== groupId) : [...prev, groupId]
+    );
+  };
+
+  const handleMergeSelectedDraftGroups = () => {
+    const currentGroups = draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+    const selectedSet = new Set(mergeSelectedGroupIds);
+    const toMerge = currentGroups.filter((g) => selectedSet.has(g.id));
+    if (toMerge.length < 2) {
+      setFcNotice({
+        type: "warning",
+        text: "Centang minimal 2 kategori terlebih dahulu untuk disatukan menjadi 1 Food Cost.",
+      });
+      return;
+    }
+
+    const mergedSasaranIds: string[] = Array.from(
+      new Set<string>(toMerge.flatMap((g) => g.sasaranIds))
+    );
+    const resolvedPorsi: "besar" | "kecil" =
+      mergeCustomPorsi !== "auto"
+        ? mergeCustomPorsi
+        : toMerge.every((g) => g.porsi === "kecil")
+          ? "kecil"
+          : "besar";
+    const resolvedTitle =
+      mergeCustomTitle.trim() || toMerge.map((g) => g.title).join(" + ");
+    const mergedId = `merged_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
+
+    const mergedGroup: FoodCostCategoryGroup = {
+      id: mergedId,
+      title: resolvedTitle,
+      porsi: resolvedPorsi,
+      sasaranIds: mergedSasaranIds,
+    };
+
+    const nextGroups: FoodCostCategoryGroup[] = [];
+    let inserted = false;
+    currentGroups.forEach((g) => {
+      if (selectedSet.has(g.id)) {
+        if (!inserted) {
+          nextGroups.push(mergedGroup);
+          inserted = true;
+        }
+      } else {
+        nextGroups.push(g);
+      }
+    });
+
+    // Preserve first populated source's ingredients into the newly created merged entry if available
+    const existingEntries = currentDayData.categoryEntries || [];
+    const firstSourceWithData = toMerge
+      .map((g) => existingEntries.find((e) => e.id === g.id))
+      .find((e) => e && (e.bahanList || []).length > 0);
+
+    if (firstSourceWithData) {
+      const mergedEntry: FoodCostCategoryEntry = {
+        id: mergedId,
+        title: resolvedTitle,
+        porsi: resolvedPorsi,
+        sasaranIds: mergedSasaranIds,
+        bahanList: cloneBahanListFresh(firstSourceWithData.bahanList, "mrg"),
+        bufferPct: firstSourceWithData.bufferPct ?? currentDayData.bufferPct ?? 5,
+        akgType: getDefaultAkgTypeForGroup(mergedSasaranIds, resolvedPorsi),
+        akgMode: firstSourceWithData.akgMode || "min",
+        nutrientModes: firstSourceWithData.nutrientModes,
+        kriteriaPm: resolvedTitle,
+      };
+      updateDayData({
+        ...currentDayData,
+        activeMode: "kategori",
+        categoryEntries: [...existingEntries, mergedEntry],
+      });
+    }
+
+    syncGroupsState(nextGroups, "per_kategori");
+    setDraftLayoutMode("per_kategori");
+    setMergeSelectedGroupIds([]);
+    setMergeCustomTitle("");
+    setMergeCustomPorsi("auto");
+    setFcNotice({
+      type: "success",
+      text: `Berhasil menyatukan ${toMerge.length} kategori menjadi 1 Food Cost: "${resolvedTitle}".`,
+    });
+  };
+
+  const handleSplitMergedGroup = (groupId: string) => {
+    const currentGroups = draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+    const target = currentGroups.find((g) => g.id === groupId);
+    if (!target || target.sasaranIds.length <= 1) return;
+
+    const splitItems: FoodCostCategoryGroup[] = target.sasaranIds.map((sId) => ({
+      id: `cat_${sId}`,
+      title: getSasaranLabel(sId),
+      porsi: resolveDefaultPorsiForSasaran(sId),
+      sasaranIds: [sId],
+    }));
+
+    const nextGroups: FoodCostCategoryGroup[] = [];
+    const seenIds = new Set<string>();
+    currentGroups.forEach((g) => {
+      if (g.id === groupId) {
+        splitItems.forEach((si) => {
+          if (!seenIds.has(si.id)) {
+            seenIds.add(si.id);
+            nextGroups.push(si);
+          }
+        });
+      } else if (!seenIds.has(g.id)) {
+        seenIds.add(g.id);
+        nextGroups.push(g);
+      }
+    });
+
+    syncGroupsState(nextGroups, "per_kategori");
+    setMergeSelectedGroupIds((prev) => prev.filter((id) => id !== groupId));
+    setFcNotice({
+      type: "info",
+      text: `Grup "${target.title}" dipisahkan kembali menjadi ${splitItems.length} kategori Food Cost masing-masing.`,
+    });
+  };
+
+  const handleRemoveGroupFromActive = (groupId: string) => {
+    const currentGroups = draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+    if (currentGroups.length <= 1) {
+      setFcNotice({
+        type: "warning",
+        text: "Minimal harus ada 1 kategori Food Cost yang aktif.",
+      });
+      return;
+    }
+    const nextGroups = currentGroups.filter((g) => g.id !== groupId);
+    syncGroupsState(nextGroups, "per_kategori");
+    setMergeSelectedGroupIds((prev) => prev.filter((id) => id !== groupId));
+  };
+
+  const handleAddSingleCategoryToActive = (sId: string) => {
+    const currentGroups = draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+    if (currentGroups.some((g) => g.sasaranIds.includes(sId))) return;
+    const newGroup: FoodCostCategoryGroup = {
+      id: `cat_${sId}`,
+      title: getSasaranLabel(sId),
+      porsi: resolveDefaultPorsiForSasaran(sId),
+      sasaranIds: [sId],
+    };
+    syncGroupsState([...currentGroups, newGroup], "per_kategori");
+  };
+
+  const handleResetToSingleCategories = (allTwelvePlusSampel = false) => {
+    const nextGroups = allTwelvePlusSampel
+      ? SASARAN_KATEGORI_LIST.map((s) => ({
+          id: `cat_${s.id}`,
+          title: getSasaranLabel(s.id),
+          porsi: resolveDefaultPorsiForSasaran(s.id),
+          sasaranIds: [s.id],
+        }))
+      : buildDefaultGroupsForTabGroup(activeGroupKey);
+    syncGroupsState(nextGroups, "per_kategori");
+    setDraftLayoutMode("per_kategori");
+    setMergeSelectedGroupIds([]);
+    setFcNotice({
+      type: "info",
+      text: allTwelvePlusSampel
+        ? `Menampilkan seluruh ${nextGroups.length} kategori sasaran (masing-masing 1 Food Cost).`
+        : `Masing-masing 1 kategori Food Cost aktif sesuai kelompok terpilih.`,
+    });
+  };
+
+  const handleKeepOnlyPmPositiveCategories = () => {
+    const baseGroups = buildDefaultGroupsForTabGroup(activeGroupKey);
+    const positiveGroups = baseGroups.filter(
+      (g) => getEntryAutoPmCount(g.sasaranIds, g.porsi) > 0
+    );
+    if (positiveGroups.length === 0) {
+      setFcNotice({
+        type: "warning",
+        text: `Belum ada kategori dengan jumlah PM > 0 pada Hari Ke-${selectedDay}. Menampilkan semua kategori default kelompok.`,
+      });
+      syncGroupsState(baseGroups, "per_kategori");
+      return;
+    }
+    syncGroupsState(positiveGroups, "per_kategori");
+    setDraftLayoutMode("per_kategori");
+    setMergeSelectedGroupIds([]);
+    setFcNotice({
+      type: "success",
+      text: `Menampilkan ${positiveGroups.length} kategori yang memiliki Penerima Manfaat (PM > 0).`,
+    });
+  };
+
   const handleBufferChange = (val: number) => {
+    if (isPerKategoriMode && (currentDayData.categoryEntries || []).length > 0) {
+      const updatedEntries = resolvedCategoryEntries.map((e) => ({ ...e, bufferPct: val }));
+      commitCategoryEntries(updatedEntries, { bufferPct: val });
+      return;
+    }
     updateDayData({ ...currentDayData, bufferPct: val });
   };
 
@@ -1265,6 +2287,31 @@ export default function FoodCostTab({
     }
 
     const targetScope = options?.scope || "all";
+
+    if (isPerKategoriMode) {
+      let updatedCount = 0;
+      const nextEntries = resolvedCategoryEntries.map((entry) => {
+        if (targetScope !== "all" && entry.porsi !== targetScope) return entry;
+        if (options?.onlyIfEmpty && (entry.bahanList || []).length > 0) return entry;
+        const sourceBahan = entry.porsi === "besar" ? pbBahan : pkBahan;
+        updatedCount++;
+        return {
+          ...entry,
+          bahanList: cloneBahanListFresh(sourceBahan, `mm_${entry.id}`),
+        };
+      });
+      if (updatedCount > 0) {
+        commitCategoryEntries(nextEntries);
+        if (!options?.silent) {
+          setFcNotice({
+            type: "success",
+            text: `Berhasil memetakan ${pbBahan.length} komponen menu "${namaMenuHariIni}" ke ${updatedCount} tabel kategori Food Cost.`,
+          });
+        }
+      }
+      return;
+    }
+
     const fillBesar =
       (targetScope === "all" || targetScope === "besar") &&
       (!options?.onlyIfEmpty || currentDayData.porsiBesarBahan.length === 0);
@@ -1276,6 +2323,7 @@ export default function FoodCostTab({
 
     updateDayData({
       ...currentDayData,
+      activeMode: "porsi",
       porsiBesarBahan: fillBesar ? pbBahan : currentDayData.porsiBesarBahan,
       porsiKecilBahan: fillKecil ? pkBahan : currentDayData.porsiKecilBahan,
     });
@@ -1289,6 +2337,21 @@ export default function FoodCostTab({
   };
 
   const handleOpenCategoryConfirmModal = () => {
+    if (draftLayoutMode === "per_kategori") {
+      const currentGroups = draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+      const filteredGroups = currentGroups.filter((g) => draftScope === "all" || g.porsi === draftScope);
+      if (filteredGroups.length === 0) {
+        setFcNotice({
+          type: "warning",
+          text: "Pilih minimal 1 kategori Food Cost sebelum melakukan konfirmasi.",
+        });
+        return;
+      }
+      setFcNotice(null);
+      setShowCategoryConfirmModal(true);
+      return;
+    }
+
     const missingKecil = (draftScope === "kecil" || draftScope === "all") && draftKecilIds.length === 0;
     const missingBesar = (draftScope === "besar" || draftScope === "all") && draftBesarIds.length === 0;
 
@@ -1321,11 +2384,18 @@ export default function FoodCostTab({
     const resolvedKecilIds = draftScope === "besar" ? draftKecilIds : draftKecilIds;
     const resolvedBesarIds = draftScope === "kecil" ? draftBesarIds : draftBesarIds;
 
-    setAppliedConfig({
+    setAppliedConfig((prev) => ({
+      ...prev,
       confirmed: true,
+      layoutMode: draftLayoutMode,
       scope: draftScope,
       kecilIds: resolvedKecilIds,
       besarIds: resolvedBesarIds,
+      categoryGroupsByGroup: draftCategoryGroupsByGroup,
+    }));
+    updateDayData({
+      ...currentDayData,
+      activeMode: draftLayoutMode === "per_kategori" ? "kategori" : "porsi",
     });
     setShowCategoryConfirmModal(false);
     setIsSelectorExpanded(false);
@@ -1334,16 +2404,18 @@ export default function FoodCostTab({
       autoMatchFromMasterMenu({ silent: true, onlyIfEmpty: true, scope: draftScope });
     }
 
-    const scopeText =
-      draftScope === "kecil"
-        ? "Porsi Kecil (Semua kategori terpilih)"
-        : draftScope === "besar"
-          ? "Porsi Besar (Semua kategori terpilih)"
-          : "Semua Food Cost (Porsi Kecil & Porsi Besar)";
+    const modeLabel =
+      draftLayoutMode === "per_kategori"
+        ? "Masing-Masing 1 Kategori"
+        : draftScope === "kecil"
+          ? "Gabung Porsi Kecil"
+          : draftScope === "besar"
+            ? "Gabung Porsi Besar"
+            : "Gabung Semua Porsi (Kecil & Besar)";
 
     setFcNotice({
       type: "success",
-      text: `Konfirmasi berhasil! Menampilkan Food Cost untuk: ${scopeText}.`,
+      text: `Konfirmasi berhasil! Menampilkan Food Cost dengan mode: ${modeLabel}.`,
     });
 
     setTimeout(() => {
@@ -1755,16 +2827,104 @@ export default function FoodCostTab({
       return sheetData;
     };
 
-    if (!appliedConfig.confirmed || appliedConfig.scope === "all" || appliedConfig.scope === "besar") {
-      const besarData = generateSheetData("besar");
-      const wsBesar = XLSX.utils.aoa_to_sheet(besarData);
-      XLSX.utils.book_append_sheet(wb, wsBesar, "Porsi Besar");
-    }
+    if (isPerKategoriMode) {
+      resolvedCategoryEntries.forEach((entry, idx) => {
+        const calcInfo = categoryCalcResultsMap[entry.id];
+        if (!calcInfo) return;
+        const { items: activeItems, totalBahanCost: totalBahan, perPorsiCost, pmCount } = {
+          items: calcInfo.items,
+          totalBahanCost: calcInfo.totalBahanCost,
+          perPorsiCost: calcInfo.calculatedCostPerPorsi,
+          pmCount: calcInfo.pmCount,
+        };
+        const entryBuffer = entry.bufferPct !== undefined ? entry.bufferPct : (currentDayData.bufferPct ?? 5);
 
-    if (!appliedConfig.confirmed || appliedConfig.scope === "all" || appliedConfig.scope === "kecil") {
-      const kecilData = generateSheetData("kecil");
-      const wsKecil = XLSX.utils.aoa_to_sheet(kecilData);
-      XLSX.utils.book_append_sheet(wb, wsKecil, "Porsi Kecil");
+        const sheetData: any[][] = [];
+        sheetData.push([kopLine1]);
+        sheetData.push([kopLine2]);
+        sheetData.push([kopLine3]);
+        sheetData.push([kopLine4]);
+        sheetData.push([]);
+        sheetData.push([`LAPORAN FOOD COST (ANALISIS BIAYA & GIZI) - ${entry.title.toUpperCase()} (${entry.porsi === "besar" ? "PORSI BESAR" : "PORSI KECIL"})`]);
+        sheetData.push(["Siklus Hari Ke:", selectedDay, "Kategori:", selectedType, "Menu:", namaMenuHariIni]);
+        sheetData.push(["Jumlah Penerima Manfaat (PM):", pmCount, "Penerima Manfaat"]);
+        sheetData.push([]);
+        sheetData.push([
+          "KRITERIA PM", "MENU", "BAHAN MAKANAN", "BERAT (BB) (g)", "URT",
+          "ENERGI (Kal)", "PROTEIN (g)", "LEMAK (g)", "KH (g)", "SERAT (g)",
+          "BDD (%)", "BK (gr)", "Jumlah Manfaat", "Gram", "Kg",
+          headerPotong, headerEkor, `Buffer (${entryBuffer}%)`, "Jumlah+Buffer", "Harga Satuan (Rp)", "Harga Total (Rp)"
+        ]);
+
+        const kriteriaPmText = entry.kriteriaPm || entry.title;
+        activeItems.forEach((b) => {
+          sheetData.push([
+            kriteriaPmText,
+            namaMenuHariIni || "-",
+            b.nama,
+            b.beratBB,
+            b.urt,
+            b.energi,
+            b.protein,
+            b.lemak,
+            b.kh,
+            b.serat,
+            b.bdd,
+            b.beratKotor,
+            pmCount,
+            b.totalKebutuhanGram,
+            b.totalKebutuhanKg,
+            b.potong || 0,
+            b.ekor || 0,
+            b.buah || 0,
+            b.butir || 0,
+            b.hargaSatuan,
+            b.hargaTotal
+          ]);
+        });
+
+        sheetData.push([]);
+        const sumEnergi = activeItems.reduce((acc, b) => acc + b.energi, 0);
+        const sumProtein = activeItems.reduce((acc, b) => acc + b.protein, 0);
+        const sumLemak = activeItems.reduce((acc, b) => acc + b.lemak, 0);
+        const sumKH = activeItems.reduce((acc, b) => acc + b.kh, 0);
+        const sumSerat = activeItems.reduce((acc, b) => acc + b.serat, 0);
+
+        const targetEnergi = getCategoryEntryAkgTarget(entry, "energi");
+        const targetProtein = getCategoryEntryAkgTarget(entry, "protein");
+        const targetLemak = getCategoryEntryAkgTarget(entry, "lemak");
+        const targetKH = getCategoryEntryAkgTarget(entry, "kh");
+        const targetSerat = getCategoryEntryAkgTarget(entry, "serat");
+
+        const pctEnergi = targetEnergi > 0 ? (sumEnergi / targetEnergi) * 100 : 0;
+        const pctProtein = targetProtein > 0 ? (sumProtein / targetProtein) * 100 : 0;
+        const pctLemak = targetLemak > 0 ? (sumLemak / targetLemak) * 100 : 0;
+        const pctKH = targetKH > 0 ? (sumKH / targetKH) * 100 : 0;
+        const pctSerat = targetSerat > 0 ? (sumSerat / targetSerat) * 100 : 0;
+
+        sheetData.push(["KANDUNGAN GIZI", "", "", "", "", sumEnergi, sumProtein, sumLemak, sumKH, sumSerat, "", "", "JUMLAH (Rp)", totalBahan, "", "", "JUMLAH (Rp)", totalBahan]);
+        sheetData.push([`KEBUTUHAN RUJUKAN AKG`, "", "", "", "", targetEnergi, targetProtein, targetLemak, targetKH, targetSerat, "", "", `BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (activeBumbuPct / 100), "", "", `BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (activeBumbuPct / 100)]);
+        sheetData.push(["KEBUTUHAN 90-110%", "", "", "", "", `${pctEnergi.toFixed(0)}%`, `${pctProtein.toFixed(0)}%`, `${pctLemak.toFixed(0)}%`, `${pctKH.toFixed(0)}%`, `${pctSerat.toFixed(0)}%`, "", "", `JUMLAH+BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (1 + activeBumbuPct / 100), "", "", `JUMLAH+BUMBU ${activeBumbuPct}% (Rp)`, totalBahan * (1 + activeBumbuPct / 100)]);
+        sheetData.push([]);
+        sheetData.push(["", "", "", "", "", "", "", "", "", "", "", "", "HARGA PER PORSI (Rp)", perPorsiCost]);
+
+        const wsCat = XLSX.utils.aoa_to_sheet(sheetData);
+        const rawSheetName = (entry.title || `Kat ${idx + 1}`).replace(/[\\\/\?\*\[\]:]/g, "").trim();
+        const sheetName = rawSheetName.substring(0, 28) || `Kategori ${idx + 1}`;
+        XLSX.utils.book_append_sheet(wb, wsCat, sheetName);
+      });
+    } else {
+      if (!appliedConfig.confirmed || appliedConfig.scope === "all" || appliedConfig.scope === "besar") {
+        const besarData = generateSheetData("besar");
+        const wsBesar = XLSX.utils.aoa_to_sheet(besarData);
+        XLSX.utils.book_append_sheet(wb, wsBesar, "Porsi Besar");
+      }
+
+      if (!appliedConfig.confirmed || appliedConfig.scope === "all" || appliedConfig.scope === "kecil") {
+        const kecilData = generateSheetData("kecil");
+        const wsKecil = XLSX.utils.aoa_to_sheet(kecilData);
+        XLSX.utils.book_append_sheet(wb, wsKecil, "Porsi Kecil");
+      }
     }
 
     // Append custom tables to Excel
@@ -1962,6 +3122,8 @@ export default function FoodCostTab({
       );
     }
 
+    const bbHighlight = !isPrint && Boolean(pastedHighlightMap[porsi]);
+
     return (
       <>
       <div className={isPrint ? "w-full border border-black rounded-lg shadow-xs overflow-hidden" : "overflow-x-auto border border-black rounded-lg shadow-xs"}>
@@ -1971,7 +3133,9 @@ export default function FoodCostTab({
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[110px] min-w-[110px]"}`} style={isPrint ? { width: '5.5%' } : undefined}>KRITERIA PM</th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[110px] min-w-[110px]"}`} style={isPrint ? { width: '5.5%' } : undefined}>MENU</th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[160px] min-w-[160px]"}`} style={isPrint ? { width: '10%' } : undefined}>BAHAN MAKANAN</th>
-              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[58px] min-w-[58px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>BERAT (BB)</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[58px] min-w-[58px]"} ${bbHighlight ? "bg-amber-300 ring-2 ring-inset ring-amber-600" : ""}`} style={isPrint ? { width: '3.5%' } : undefined}>
+                BERAT (BB){bbHighlight && <span className="block text-[8px] font-black text-amber-950 normal-case">Ubah ↵</span>}
+              </th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[58px] min-w-[58px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>URT</th>
               <th colSpan={5} className="p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap bg-[#76933C] print:text-black">KOMPOSISI ZAT GIZI MAKANAN</th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[58px] min-w-[58px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>BDD (%)</th>
@@ -2084,7 +3248,7 @@ export default function FoodCostTab({
                       </div>
                     )}
                   </td>
-                  <td className="p-1 border border-black text-center w-[56px] min-w-[56px]">
+                  <td className={`p-1 border border-black text-center w-[56px] min-w-[56px] ${bbHighlight ? "bg-amber-50 ring-1 ring-inset ring-amber-400" : ""}`}>
                     {isPrint ? (
                       <span className="font-mono font-bold text-slate-950 text-xs text-center">{b.beratBB}</span>
                     ) : (
@@ -2093,7 +3257,17 @@ export default function FoodCostTab({
                         type="number"
                         value={currentDayData[porsi === "besar" ? "porsiBesarBahan" : "porsiKecilBahan"][idx]?.beratBB || ""}
                         onChange={(e) => handleRowChange(porsi, idx, "beratBB", Number(e.target.value))}
-                        className="w-full text-center bg-transparent border-0 font-mono font-bold p-0 text-slate-950 text-xs"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            const nextEl = document.getElementById(`fc-input-bb-${porsi}-${idx + 1}`) as HTMLInputElement | null;
+                            if (nextEl) {
+                              nextEl.focus();
+                              nextEl.select();
+                            }
+                          }
+                        }}
+                        className={`w-full text-center border-0 font-mono font-bold p-0 text-slate-950 text-xs rounded ${bbHighlight ? "bg-amber-100/80 focus:bg-white focus:ring-2 focus:ring-amber-500" : "bg-transparent"}`}
                       />
                     )}
                   </td>
@@ -2664,6 +3838,581 @@ export default function FoodCostTab({
     );
   };
 
+  const renderCategoryFoodCostTable = (entry: FoodCostCategoryEntry, isPrint: boolean) => {
+    const calcInfo = categoryCalcResultsMap[entry.id];
+    const items = calcInfo ? calcInfo.items : [];
+    const totalBahanCost = calcInfo ? calcInfo.totalBahanCost : 0;
+    const bumbuCost = calcInfo ? calcInfo.bumbuCost : 0;
+    const subtotalCost = calcInfo ? calcInfo.subtotalCost : 0;
+    const calculatedCostPerPorsi = calcInfo ? calcInfo.calculatedCostPerPorsi : 0;
+    const recipientCount = calcInfo ? calcInfo.pmCount : getEntryEffectivePmCount(entry);
+    const targetPrice = calcInfo ? calcInfo.targetPrice : (entry.porsi === "besar" ? activeTargetPriceBesar : activeTargetPriceKecil);
+    const entryBuffer = entry.bufferPct !== undefined ? entry.bufferPct : (currentDayData.bufferPct ?? 5);
+
+    const sumEnergi = items.reduce((acc, b) => acc + b.energi, 0);
+    const sumProtein = items.reduce((acc, b) => acc + b.protein, 0);
+    const sumLemak = items.reduce((acc, b) => acc + b.lemak, 0);
+    const sumKH = items.reduce((acc, b) => acc + b.kh, 0);
+    const sumSerat = items.reduce((acc, b) => acc + b.serat, 0);
+
+    const targetEnergi = getCategoryEntryAkgTarget(entry, "energi");
+    const targetProtein = getCategoryEntryAkgTarget(entry, "protein");
+    const targetLemak = getCategoryEntryAkgTarget(entry, "lemak");
+    const targetKH = getCategoryEntryAkgTarget(entry, "kh");
+    const targetSerat = getCategoryEntryAkgTarget(entry, "serat");
+
+    const pctEnergi = targetEnergi > 0 ? (sumEnergi / targetEnergi) * 100 : 0;
+    const pctProtein = targetProtein > 0 ? (sumProtein / targetProtein) * 100 : 0;
+    const pctLemak = targetLemak > 0 ? (sumLemak / targetLemak) * 100 : 0;
+    const pctKH = targetKH > 0 ? (sumKH / targetKH) * 100 : 0;
+    const pctSerat = targetSerat > 0 ? (sumSerat / targetSerat) * 100 : 0;
+
+    const tableKey = `cat_${entry.id}`;
+    const bbHighlight = !isPrint && Boolean(pastedHighlightMap[tableKey]);
+    const kriteriaPmText = entry.kriteriaPm !== undefined ? entry.kriteriaPm : entry.title;
+
+    if (items.length === 0) {
+      if (isPrint) {
+        return (
+          <div className="p-4 border border-black rounded-lg text-center text-xs font-bold text-slate-500 italic uppercase bg-slate-50">
+            Tidak ada komponen bahan baku untuk kategori {entry.title} hari ini.
+          </div>
+        );
+      }
+      return (
+        <div className="flex flex-col items-center justify-center p-7 bg-slate-50 border border-dashed border-slate-300 rounded-2xl space-y-3 text-center my-2">
+          <div className="p-2.5 bg-indigo-50 text-indigo-500 rounded-full">
+            <Layers className="w-5 h-5" />
+          </div>
+          <div>
+            <h5 className="text-xs font-black text-slate-700 uppercase tracking-wide">
+              Komponen Bahan Baku "{entry.title}" Masih Kosong
+            </h5>
+            <p className="text-[11px] text-slate-500 mt-1 max-w-md">
+              Klik <strong>+ Tambah Bahan Baku</strong> untuk input manual, atau klik <strong>Tempel Isian</strong> / pilih di dropdown <strong>Salin dari...</strong> jika bahan &amp; uraiannya sama dengan Food Cost lain (Anda tinggal ubah BB).
+            </p>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <>
+      <div className={isPrint ? "w-full border border-black rounded-lg shadow-xs overflow-hidden" : "overflow-x-auto border border-black rounded-lg shadow-xs"}>
+        <table className={`w-full border-collapse border border-black font-sans text-center ${isPrint ? "table-fixed text-[9px] leading-tight" : "text-xs"}`} style={isPrint ? { tableLayout: 'fixed', width: '100%' } : { fontSize: '12px' }}>
+          <thead className="bg-[#92D050] text-black font-bold uppercase border border-black text-center">
+            <tr>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[110px] min-w-[110px]"}`} style={isPrint ? { width: '5.5%' } : undefined}>KRITERIA PM</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[110px] min-w-[110px]"}`} style={isPrint ? { width: '5.5%' } : undefined}>MENU</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[160px] min-w-[160px]"}`} style={isPrint ? { width: '10%' } : undefined}>BAHAN MAKANAN</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[58px] min-w-[58px]"} ${bbHighlight ? "bg-amber-300 ring-2 ring-inset ring-amber-600" : ""}`} style={isPrint ? { width: '3.5%' } : undefined}>
+                BERAT (BB){bbHighlight && <span className="block text-[8px] font-black text-amber-950 normal-case">Ubah ↵</span>}
+              </th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[58px] min-w-[58px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>URT</th>
+              <th colSpan={5} className="p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap bg-[#76933C] print:text-black">KOMPOSISI ZAT GIZI MAKANAN</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[58px] min-w-[58px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>BDD (%)</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[68px] min-w-[68px]"}`} style={isPrint ? { width: '4%' } : undefined}>BK (g)</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black leading-tight ${isPrint ? "" : "w-[68px] min-w-[68px]"}`} style={isPrint ? { width: '4%' } : undefined}>Jumlah<br/>Manfaat</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[76px] min-w-[76px]"}`} style={isPrint ? { width: '4.5%' } : undefined}>Gram (g)</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap ${isPrint ? "" : "w-[76px] min-w-[76px]"}`} style={isPrint ? { width: '4.5%' } : undefined}>Kg (kg)</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap bg-[#92D050] ${isPrint ? "" : "w-[68px] min-w-[68px]"}`} style={isPrint ? { width: '4%' } : undefined}>
+                {isPrint ? headerPotong : (
+                  <input
+                    type="text"
+                    value={headerPotong}
+                    onChange={(e) => {
+                      setHeaderPotong(e.target.value);
+                      localStorage.setItem("fc_header_potong", e.target.value);
+                    }}
+                    className="w-full text-center bg-[#92D050] border-0 hover:bg-[#86c145] focus:bg-white font-black p-0.5 rounded text-slate-950 uppercase text-[11px] focus:ring-1 focus:ring-slate-600"
+                    title="Ubah judul kolom Potong"
+                  />
+                )}
+              </th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black whitespace-nowrap bg-[#92D050] ${isPrint ? "" : "w-[68px] min-w-[68px]"}`} style={isPrint ? { width: '4%' } : undefined}>
+                {isPrint ? headerEkor : (
+                  <input
+                    type="text"
+                    value={headerEkor}
+                    onChange={(e) => {
+                      setHeaderEkor(e.target.value);
+                      localStorage.setItem("fc_header_ekor", e.target.value);
+                    }}
+                    className="w-full text-center bg-[#92D050] border-0 hover:bg-[#86c145] focus:bg-white font-black p-0.5 rounded text-slate-950 uppercase text-[11px] focus:ring-1 focus:ring-slate-600"
+                    title="Ubah judul kolom Ekor"
+                  />
+                )}
+              </th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black bg-[#92D050] text-[11px] leading-tight select-none ${isPrint ? "" : "w-[80px] min-w-[80px]"}`} style={isPrint ? { width: '4.5%' } : undefined}>
+                Buffer<br/><span className="text-[10px] font-bold">({entryBuffer}%)</span>
+              </th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-black bg-[#92D050] text-[11px] leading-tight select-none ${isPrint ? "" : "w-[90px] min-w-[90px]"}`} style={isPrint ? { width: '5.5%' } : undefined}>
+                Jumlah +<br/>Buffer
+              </th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[130px] min-w-[130px]"}`} style={isPrint ? { width: '7.5%' } : undefined}>Harga Satuan</th>
+              <th rowSpan={2} className={`p-1 border border-black border-r-2 border-r-slate-950 text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[136px] min-w-[136px]"}`} style={isPrint ? { width: '8.5%' } : undefined}>Harga Total</th>
+              {!isPrint && <th rowSpan={2} className="p-1 border border-black border-l-2 border-l-slate-950 text-center text-rose-800 w-[44px] min-w-[44px] no-print">Aksi</th>}
+            </tr>
+            <tr>
+              <th className={`p-1 border border-black text-center bg-[#D8E4BC] text-slate-950 font-bold ${isPrint ? "" : "w-[54px] min-w-[54px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>ENERGI (Kal)</th>
+              <th className={`p-1 border border-black text-center bg-[#D8E4BC] text-slate-950 font-bold ${isPrint ? "" : "w-[56px] min-w-[56px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>Protein (g)</th>
+              <th className={`p-1 border border-black text-center bg-[#D8E4BC] text-slate-950 font-bold ${isPrint ? "" : "w-[56px] min-w-[56px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>LEMAK (g)</th>
+              <th className={`p-1 border border-black text-center bg-[#D8E4BC] text-slate-950 font-bold ${isPrint ? "" : "w-[56px] min-w-[56px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>KH (g)</th>
+              <th className={`p-1 border border-black text-center bg-[#D8E4BC] text-slate-950 font-bold ${isPrint ? "" : "w-[56px] min-w-[56px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>SERAT (g)</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-black text-[11px] text-slate-900 bg-white">
+            {items.map((b, idx) => (
+              <tr key={b.id} className="hover:bg-slate-50/50">
+                {idx === 0 && (
+                  <td rowSpan={items.length} className="p-1 border border-black text-center font-extrabold bg-[#E2EFDA] align-middle text-[10px] uppercase leading-tight w-[110px] min-w-[110px]">
+                    {isPrint ? (
+                      <span className="block p-1 text-[10px] font-extrabold text-slate-950 uppercase">{kriteriaPmText}</span>
+                    ) : (
+                      <textarea
+                        value={kriteriaPmText}
+                        onChange={(e) => updateCategoryEntry(entry.id, (cur) => ({ ...cur, kriteriaPm: e.target.value }))}
+                        className="w-full text-center bg-transparent border-0 font-extrabold text-[10px] uppercase focus:ring-1 focus:ring-indigo-500 p-1 resize-none overflow-hidden"
+                        rows={3}
+                        placeholder="Edit Kriteria PM..."
+                      />
+                    )}
+                  </td>
+                )}
+                {idx === 0 && (
+                  <td rowSpan={items.length} className="p-1 border border-black text-center font-bold bg-[#F2F2F2] align-middle text-[10px] w-[110px] min-w-[110px] break-words text-slate-950">
+                    {namaMenuHariIni || "-"}
+                  </td>
+                )}
+                <td className="p-1 border border-black font-semibold w-[160px] min-w-[160px] text-center">
+                  {isPrint ? (
+                    <span className="p-0.5 block text-xs font-bold text-slate-950 text-center">{b.nama}</span>
+                  ) : (
+                    <div className="flex items-center gap-1.5 justify-center">
+                      <div className="flex-1 min-w-0">
+                        <SearchableTkpiDropdown
+                          id={`fc-select-tkpi-${tableKey}-${idx}`}
+                          tkpiList={tkpiList}
+                          selectedValue={entry.bahanList[idx]?.tkpiId || ""}
+                          onChange={(val) => editIngredientInCategoryEntry(entry.id, idx, "tkpiId", val)}
+                          minimal
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => removeIngredientFromCategoryEntry(entry.id, b.id, idx)}
+                        className="p-1 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg transition hover:scale-105 active:scale-95 shrink-0 no-print"
+                        title="Hapus Bahan Makanan Ini"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </td>
+                <td className={`p-1 border border-black text-center w-[56px] min-w-[56px] ${bbHighlight ? "bg-amber-50 ring-1 ring-inset ring-amber-400" : ""}`}>
+                  {isPrint ? (
+                    <span className="font-mono font-bold text-slate-950 text-xs text-center">{b.beratBB}</span>
+                  ) : (
+                    <input
+                      id={`fc-input-bb-${tableKey}-${idx}`}
+                      type="number"
+                      value={entry.bahanList[idx]?.beratBB || ""}
+                      onChange={(e) => editIngredientInCategoryEntry(entry.id, idx, "beratBB", Number(e.target.value))}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          const nextEl = document.getElementById(`fc-input-bb-${tableKey}-${idx + 1}`) as HTMLInputElement | null;
+                          if (nextEl) {
+                            nextEl.focus();
+                            nextEl.select();
+                          }
+                        }
+                      }}
+                      className={`w-full text-center border-0 font-mono font-bold p-0 text-slate-950 text-xs rounded ${bbHighlight ? "bg-amber-100/80 focus:bg-white focus:ring-2 focus:ring-amber-500" : "bg-transparent"}`}
+                    />
+                  )}
+                </td>
+                <td className="p-1 border border-black text-center w-[56px] min-w-[56px]">
+                  {isPrint ? (
+                    <span className="text-slate-950 text-xs text-center">{b.urt}</span>
+                  ) : (
+                    <input
+                      id={`fc-input-urt-${tableKey}-${idx}`}
+                      type="text"
+                      value={entry.bahanList[idx]?.urt || ""}
+                      onChange={(e) => editIngredientInCategoryEntry(entry.id, idx, "urt", e.target.value)}
+                      className="w-full text-center bg-transparent border-0 p-0 text-slate-950 text-xs"
+                    />
+                  )}
+                </td>
+                <td className="p-1 border border-black text-center font-mono text-slate-950 font-semibold bg-slate-50/30 w-[54px] min-w-[54px] text-xs">{b.energi.toFixed(1)}</td>
+                <td className="p-1 border border-black text-center font-mono text-slate-950 font-semibold bg-slate-50/30 w-[56px] min-w-[56px] text-xs">{b.protein.toFixed(1)}</td>
+                <td className="p-1 border border-black text-center font-mono text-slate-950 font-semibold bg-slate-50/30 w-[56px] min-w-[56px] text-xs">{b.lemak.toFixed(1)}</td>
+                <td className="p-1 border border-black text-center font-mono text-slate-950 font-semibold bg-slate-50/30 w-[56px] min-w-[56px] text-xs">{b.kh.toFixed(1)}</td>
+                <td className="p-1 border border-black text-center font-mono text-slate-950 font-semibold bg-slate-50/30 w-[56px] min-w-[56px] text-xs">{b.serat.toFixed(1)}</td>
+
+                <td className="p-1 border border-black text-center w-[56px] min-w-[56px]">
+                  {isPrint ? (
+                    <span className="font-mono font-bold text-slate-950 text-xs">{b.bdd}%</span>
+                  ) : (
+                    <EditableBddCell
+                      value={b.bdd}
+                      isCustom={entry.bahanList[idx]?.bdd !== undefined}
+                      onChange={(newVal) => editIngredientInCategoryEntry(entry.id, idx, "bdd", newVal)}
+                    />
+                  )}
+                </td>
+                <td className="p-1 border border-black text-center font-mono font-bold bg-[#E6F0FA]/20 w-[64px] min-w-[64px] text-slate-950 text-xs">{b.beratKotor.toFixed(1)}</td>
+
+                {idx === 0 && (
+                  <td rowSpan={items.length} className="p-1 border border-black text-center font-extrabold bg-[#FFF2CC] align-middle font-mono w-[64px] min-w-[64px] text-slate-950 text-xs">
+                    {isPrint ? (
+                      <span className="font-mono font-extrabold text-slate-950 text-xs">{recipientCount}</span>
+                    ) : (
+                      <input
+                        type="number"
+                        min="0"
+                        value={entry.customPmCount !== undefined ? entry.customPmCount : recipientCount}
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          const val = raw === "" ? undefined : Math.max(0, Number(raw));
+                          updateCategoryEntry(entry.id, (cur) => ({ ...cur, customPmCount: val }));
+                        }}
+                        className="w-full text-center bg-transparent border-0 font-mono font-extrabold p-0.5 text-slate-950 text-xs focus:bg-white focus:ring-1 focus:ring-amber-500 rounded cursor-pointer hover:bg-amber-100/60"
+                        title="Klik untuk mengedit Jumlah Penerima Manfaat kategori ini"
+                      />
+                    )}
+                  </td>
+                )}
+
+                <td className="p-1 border border-black text-center font-mono text-slate-950 w-[72px] min-w-[72px] font-semibold text-xs">{b.totalKebutuhanGram.toFixed(1)}</td>
+                <td className="p-1 border border-black text-center font-mono font-bold text-slate-950 w-[72px] min-w-[72px] text-xs">{b.totalKebutuhanKg.toFixed(1)}</td>
+
+                <td className="p-1 border border-black text-center w-[68px] min-w-[68px]">
+                  {isPrint ? (
+                    <span className="font-mono text-slate-950">{b.potong || "-"}</span>
+                  ) : (
+                    <div className="relative group/calc flex items-center justify-center h-full w-full">
+                      <input
+                        type="text"
+                        value={entry.bahanList[idx]?.potong ?? ""}
+                        onChange={(e) => editIngredientInCategoryEntry(entry.id, idx, "potong", e.target.value)}
+                        className="w-full text-center bg-white border border-slate-900 rounded-lg font-mono font-bold text-xs p-1 focus:ring-2 focus:ring-indigo-600 focus:outline-none shadow-2xs"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => openCalculator(`cat:${entry.id}`, idx, "potong", String(entry.bahanList[idx]?.potong ?? ""), b.nama)}
+                        className="absolute right-0.5 top-1/2 -translate-y-1/2 opacity-0 group-hover/calc:opacity-100 focus:opacity-100 bg-white hover:bg-slate-100 border border-slate-300 shadow-xs px-1 py-0.5 rounded text-[10px] text-slate-600 z-10 transition-opacity"
+                        title={`Hitung Potong - ${b.nama}`}
+                      >
+                        🧮
+                      </button>
+                    </div>
+                  )}
+                </td>
+                <td className="p-1 border border-black text-center w-[68px] min-w-[68px]">
+                  {isPrint ? (
+                    <span className="font-mono text-slate-950">{b.ekor || "-"}</span>
+                  ) : (
+                    <div className="relative group/calc flex items-center justify-center h-full w-full">
+                      <input
+                        type="text"
+                        value={entry.bahanList[idx]?.ekor ?? ""}
+                        onChange={(e) => editIngredientInCategoryEntry(entry.id, idx, "ekor", e.target.value)}
+                        className="w-full text-center bg-white border border-slate-900 rounded-lg font-mono font-bold text-xs p-1 focus:ring-2 focus:ring-indigo-600 focus:outline-none shadow-2xs"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => openCalculator(`cat:${entry.id}`, idx, "ekor", String(entry.bahanList[idx]?.ekor ?? ""), b.nama)}
+                        className="absolute right-0.5 top-1/2 -translate-y-1/2 opacity-0 group-hover/calc:opacity-100 focus:opacity-100 bg-white hover:bg-slate-100 border border-slate-300 shadow-xs px-1 py-0.5 rounded text-[10px] text-slate-600 z-10 transition-opacity"
+                        title={`Hitung Ekor - ${b.nama}`}
+                      >
+                        🧮
+                      </button>
+                    </div>
+                  )}
+                </td>
+                <td
+                  onClick={() => !isPrint && openBufferConfig(`cat:${entry.id}`, idx, b)}
+                  className={`p-1 border border-black text-center w-[80px] min-w-[80px] bg-slate-50/50 ${!isPrint ? "cursor-pointer hover:bg-indigo-50/70 transition-all group/buffer" : ""}`}
+                  title={!isPrint ? "Klik untuk memilih basis Buffer (Kg, Potong, Ekor)" : undefined}
+                >
+                  <div className="flex flex-col items-center justify-center h-full min-h-[36px]">
+                    <span className="font-mono text-slate-950 text-xs font-semibold">
+                      {typeof b.buah === "number" && b.buah >= 0 ? b.buah.toFixed(1) : "-"}
+                    </span>
+                    {!isPrint && (
+                      <span className="text-[8px] text-indigo-600 font-extrabold uppercase tracking-wider block leading-none mt-0.5 opacity-70 group-hover/buffer:opacity-100 transition-opacity">
+                        {b.bufferBase === "kg" ? "KG" : b.bufferBase === "potong" ? "Ptg" : b.bufferBase === "ekor" ? "Ekr" : b.bufferBase === "custom" ? "Cust" : "Auto"} ⚙️
+                      </span>
+                    )}
+                  </div>
+                </td>
+                <td
+                  onClick={() => !isPrint && openBufferConfig(`cat:${entry.id}`, idx, b)}
+                  className={`p-1 border border-black text-center w-[90px] min-w-[90px] bg-[#E6F0FA]/30 ${!isPrint ? "cursor-pointer hover:bg-indigo-50/70 transition-all group/jumlah" : ""}`}
+                  title={!isPrint ? "Klik untuk mengatur rumus Jumlah + Buffer" : undefined}
+                >
+                  <div className="flex flex-col items-center justify-center h-full min-h-[36px]">
+                    <span className="font-mono text-slate-950 text-xs font-bold text-indigo-950">
+                      {typeof b.butir === "number" && b.butir >= 0 ? b.butir.toFixed(1) : "-"}
+                    </span>
+                    {!isPrint && (
+                      <span className="text-[8px] text-indigo-700 font-extrabold uppercase tracking-wider block leading-none mt-0.5 opacity-70 group-hover/jumlah:opacity-100 transition-opacity">
+                        {(() => {
+                          const val = b.jumlahBufferChoice || "auto";
+                          if (val === "auto") return "Auto";
+                          if (val === "kg_with") return "KG + Buf";
+                          if (val === "kg_without") return "KG Saja";
+                          if (val === "potong_with") return "Ptg + Buf";
+                          if (val === "potong_without") return "Ptg Saja";
+                          if (val === "ekor_with") return "Ekr + Buf";
+                          if (val === "ekor_without") return "Ekr Saja";
+                          if (val === "custom_with") return "Cust + Buf";
+                          if (val === "custom_without") return "Cust Saja";
+                          return val;
+                        })()} ⚙️
+                      </span>
+                    )}
+                  </div>
+                </td>
+                <td className="p-1 border border-black text-center w-[130px] min-w-[130px]">
+                  {isPrint ? (
+                    <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-bold text-slate-950">
+                      <span className="text-slate-500">Rp</span>
+                      <span>{formatRupiah(b.hargaSatuan).replace("Rp", "").trim()}</span>
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-center gap-1 w-full">
+                      <div className="flex items-center gap-1 bg-white/50 px-1 rounded border border-slate-200 w-full max-w-[84px]">
+                        <span className="text-[10px] font-bold text-slate-400">Rp</span>
+                        <input
+                          id={`fc-input-price-${tableKey}-${idx}`}
+                          type="text"
+                          inputMode="numeric"
+                          value={formatThousandSeparator(entry.bahanList[idx]?.hargaSatuan)}
+                          onChange={(e) => editIngredientInCategoryEntry(entry.id, idx, "hargaSatuan", parseThousandSeparator(e.target.value))}
+                          className="w-full text-right bg-transparent border-0 font-mono font-bold p-0 focus:ring-0 text-slate-950 text-xs"
+                        />
+                      </div>
+                      <PriceCalculatorPopover
+                        initialValue={entry.bahanList[idx]?.hargaSatuan || 0}
+                        onApply={(val) => editIngredientInCategoryEntry(entry.id, idx, "hargaSatuan", val)}
+                        placeholder="Hitung Harga Satuan"
+                        ingredientName={b.nama}
+                      />
+                    </div>
+                  )}
+                </td>
+                <td className="p-1 border border-black border-r-2 border-r-slate-950 text-center w-[136px] min-w-[136px]">
+                  <div className="flex items-center justify-between px-1 w-full h-full">
+                    <span className="text-slate-500 text-[10px] font-bold">Rp</span>
+                    <div className="flex items-center gap-1 font-mono text-xs font-bold text-slate-950 whitespace-nowrap">
+                      <span>{formatRupiah(b.hargaTotal).replace("Rp", "").trim()}</span>
+                    </div>
+                  </div>
+                </td>
+                {!isPrint && (
+                  <td className="p-1 border border-black border-l-2 border-l-slate-950 text-center w-[44px] min-w-[44px] no-print">
+                    <button
+                      type="button"
+                      onClick={() => removeIngredientFromCategoryEntry(entry.id, b.id, idx)}
+                      className="p-0.5 text-slate-400 hover:text-rose-600 rounded"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </td>
+                )}
+              </tr>
+            ))}
+          </tbody>
+
+          <tfoot className="border border-black font-semibold text-slate-950 text-xs text-center">
+            <tr className="border border-black">
+              <td colSpan={5} className="p-1.5 border border-black font-extrabold text-black uppercase bg-[#92D050] text-center">
+                KANDUNGAN GIZI
+              </td>
+              <td className="p-1.5 border border-black text-center font-mono font-extrabold text-black w-[54px] min-w-[54px] bg-[#92D050]">{sumEnergi.toFixed(1)}</td>
+              <td className="p-1.5 border border-black text-center font-mono font-extrabold text-black w-[56px] min-w-[56px] bg-[#92D050]">{sumProtein.toFixed(1)}</td>
+              <td className="p-1.5 border border-black text-center font-mono font-extrabold text-black w-[56px] min-w-[56px] bg-[#92D050]">{sumLemak.toFixed(1)}</td>
+              <td className="p-1.5 border border-black text-center font-mono font-extrabold text-black w-[56px] min-w-[56px] bg-[#92D050]">{sumKH.toFixed(1)}</td>
+              <td className="p-1.5 border border-black text-center font-mono font-extrabold text-black w-[56px] min-w-[56px] bg-[#92D050]">{sumSerat.toFixed(1)}</td>
+              <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#BFBFBF]">JUMLAH</td>
+              <td className="p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 bg-[#BFBFBF]">
+                <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950">
+                  <span className="text-slate-600 font-black">Rp</span>
+                  <span className="font-black">{formatRupiah(totalBahanCost).replace("Rp", "").trim()}</span>
+                </div>
+              </td>
+              {!isPrint && <td className="p-1 border border-black border-l-2 border-l-slate-950 bg-[#BFBFBF] no-print"></td>}
+            </tr>
+
+            <tr className="border border-black">
+              <td colSpan={5} className="p-1.5 border border-black font-extrabold text-black uppercase bg-[#92D050] text-center">
+                <div className="flex items-center justify-center gap-1.5 flex-wrap">
+                  <span>AKG: {entry.title.toUpperCase()}</span>
+                  {!isPrint && (
+                    <select
+                      value={entry.akgMode || "min"}
+                      onChange={(e) => {
+                        const newMode = e.target.value;
+                        updateCategoryEntry(entry.id, (cur) => ({
+                          ...cur,
+                          akgMode: newMode,
+                          nutrientModes: { energi: newMode, protein: newMode, lemak: newMode, kh: newMode, serat: newMode },
+                        }));
+                      }}
+                      className="bg-white hover:bg-slate-50 text-slate-900 text-[11px] font-black rounded-lg px-2 py-0.5 border border-indigo-400 shadow-xs focus:outline-none uppercase cursor-pointer"
+                    >
+                      <option value="min">SEMUA MIN</option>
+                      <option value="max">SEMUA MAX</option>
+                      <option value="avg">SEMUA RATA-RATA</option>
+                      <option value="custom">SEMUA KUSTOM ✍️</option>
+                    </select>
+                  )}
+                </div>
+              </td>
+
+              {[
+                { key: "energi", target: targetEnergi },
+                { key: "protein", target: targetProtein },
+                { key: "lemak", target: targetLemak },
+                { key: "kh", target: targetKH },
+                { key: "serat", target: targetSerat },
+              ].map((nut) => (
+                <td key={nut.key} className="p-1 border border-black text-center font-mono font-bold text-black w-[58px] min-w-[58px] bg-[#92D050]">
+                  {!isPrint && (
+                    <select
+                      value={entry.nutrientModes?.[nut.key] || entry.akgMode || "min"}
+                      onChange={(e) => updateCategoryEntryNutrientMode(entry.id, nut.key, e.target.value)}
+                      className="w-full text-[8.5px] font-black uppercase bg-white border border-emerald-700/50 rounded px-0.5 py-0.5 mb-1 text-slate-900 focus:outline-none cursor-pointer"
+                    >
+                      <option value="min">MIN</option>
+                      <option value="max">MAX</option>
+                      <option value="avg">RATA2</option>
+                      <option value="custom">KUST</option>
+                    </select>
+                  )}
+                  {isPrint ? (
+                    <span>{nut.target > 0 ? nut.target.toFixed(1) : "-"}</span>
+                  ) : (
+                    <input
+                      type="number"
+                      step="any"
+                      value={nut.target > 0 ? Number(nut.target.toFixed(1)) : ""}
+                      onChange={(e) => handleCategoryEntryAkgValChange(entry, nut.key, Number(e.target.value))}
+                      className="w-full text-center bg-[#C6E0B4] hover:bg-white focus:bg-white border border-emerald-700/40 focus:ring-2 focus:ring-indigo-600 font-mono font-extrabold px-0.5 py-0.5 rounded-md text-slate-900 text-[11px] shadow-2xs"
+                    />
+                  )}
+                </td>
+              ))}
+
+              {planningMode === "all_ingredients" ? (
+                <>
+                  <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#A9D08E]">
+                    HARGA PER PORSI
+                  </td>
+                  <td className={`p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 ${calculatedCostPerPorsi > targetPrice ? "bg-[#FF0000]" : "bg-[#00B050]"}`}>
+                    <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950 print:text-black">
+                      <span className="font-black">Rp</span>
+                      <span className="font-black">{formatRupiah(calculatedCostPerPorsi).replace("Rp", "").trim()}</span>
+                    </div>
+                  </td>
+                  {!isPrint && (
+                    <td className={`p-1 border border-black border-l-2 border-l-slate-950 no-print ${calculatedCostPerPorsi > targetPrice ? "bg-[#FF0000]" : "bg-[#00B050]"}`}></td>
+                  )}
+                </>
+              ) : (
+                <>
+                  <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#FFFF00]">
+                    BUMBU {activeBumbuPct}%
+                  </td>
+                  <td className="p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 bg-[#FFFF00]">
+                    <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950">
+                      <span className="text-slate-600 font-black">Rp</span>
+                      <span className="font-black">{formatRupiah(bumbuCost).replace("Rp", "").trim()}</span>
+                    </div>
+                  </td>
+                  {!isPrint && <td className="p-1 border border-black border-l-2 border-l-slate-950 bg-[#FFFF00] no-print"></td>}
+                </>
+              )}
+            </tr>
+
+            <tr className="border border-black">
+              <td colSpan={5} className="p-1.5 border border-black font-extrabold text-black uppercase bg-[#92D050] text-center">
+                KEBUTUHAN 90-110%
+              </td>
+              {[
+                { val: pctEnergi, active: targetEnergi > 0 && !isNaN(pctEnergi) && isFinite(pctEnergi) },
+                { val: pctProtein, active: targetProtein > 0 && !isNaN(pctProtein) && isFinite(pctProtein) },
+                { val: pctLemak, active: targetLemak > 0 && !isNaN(pctLemak) && isFinite(pctLemak) },
+                { val: pctKH, active: targetKH > 0 && !isNaN(pctKH) && isFinite(pctKH) },
+                { val: pctSerat, active: targetSerat > 0 && !isNaN(pctSerat) && isFinite(pctSerat) },
+              ].map((pctInfo, idx) => {
+                const isOk = pctInfo.active && pctInfo.val >= 90 && pctInfo.val <= 110;
+                const cellBg = pctInfo.active ? (isOk ? '#00B050' : '#FF0000') : '#FF0000';
+                return (
+                  <td key={idx} className="p-1.5 border border-black text-center font-mono font-black text-black" style={{ backgroundColor: cellBg, color: 'black' }}>
+                    {pctInfo.active ? `${pctInfo.val.toFixed(0)}%` : ""}
+                  </td>
+                );
+              })}
+
+              {planningMode === "all_ingredients" ? (
+                <>
+                  <td colSpan={10} className="p-1.5 border border-black bg-slate-50/10"></td>
+                  <td className="p-1 border border-black bg-slate-50/10"></td>
+                  {!isPrint && <td className="p-1 border border-black bg-slate-50/10 no-print"></td>}
+                </>
+              ) : (
+                <>
+                  <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#F8CBAD]">
+                    JUMLAH+BUMBU {activeBumbuPct}%
+                  </td>
+                  <td className="p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 bg-[#F8CBAD]">
+                    <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950">
+                      <span className="text-slate-600 font-black">Rp</span>
+                      <span className="font-black">{formatRupiah(subtotalCost).replace("Rp", "").trim()}</span>
+                    </div>
+                  </td>
+                  {!isPrint && <td className="p-1 border border-black border-l-2 border-l-slate-950 bg-[#F8CBAD] no-print"></td>}
+                </>
+              )}
+            </tr>
+
+            {planningMode === "with_bumbu_10" && (
+              <tr className="border border-black font-extrabold text-black">
+                <td colSpan={10} className="p-1.5 border border-black bg-slate-50/30"></td>
+                <td colSpan={10} className="p-1.5 border border-black border-r-2 border-r-slate-950 text-right pr-4 uppercase text-slate-950 font-black bg-[#A9D08E]">
+                  HARGA PER PORSI
+                </td>
+                <td className={`p-1 border border-black border-l-2 border-l-slate-950 border-r-2 border-r-slate-950 ${calculatedCostPerPorsi > targetPrice ? "bg-[#FF0000]" : "bg-[#00B050]"}`}>
+                  <div className="flex items-center justify-between px-1 w-full font-mono text-xs font-black text-slate-950 print:text-black">
+                    <span className="font-black">Rp</span>
+                    <span className="font-black">{formatRupiah(calculatedCostPerPorsi).replace("Rp", "").trim()}</span>
+                  </div>
+                </td>
+                {!isPrint && (
+                  <td className={`p-1 border border-black border-l-2 border-l-slate-950 no-print ${calculatedCostPerPorsi > targetPrice ? "bg-[#FF0000]" : "bg-[#00B050]"}`}></td>
+                )}
+              </tr>
+            )}
+          </tfoot>
+        </table>
+      </div>
+      {!isPrint &&
+        renderOverBudgetNotice(
+          `cat_${entry.id}`,
+          entry.title,
+          calculatedCostPerPorsi,
+          targetPrice,
+          recipientCount,
+          items
+        )}
+      </>
+    );
+  };
+
   const renderCustomFoodCostTable = (table: any, isPrint: boolean) => {
     const results = table.porsi === "besar"
       ? calculateDay(table.bahanList, [], table.pmCount, 0, table.bufferPct || 5, tkpiList, activeBumbuPct)
@@ -2757,6 +4506,8 @@ export default function FoodCostTab({
     }
 
     const customBufferPct = table.bufferPct || 5;
+    const customTableKey = `custom_${table.id}`;
+    const customBbHighlight = !isPrint && Boolean(pastedHighlightMap[customTableKey]);
 
     return (
       <>
@@ -2767,7 +4518,9 @@ export default function FoodCostTab({
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[110px] min-w-[110px]"}`} style={isPrint ? { width: '5.5%' } : undefined}>KRITERIA PM</th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[110px] min-w-[110px]"}`} style={isPrint ? { width: '5.5%' } : undefined}>MENU</th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[160px] min-w-[160px]"}`} style={isPrint ? { width: '10%' } : undefined}>BAHAN MAKANAN</th>
-              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[56px] min-w-[56px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>BERAT (BB)</th>
+              <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[56px] min-w-[56px]"} ${customBbHighlight ? "bg-amber-300 ring-2 ring-inset ring-amber-600" : ""}`} style={isPrint ? { width: '3.5%' } : undefined}>
+                BERAT (BB){customBbHighlight && <span className="block text-[8px] font-black text-amber-950 normal-case">Ubah ↵</span>}
+              </th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[56px] min-w-[56px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>URT</th>
               <th colSpan={5} className="p-1 border border-black text-center text-slate-950 font-extrabold bg-[#76933C] print:text-black">KOMPOSISI ZAT GIZI MAKANAN</th>
               <th rowSpan={2} className={`p-1 border border-black text-center text-slate-950 font-extrabold ${isPrint ? "" : "w-[56px] min-w-[56px]"}`} style={isPrint ? { width: '3.5%' } : undefined}>BDD (%)</th>
@@ -2868,15 +4621,26 @@ export default function FoodCostTab({
                       />
                     )}
                   </td>
-                  <td className="p-1 border border-black text-center w-[56px] min-w-[56px]">
+                  <td className={`p-1 border border-black text-center w-[56px] min-w-[56px] ${customBbHighlight ? "bg-amber-50 ring-1 ring-inset ring-amber-400" : ""}`}>
                     {isPrint ? (
                       <span className="font-mono font-bold text-slate-950 text-xs text-center">{b.beratBB}</span>
                     ) : (
                       <input
+                        id={`fc-input-bb-${customTableKey}-${idx}`}
                         type="number"
                         value={table.bahanList[idx]?.beratBB || ""}
                         onChange={(e) => editIngredientInCustomTable(table.id, idx, "beratBB", Number(e.target.value))}
-                        className="w-full text-center bg-transparent border-0 font-mono font-bold p-0 text-slate-950 text-xs"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            const nextEl = document.getElementById(`fc-input-bb-${customTableKey}-${idx + 1}`) as HTMLInputElement | null;
+                            if (nextEl) {
+                              nextEl.focus();
+                              nextEl.select();
+                            }
+                          }
+                        }}
+                        className={`w-full text-center border-0 font-mono font-bold p-0 text-slate-950 text-xs rounded ${customBbHighlight ? "bg-amber-100/80 focus:bg-white focus:ring-2 focus:ring-amber-500" : "bg-transparent"}`}
                       />
                     )}
                   </td>
@@ -3834,7 +5598,7 @@ export default function FoodCostTab({
             </div>
           </div>
 
-          {/* Pilah Kategori Porsi Kecil & Porsi Besar + Konfirmasi Sebelum Tampil */}
+          {/* Pilah Kategori Porsi Kecil & Porsi Besar + Masing-Masing 1 Kategori / Gabung Pilihan */}
           <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
             <div className="p-4 sm:px-5 bg-slate-50/80 border-b border-slate-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-start sm:items-center gap-3">
@@ -3844,17 +5608,23 @@ export default function FoodCostTab({
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <h4 className="text-xs font-black text-slate-900 uppercase tracking-wide">
-                      Pilih & Pilah Kategori Food Cost (Porsi Kecil & Porsi Besar)
+                      Pilih & Pilah Kategori Food Cost
                     </h4>
                     {appliedConfig.confirmed ? (
-                      <span className="px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-black uppercase">
-                        Terkonfirmasi:{" "}
-                        {appliedConfig.scope === "kecil"
-                          ? "Porsi Kecil"
-                          : appliedConfig.scope === "besar"
-                            ? "Porsi Besar"
-                            : "Semua Food Cost"}
-                      </span>
+                      isPerKategoriMode ? (
+                        <span className="px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-black uppercase">
+                          Aktif: Masing-Masing Kategori ({resolvedCategoryEntries.length} Panel Food Cost)
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-800 border border-indigo-200 text-[10px] font-black uppercase">
+                          Aktif: Gabung{" "}
+                          {appliedConfig.scope === "kecil"
+                            ? "Porsi Kecil"
+                            : appliedConfig.scope === "besar"
+                              ? "Porsi Besar"
+                              : "Semua Porsi (Kecil & Besar)"}
+                        </span>
+                      )
                     ) : (
                       <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-800 border border-amber-200 text-[10px] font-black uppercase">
                         Menunggu Pemilihan & Konfirmasi
@@ -3862,7 +5632,9 @@ export default function FoodCostTab({
                     )}
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    Pilih tampilan Porsi Kecil, Porsi Besar, atau Semua Food Cost lalu konfirmasi terlebih dahulu agar tabel muncul otomatis sesuai kategori pilihan.
+                    {isPerKategoriMode
+                      ? "Tampilan default: masing-masing 1 kategori sasaran memiliki panel Food Cost sendiri. Anda dapat mencentang & menyatukan beberapa kategori menjadi 1 Food Cost kapan saja."
+                      : "Mode gabung per porsi: seluruh kategori Porsi Kecil dan Porsi Besar digabung menjadi maksimal 2 tabel Food Cost."}
                   </p>
                 </div>
               </div>
@@ -3875,12 +5647,12 @@ export default function FoodCostTab({
                 {isSelectorExpanded ? (
                   <>
                     <ChevronUp className="w-3.5 h-3.5" />
-                    Tutup Pilihan
+                    Tutup Pengaturan Kategori
                   </>
                 ) : (
                   <>
                     <ChevronDown className="w-3.5 h-3.5" />
-                    Ubah Pilihan Kategori
+                    Atur / Satukan Kategori
                   </>
                 )}
               </button>
@@ -3888,244 +5660,487 @@ export default function FoodCostTab({
 
             {isSelectorExpanded && (
               <div className="p-5 space-y-5">
-                {/* Step 1: Display Mode Selection */}
-                <div className="space-y-2">
-                  <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
-                    1. Pilih Mode Tampilan Food Cost
-                  </span>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                    <button
-                      type="button"
-                      onClick={() => handleSelectDraftScope("kecil")}
-                      className={`p-3.5 rounded-xl border text-left transition cursor-pointer ${
-                        draftScope === "kecil"
-                          ? "bg-indigo-50 border-indigo-500 ring-2 ring-indigo-500/20"
-                          : "bg-slate-50/70 border-slate-200 hover:border-indigo-300"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-black text-indigo-950 uppercase">Porsi Kecil</span>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800">
-                          {draftKecilIds.length} Kategori
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-600 mt-1">
-                        Otomatis memilih & menampilkan semua kategori Porsi Kecil yang telah ditentukan.
-                      </p>
-                    </button>
+                {/* Step 1: Layout Mode Switcher & Scope Filter */}
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">
+                      1. Pilih Mode Panel Food Cost
+                    </span>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase mr-1">Filter Porsi:</span>
+                      {(
+                        [
+                          { id: "all", label: "Semua Porsi" },
+                          { id: "kecil", label: "Hanya Porsi Kecil" },
+                          { id: "besar", label: "Hanya Porsi Besar" },
+                        ] as const
+                      ).map((sc) => (
+                        <button
+                          key={sc.id}
+                          type="button"
+                          onClick={() => {
+                            handleSelectDraftScope(sc.id);
+                            if (draftLayoutMode === "per_kategori") {
+                              setAppliedConfig((prev) => ({
+                                ...prev,
+                                confirmed: true,
+                                layoutMode: "per_kategori",
+                                scope: sc.id,
+                              }));
+                            }
+                          }}
+                          className={`px-2.5 py-1 rounded-lg text-[10px] font-extrabold border transition cursor-pointer ${
+                            draftScope === sc.id
+                              ? "bg-slate-900 text-white border-slate-900"
+                              : "bg-white text-slate-600 border-slate-200 hover:border-slate-300"
+                          }`}
+                        >
+                          {sc.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
 
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                     <button
                       type="button"
-                      onClick={() => handleSelectDraftScope("besar")}
+                      onClick={() => handleSwitchLayoutMode("per_kategori")}
                       className={`p-3.5 rounded-xl border text-left transition cursor-pointer ${
-                        draftScope === "besar"
-                          ? "bg-cyan-50 border-cyan-500 ring-2 ring-cyan-500/20"
-                          : "bg-slate-50/70 border-slate-200 hover:border-cyan-300"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-black text-cyan-950 uppercase">Porsi Besar</span>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-cyan-100 text-cyan-800">
-                          {draftBesarIds.length} Kategori
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-600 mt-1">
-                        Otomatis memilih & menampilkan semua kategori Porsi Besar yang telah ditentukan.
-                      </p>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => handleSelectDraftScope("all")}
-                      className={`p-3.5 rounded-xl border text-left transition cursor-pointer ${
-                        draftScope === "all"
+                        draftLayoutMode === "per_kategori"
                           ? "bg-emerald-50 border-emerald-500 ring-2 ring-emerald-500/20"
                           : "bg-slate-50/70 border-slate-200 hover:border-emerald-300"
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-black text-emerald-950 uppercase">Semua Food Cost</span>
+                        <span className="text-xs font-black text-emerald-950 uppercase flex items-center gap-1.5">
+                          <Layers className="w-3.5 h-3.5 text-emerald-600" />
+                          Masing-Masing 1 Kategori
+                        </span>
                         <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                          Kecil + Besar
+                          Bisa Satukan Pilihan
                         </span>
                       </div>
                       <p className="text-[11px] text-slate-600 mt-1">
-                        Pilih kategori Porsi Kecil & Besar yang ingin diterapkan lalu konfirmasi.
+                        Setiap kategori penerima manfaat tampil terpisah 1 Food Cost. Centang 2+ kategori di bawah jika ingin menyatukannya menjadi 1 Food Cost.
+                      </p>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleSwitchLayoutMode("gabung_porsi")}
+                      className={`p-3.5 rounded-xl border text-left transition cursor-pointer ${
+                        draftLayoutMode === "gabung_porsi"
+                          ? "bg-indigo-50 border-indigo-500 ring-2 ring-indigo-500/20"
+                          : "bg-slate-50/70 border-slate-200 hover:border-indigo-300"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-black text-indigo-950 uppercase flex items-center gap-1.5">
+                          <Combine className="w-3.5 h-3.5 text-indigo-600" />
+                          Gabung Semua per Porsi (Besar & Kecil)
+                        </span>
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800">
+                          2 Panel Gabungan
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-600 mt-1">
+                        Menggabungkan seluruh kategori Porsi Kecil dan Porsi Besar ke dalam 2 tabel Food Cost gabungan (Besar & Kecil).
                       </p>
                     </button>
                   </div>
                 </div>
 
-                {/* Step 2: Separated Porsi Kecil & Porsi Besar Checklists */}
-                <div className="space-y-2">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">
-                      2. Pilah Kategori Penerima Manfaat yang Diterapkan
-                    </span>
-                    {onNavigateToPM && (
-                      <button
-                        type="button"
-                        onClick={onNavigateToPM}
-                        className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer"
+                {/* Step 2A: Per-Kategori + Selective Merge UI */}
+                {draftLayoutMode === "per_kategori" ? (
+                  (() => {
+                    const currentGroups =
+                      draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+                    const assignedIds = new Set(currentGroups.flatMap((g) => g.sasaranIds));
+                    const omittedCategories = SASARAN_KATEGORI_LIST.filter((s) => !assignedIds.has(s.id));
+
+                    return (
+                      <div className="space-y-3 pt-2 border-t border-slate-100">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div>
+                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
+                              2. Kelola Panel Kategori & Satukan Kategori Terpilih
+                            </span>
+                            <p className="text-[11px] text-slate-500">
+                              Centang minimal 2 kartu kategori lalu klik{" "}
+                              <strong className="text-indigo-700">Satukan Kategori Terpilih</strong> untuk menggabungkan jadi 1 Food Cost.
+                            </p>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={handleKeepOnlyPmPositiveCategories}
+                              className="px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[10px] font-extrabold transition cursor-pointer"
+                            >
+                              Hanya Ada PM &gt; 0
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleResetToSingleCategories(false)}
+                              className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 text-[10px] font-extrabold transition cursor-pointer"
+                            >
+                              Sesuai Kelompok Aktif
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleResetToSingleCategories(true)}
+                              className="px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 text-[10px] font-extrabold transition cursor-pointer"
+                            >
+                              Semua 12 Kategori + Sampel
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setShowCrossGroupPicker((prev) => !prev)}
+                              className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-extrabold transition cursor-pointer ${
+                                showCrossGroupPicker
+                                  ? "bg-amber-100 border-amber-300 text-amber-900"
+                                  : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                              }`}
+                            >
+                              + Tambah Kategori Lainnya ({omittedCategories.length})
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                          {currentGroups.map((g) => {
+                            const isChecked = mergeSelectedGroupIds.includes(g.id);
+                            const autoPm = getEntryAutoPmCount(g.sasaranIds, g.porsi);
+                            const isMerged = g.sasaranIds.length > 1;
+                            const isHiddenByScope = draftScope !== "all" && g.porsi !== draftScope;
+
+                            return (
+                              <div
+                                key={g.id}
+                                className={`rounded-xl border p-3 transition flex flex-col justify-between gap-2 ${
+                                  isChecked
+                                    ? "bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 shadow-xs"
+                                    : isMerged
+                                      ? "bg-amber-50/50 border-amber-300"
+                                      : "bg-slate-50/60 border-slate-200 hover:border-slate-300"
+                                } ${isHiddenByScope ? "opacity-55" : ""}`}
+                              >
+                                <div className="flex items-start justify-between gap-2">
+                                  <label className="flex items-start gap-2 cursor-pointer min-w-0 flex-1">
+                                    <input
+                                      type="checkbox"
+                                      checked={isChecked}
+                                      onChange={() => toggleMergeSelection(g.id)}
+                                      className="mt-0.5 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500 shrink-0"
+                                    />
+                                    <div className="min-w-0">
+                                      <span className="text-xs font-black text-slate-900 block break-words leading-snug">
+                                        {g.title}
+                                      </span>
+                                      <div className="flex flex-wrap items-center gap-1 mt-1">
+                                        <span
+                                          className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase ${
+                                            g.porsi === "besar"
+                                              ? "bg-amber-100 text-amber-800"
+                                              : "bg-cyan-100 text-cyan-800"
+                                          }`}
+                                        >
+                                          {g.porsi === "besar" ? "Porsi Besar" : "Porsi Kecil"}
+                                        </span>
+                                        <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-[9px] font-mono font-bold text-slate-700">
+                                          {autoPm} PM
+                                        </span>
+                                        {isMerged && (
+                                          <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-black">
+                                            Gabungan {g.sasaranIds.length}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                  </label>
+
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    {isMerged && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleSplitMergedGroup(g.id)}
+                                        title="Pisahkan kembali menjadi kategori masing-masing"
+                                        className="px-2 py-1 rounded-lg bg-white hover:bg-amber-100 border border-amber-300 text-amber-800 text-[10px] font-extrabold flex items-center gap-1 cursor-pointer transition"
+                                      >
+                                        <Split className="w-3 h-3" />
+                                        Pisahkan
+                                      </button>
+                                    )}
+                                    {currentGroups.length > 1 && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleRemoveGroupFromActive(g.id)}
+                                        title="Sembunyikan kategori ini dari tampilan"
+                                        className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer"
+                                      >
+                                        <X className="w-3.5 h-3.5" />
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+
+                                {isMerged && (
+                                  <div className="text-[10px] text-slate-600 bg-white/80 rounded-lg px-2 py-1 border border-amber-200/70 font-semibold">
+                                    Termasuk: {g.sasaranIds.map((id) => getSasaranLabel(id)).join(", ")}
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+
+                        {/* Merge Selected Categories Action Bar */}
+                        {mergeSelectedGroupIds.length >= 2 && (
+                          <div className="p-3.5 rounded-xl bg-indigo-50 border-2 border-indigo-300 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                            <div className="flex flex-col sm:flex-row sm:items-center gap-2 flex-1">
+                              <span className="text-xs font-black text-indigo-950 shrink-0">
+                                {mergeSelectedGroupIds.length} Kategori Dipilih:
+                              </span>
+                              <input
+                                type="text"
+                                value={mergeCustomTitle}
+                                onChange={(e) => setMergeCustomTitle(e.target.value)}
+                                placeholder="Nama Food Cost gabungan (opsional, kosongkan agar otomatis)"
+                                className="flex-1 bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                              />
+                              <select
+                                value={mergeCustomPorsi}
+                                onChange={(e) => setMergeCustomPorsi(e.target.value as "auto" | "kecil" | "besar")}
+                                className="bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800 focus:outline-none"
+                              >
+                                <option value="auto">Plafon &amp; Porsi Otomatis</option>
+                                <option value="besar">Tetapkan Porsi Besar</option>
+                                <option value="kecil">Tetapkan Porsi Kecil</option>
+                              </select>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              <button
+                                type="button"
+                                onClick={handleMergeSelectedDraftGroups}
+                                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-black flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                              >
+                                <Combine className="w-3.5 h-3.5" />
+                                Satukan {mergeSelectedGroupIds.length} Kategori Terpilih menjadi 1 Food Cost
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setMergeSelectedGroupIds([])}
+                                className="px-3 py-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 rounded-xl text-xs font-bold transition cursor-pointer"
+                              >
+                                Batal Pilih
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Omitted / Cross-Group Categories Picker */}
+                        {(showCrossGroupPicker || omittedCategories.length > 0) && omittedCategories.length > 0 && (
+                          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
+                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
+                              Tambahkan Kategori Lain / Tersembunyi ke Panel Food Cost:
+                            </span>
+                            <div className="flex flex-wrap gap-1.5">
+                              {omittedCategories.map((s) => {
+                                const defPorsi = resolveDefaultPorsiForSasaran(s.id);
+                                const cnt = getSasaranPmCount(s.id, defPorsi);
+                                return (
+                                  <button
+                                    key={s.id}
+                                    type="button"
+                                    onClick={() => handleAddSingleCategoryToActive(s.id)}
+                                    className="px-2.5 py-1 rounded-lg bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-300 text-[11px] font-bold text-slate-700 hover:text-indigo-800 transition cursor-pointer inline-flex items-center gap-1"
+                                  >
+                                    <Plus className="w-3 h-3 text-indigo-600" />
+                                    {s.label}
+                                    <span className="text-[10px] font-mono text-slate-400">({cnt})</span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })()
+                ) : (
+                  /* Step 2B: Separated Porsi Kecil & Porsi Besar Checklists (Gabung per Porsi) */
+                  <div className="space-y-2 pt-2 border-t border-slate-100">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">
+                        2. Pilah Kategori Penerima Manfaat yang Diterapkan (Mode Gabung per Porsi)
+                      </span>
+                      {onNavigateToPM && (
+                        <button
+                          type="button"
+                          onClick={onNavigateToPM}
+                          className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer"
+                        >
+                          Ubah Klasifikasi Porsi di Data PM →
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                      {/* Porsi Kecil Categories Card */}
+                      <div
+                        className={`rounded-xl border p-4 space-y-3 transition ${
+                          draftScope === "besar"
+                            ? "bg-slate-50 border-slate-200 opacity-55"
+                            : "bg-indigo-50/40 border-indigo-200"
+                        }`}
                       >
-                        Ubah Klasifikasi Porsi di Data PM →
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                    {/* Porsi Kecil Categories Card */}
-                    <div
-                      className={`rounded-xl border p-4 space-y-3 transition ${
-                        draftScope === "besar"
-                          ? "bg-slate-50 border-slate-200 opacity-55"
-                          : "bg-indigo-50/40 border-indigo-200"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2 border-b border-indigo-200/60 pb-2">
-                        <div>
-                          <span className="text-xs font-black text-indigo-950 uppercase">
-                            Kategori Porsi Kecil
-                          </span>
-                          <p className="text-[10px] text-indigo-700 font-semibold">
-                            Plafon {formatRupiah(activeTargetPriceKecil)}/porsi · Terpilih {draftKecilIds.length}/{defaultKecilIds.length}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            disabled={draftScope === "besar"}
-                            onClick={() => setDraftKecilIds(defaultKecilIds)}
-                            className="px-2.5 py-1 rounded-lg bg-white border border-indigo-200 text-[10px] font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 cursor-pointer"
-                          >
-                            Pilih Semua
-                          </button>
-                          <button
-                            type="button"
-                            disabled={draftScope === "besar"}
-                            onClick={() => setDraftKecilIds([])}
-                            className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
-                          >
-                            Kosongkan
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {defaultKecilIds.map((sId) => {
-                          const checked = draftKecilIds.includes(sId);
-                          const label = getSasaranLabel(sId);
-                          const count = getSasaranPmCount(sId, "kecil");
-                          return (
-                            <label
-                              key={sId}
-                              className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border text-xs cursor-pointer transition ${
-                                checked
-                                  ? "bg-white border-indigo-400 text-indigo-950 font-bold shadow-2xs"
-                                  : "bg-white/60 border-slate-200 text-slate-600 font-medium"
-                              }`}
+                        <div className="flex items-center justify-between gap-2 border-b border-indigo-200/60 pb-2">
+                          <div>
+                            <span className="text-xs font-black text-indigo-950 uppercase">
+                              Kategori Porsi Kecil
+                            </span>
+                            <p className="text-[10px] text-indigo-700 font-semibold">
+                              Plafon {formatRupiah(activeTargetPriceKecil)}/porsi · Terpilih {draftKecilIds.length}/{defaultKecilIds.length}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={draftScope === "besar"}
+                              onClick={() => setDraftKecilIds(defaultKecilIds)}
+                              className="px-2.5 py-1 rounded-lg bg-white border border-indigo-200 text-[10px] font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 cursor-pointer"
                             >
-                              <span className="flex items-center gap-2 min-w-0">
-                                <input
-                                  type="checkbox"
-                                  disabled={draftScope === "besar"}
-                                  checked={checked}
-                                  onChange={() => toggleDraftCategory("kecil", sId)}
-                                  className="rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
-                                />
-                                <span className="truncate">{label}</span>
-                              </span>
-                              <span className="text-[10px] font-mono font-bold text-indigo-700 shrink-0">
-                                {count} PM
-                              </span>
-                            </label>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Porsi Besar Categories Card */}
-                    <div
-                      className={`rounded-xl border p-4 space-y-3 transition ${
-                        draftScope === "kecil"
-                          ? "bg-slate-50 border-slate-200 opacity-55"
-                          : "bg-cyan-50/40 border-cyan-200"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2 border-b border-cyan-200/60 pb-2">
-                        <div>
-                          <span className="text-xs font-black text-cyan-950 uppercase">
-                            Kategori Porsi Besar
-                          </span>
-                          <p className="text-[10px] text-cyan-800 font-semibold">
-                            Plafon {formatRupiah(activeTargetPriceBesar)}/porsi · Terpilih {draftBesarIds.length}/{defaultBesarIds.length}
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            disabled={draftScope === "kecil"}
-                            onClick={() => setDraftBesarIds(defaultBesarIds)}
-                            className="px-2.5 py-1 rounded-lg bg-white border border-cyan-200 text-[10px] font-bold text-cyan-800 hover:bg-cyan-50 disabled:opacity-50 cursor-pointer"
-                          >
-                            Pilih Semua
-                          </button>
-                          <button
-                            type="button"
-                            disabled={draftScope === "kecil"}
-                            onClick={() => setDraftBesarIds([])}
-                            className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
-                          >
-                            Kosongkan
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {defaultBesarIds.map((sId) => {
-                          const checked = draftBesarIds.includes(sId);
-                          const label = getSasaranLabel(sId);
-                          const count = getSasaranPmCount(sId, "besar");
-                          return (
-                            <label
-                              key={sId}
-                              className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border text-xs cursor-pointer transition ${
-                                checked
-                                  ? "bg-white border-cyan-500 text-cyan-950 font-bold shadow-2xs"
-                                  : "bg-white/60 border-slate-200 text-slate-600 font-medium"
-                              }`}
+                              Pilih Semua
+                            </button>
+                            <button
+                              type="button"
+                              disabled={draftScope === "besar"}
+                              onClick={() => setDraftKecilIds([])}
+                              className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
                             >
-                              <span className="flex items-center gap-2 min-w-0">
-                                <input
-                                  type="checkbox"
-                                  disabled={draftScope === "kecil"}
-                                  checked={checked}
-                                  onChange={() => toggleDraftCategory("besar", sId)}
-                                  className="rounded border-cyan-300 text-cyan-600 focus:ring-cyan-500"
-                                />
-                                <span className="truncate">{label}</span>
-                              </span>
-                              <span className="text-[10px] font-mono font-bold text-cyan-800 shrink-0">
-                                {count} PM
-                              </span>
-                            </label>
-                          );
-                        })}
+                              Kosongkan
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {defaultKecilIds.map((sId) => {
+                            const checked = draftKecilIds.includes(sId);
+                            const label = getSasaranLabel(sId);
+                            const count = getSasaranPmCount(sId, "kecil");
+                            return (
+                              <label
+                                key={sId}
+                                className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border text-xs cursor-pointer transition ${
+                                  checked
+                                    ? "bg-white border-indigo-400 text-indigo-950 font-bold shadow-2xs"
+                                    : "bg-white/60 border-slate-200 text-slate-600 font-medium"
+                                }`}
+                              >
+                                <span className="flex items-center gap-2 min-w-0">
+                                  <input
+                                    type="checkbox"
+                                    disabled={draftScope === "besar"}
+                                    checked={checked}
+                                    onChange={() => toggleDraftCategory("kecil", sId)}
+                                    className="rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
+                                  />
+                                  <span className="truncate">{label}</span>
+                                </span>
+                                <span className="text-[10px] font-mono font-bold text-indigo-700 shrink-0">
+                                  {count} PM
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Porsi Besar Categories Card */}
+                      <div
+                        className={`rounded-xl border p-4 space-y-3 transition ${
+                          draftScope === "kecil"
+                            ? "bg-slate-50 border-slate-200 opacity-55"
+                            : "bg-cyan-50/40 border-cyan-200"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 border-b border-cyan-200/60 pb-2">
+                          <div>
+                            <span className="text-xs font-black text-cyan-950 uppercase">
+                              Kategori Porsi Besar
+                            </span>
+                            <p className="text-[10px] text-cyan-800 font-semibold">
+                              Plafon {formatRupiah(activeTargetPriceBesar)}/porsi · Terpilih {draftBesarIds.length}/{defaultBesarIds.length}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              disabled={draftScope === "kecil"}
+                              onClick={() => setDraftBesarIds(defaultBesarIds)}
+                              className="px-2.5 py-1 rounded-lg bg-white border border-cyan-200 text-[10px] font-bold text-cyan-800 hover:bg-cyan-50 disabled:opacity-50 cursor-pointer"
+                            >
+                              Pilih Semua
+                            </button>
+                            <button
+                              type="button"
+                              disabled={draftScope === "kecil"}
+                              onClick={() => setDraftBesarIds([])}
+                              className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
+                            >
+                              Kosongkan
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                          {defaultBesarIds.map((sId) => {
+                            const checked = draftBesarIds.includes(sId);
+                            const label = getSasaranLabel(sId);
+                            const count = getSasaranPmCount(sId, "besar");
+                            return (
+                              <label
+                                key={sId}
+                                className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border text-xs cursor-pointer transition ${
+                                  checked
+                                    ? "bg-white border-cyan-500 text-cyan-950 font-bold shadow-2xs"
+                                    : "bg-white/60 border-slate-200 text-slate-600 font-medium"
+                                }`}
+                              >
+                                <span className="flex items-center gap-2 min-w-0">
+                                  <input
+                                    type="checkbox"
+                                    disabled={draftScope === "kecil"}
+                                    checked={checked}
+                                    onChange={() => toggleDraftCategory("besar", sId)}
+                                    className="rounded border-cyan-300 text-cyan-600 focus:ring-cyan-500"
+                                  />
+                                  <span className="truncate">{label}</span>
+                                </span>
+                                <span className="text-[10px] font-mono font-bold text-cyan-800 shrink-0">
+                                  {count} PM
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                   </div>
-                </div>
+                )}
 
                 {/* Step 3: Confirmation CTA */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-slate-100">
                   <div className="text-[11px] text-slate-600 font-semibold">
                     Mode aktif dipilih:{" "}
                     <span className="font-black text-slate-900">
-                      {draftScope === "kecil"
-                        ? `Porsi Kecil (${draftKecilIds.length} kategori)`
-                        : draftScope === "besar"
-                          ? `Porsi Besar (${draftBesarIds.length} kategori)`
-                          : `Semua Food Cost (${draftKecilIds.length} Kecil + ${draftBesarIds.length} Besar)`}
+                      {draftLayoutMode === "per_kategori"
+                        ? `Masing-Masing 1 Kategori (${(draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey)).filter((g) => draftScope === "all" || g.porsi === draftScope).length} Panel)`
+                        : draftScope === "kecil"
+                          ? `Gabung Porsi Kecil (${draftKecilIds.length} kategori)`
+                          : draftScope === "besar"
+                            ? `Gabung Porsi Besar (${draftBesarIds.length} kategori)`
+                            : `Gabung Semua Food Cost (${draftKecilIds.length} Kecil + ${draftBesarIds.length} Besar)`}
                     </span>
                   </div>
                   <button
@@ -4135,7 +6150,7 @@ export default function FoodCostTab({
                     className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black flex items-center justify-center gap-2 shadow-sm transition cursor-pointer shrink-0"
                   >
                     <CheckCircle2 className="w-4 h-4" />
-                    Konfirmasi & Tampilkan Food Cost Otomatis
+                    Konfirmasi &amp; Tampilkan Food Cost Otomatis
                   </button>
                 </div>
               </div>
@@ -4293,6 +6308,49 @@ export default function FoodCostTab({
           </div>
 
           <div id="fc-tables-container" className="space-y-6">
+            {/* Persistent Clipboard Banner for Quick Copy & Paste */}
+            {copiedFoodCost && (
+              <div className="bg-amber-50/90 border border-amber-300 rounded-2xl p-3.5 sm:px-5 flex flex-col md:flex-row md:items-center justify-between gap-3 shadow-xs">
+                <div className="flex items-start sm:items-center gap-3">
+                  <div className="p-2 rounded-xl bg-amber-100 text-amber-800 shrink-0">
+                    <Clipboard className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-black text-amber-950 uppercase">
+                        Clipboard Food Cost Aktif: {copiedFoodCost.sourceLabel}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-white border border-amber-200 text-[10px] font-mono font-bold text-amber-800">
+                        {copiedFoodCost.bahanList.length} Bahan · Buffer {copiedFoodCost.bufferPct}% · {copiedFoodCost.copiedAt}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-amber-800 font-medium mt-0.5">
+                      Klik tombol <strong>Tempel Isian</strong> pada Food Cost kategori atau hari berikutnya, lalu cukup ubah kolom <strong>BERAT (BB)</strong> &amp; tekan Enter untuk lanjut baris berikutnya.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {isPerKategoriMode && (
+                    <button
+                      type="button"
+                      onClick={handlePasteToAllEmptyCategoryEntries}
+                      className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                    >
+                      <ClipboardCheck className="w-3.5 h-3.5" />
+                      Tempel ke Semua Tabel Kosong
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setCopiedFoodCost(null)}
+                    className="px-3 py-2 bg-white hover:bg-amber-100 border border-amber-300 text-amber-900 rounded-xl text-xs font-bold transition cursor-pointer"
+                  >
+                    Hapus Clipboard
+                  </button>
+                </div>
+              </div>
+            )}
+
             {!appliedConfig.confirmed ? (
               <div className="bg-gradient-to-br from-slate-50 to-indigo-50/40 border-2 border-dashed border-indigo-200 rounded-2xl p-8 text-center space-y-3">
                 <div className="w-11 h-11 rounded-2xl bg-indigo-100 text-indigo-700 flex items-center justify-center mx-auto">
@@ -4303,9 +6361,8 @@ export default function FoodCostTab({
                     Konfirmasi Kategori Food Cost Terlebih Dahulu
                   </h4>
                   <p className="text-xs text-slate-600 leading-relaxed">
-                    Pilih mode tampilan (<strong>Porsi Kecil</strong>, <strong>Porsi Besar</strong>, atau{" "}
-                    <strong>Semua Food Cost</strong>) beserta kategori sasaran pada panel di atas, lalu klik{" "}
-                    <strong>Konfirmasi & Tampilkan Food Cost Otomatis</strong>.
+                    Pilih mode tampilan beserta kategori sasaran pada panel di atas, lalu klik{" "}
+                    <strong>Konfirmasi &amp; Tampilkan Food Cost Otomatis</strong>.
                   </p>
                 </div>
                 <div className="pt-1 flex flex-wrap items-center justify-center gap-2">
@@ -4322,9 +6379,300 @@ export default function FoodCostTab({
                   </button>
                 </div>
               </div>
+            ) : isPerKategoriMode ? (
+              resolvedCategoryEntries.length === 0 ? (
+                <div className="bg-slate-50 border-2 border-dashed border-slate-200 rounded-2xl p-8 text-center space-y-3">
+                  <p className="text-xs font-bold text-slate-600">
+                    Tidak ada kategori Food Cost yang cocok dengan filter porsi saat ini.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      handleSelectDraftScope("all");
+                      setAppliedConfig((prev) => ({ ...prev, scope: "all", confirmed: true }));
+                      handleResetToSingleCategories(false);
+                    }}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold cursor-pointer"
+                  >
+                    Tampilkan Semua Kategori Kelompok
+                  </button>
+                </div>
+              ) : (
+                resolvedCategoryEntries.map((entry) => {
+                  const calcInfo = categoryCalcResultsMap[entry.id];
+                  const entryPm = calcInfo?.pmCount ?? getEntryEffectivePmCount(entry);
+                  const entryTargetPrice =
+                    calcInfo?.targetPrice ?? (entry.porsi === "besar" ? activeTargetPriceBesar : activeTargetPriceKecil);
+                  const entryActualPerPorsi = calcInfo?.calculatedCostPerPorsi ?? 0;
+                  const entryActualTotal = calcInfo?.actualTotalCost ?? 0;
+                  const isEntryOver = entryPm > 0 && entryActualPerPorsi > entryTargetPrice;
+                  const highlightInfo = pastedHighlightMap[`cat_${entry.id}`];
+                  const isMergedEntry = entry.sasaranIds.length > 1;
+                  const quickSources = copySourceOptions.filter((opt) => opt.key !== `cat:${entry.id}`);
+
+                  return (
+                    <div
+                      key={entry.id}
+                      id={`fc-block-cat_${entry.id}`}
+                      className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden space-y-3 p-4"
+                    >
+                      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-2 border-b border-slate-100">
+                        <div className="space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span
+                              className={`w-2.5 h-2.5 rounded-full shrink-0 ${
+                                entry.porsi === "besar" ? "bg-amber-500" : "bg-cyan-500"
+                              }`}
+                            ></span>
+                            <h4 className="font-extrabold text-slate-900 uppercase text-xs tracking-wide">
+                              FOOD COST — {entry.title}
+                            </h4>
+                            <span
+                              className={`px-2 py-0.5 rounded-md text-[10px] font-black uppercase border ${
+                                entry.porsi === "besar"
+                                  ? "bg-amber-50 text-amber-800 border-amber-200"
+                                  : "bg-cyan-50 text-cyan-800 border-cyan-200"
+                              }`}
+                            >
+                              {entry.porsi === "besar" ? "Porsi Besar" : "Porsi Kecil"}
+                            </span>
+                            {isMergedEntry && (
+                              <>
+                                <span className="px-2 py-0.5 rounded-md bg-indigo-50 text-indigo-800 border border-indigo-200 text-[10px] font-black">
+                                  Gabungan {entry.sasaranIds.length} Kategori
+                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSplitMergedGroup(entry.id)}
+                                  className="px-2 py-0.5 rounded-md bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-extrabold inline-flex items-center gap-1 cursor-pointer transition"
+                                  title="Pisahkan kembali kategori gabungan ini"
+                                >
+                                  <Split className="w-3 h-3" />
+                                  Pisahkan
+                                </button>
+                              </>
+                            )}
+                            {isEntryOver && (
+                              <span className="px-2 py-0.5 rounded-md bg-rose-100 text-rose-800 border border-rose-300 text-[10px] font-black">
+                                OVER BUDGET
+                              </span>
+                            )}
+                          </div>
+
+                          <p className="text-[11px] text-slate-500 font-semibold">
+                            Plafon PM:{" "}
+                            <span className="text-slate-800 font-bold">{formatRupiah(entryTargetPrice)}/porsi</span>
+                            {" · "}
+                            Aktual:{" "}
+                            <span className={isEntryOver ? "text-rose-600 font-black" : "text-emerald-700 font-bold"}>
+                              {formatRupiah(Math.round(entryActualPerPorsi))}/porsi
+                            </span>
+                            {" · "}
+                            Total Biaya:{" "}
+                            <span className="text-slate-800 font-bold">{formatRupiah(Math.round(entryActualTotal))}</span>
+                            {" · "}
+                            Jumlah: <span className="text-slate-900 font-black">{entryPm} PM</span>
+                          </p>
+
+                          {isMergedEntry && (
+                            <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                              {entry.sasaranIds.map((sId) => (
+                                <span
+                                  key={sId}
+                                  className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-200 text-[10px] font-bold text-slate-700"
+                                >
+                                  {getSasaranLabel(sId)} ({getSasaranPmCount(sId, entry.porsi)})
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleCopyFoodCost(entry.title, entry.porsi, entry.bahanList, entry.bufferPct)
+                            }
+                            className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-[11px] font-extrabold transition cursor-pointer"
+                            title="Salin semua bahan, uraian, harga, dan buffer dari Food Cost ini"
+                          >
+                            <Copy className="w-3.5 h-3.5 text-indigo-600" />
+                            Salin Semua Isian
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handlePasteToTarget(
+                                "category",
+                                entry.id,
+                                entry.title,
+                                (entry.bahanList || []).length
+                              )
+                            }
+                            className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11px] font-extrabold transition cursor-pointer ${
+                              copiedFoodCost
+                                ? "bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300"
+                                : "bg-slate-50 hover:bg-slate-100 text-slate-500 border border-slate-200"
+                            }`}
+                            title="Tempel semua isian Food Cost yang sudah disalin"
+                          >
+                            <ClipboardCheck className="w-3.5 h-3.5" />
+                            Tempel Isian
+                          </button>
+
+                          {quickSources.length > 0 && (
+                            <select
+                              value=""
+                              onChange={(e) => {
+                                const picked = quickSources.find((o) => o.key === e.target.value);
+                                if (!picked) return;
+                                handlePasteToTarget(
+                                  "category",
+                                  entry.id,
+                                  entry.title,
+                                  (entry.bahanList || []).length,
+                                  {
+                                    sourceLabel: picked.label,
+                                    sourcePorsi: picked.porsi,
+                                    copiedAt: "Langsung",
+                                    bufferPct: picked.bufferPct,
+                                    bahanList: picked.bahanList,
+                                  }
+                                );
+                              }}
+                              className="bg-white border border-slate-200 hover:border-indigo-300 rounded-lg text-[11px] font-bold text-slate-700 px-2 py-1.5 max-w-[165px] cursor-pointer focus:outline-none"
+                              title="Tarik langsung isian dari Food Cost kategori atau hari lain"
+                            >
+                              <option value="">Salin dari...</option>
+                              {quickSources.map((opt) => (
+                                <option key={opt.key} value={opt.key}>
+                                  {opt.label}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => addIngredientToCategoryEntry(entry.id)}
+                            className="flex items-center gap-1 px-2.5 py-1.5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 rounded-lg text-[11px] font-bold transition shadow-xs cursor-pointer"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                            Tambah Bahan Baku
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => {
+                              triggerConfirm({
+                                title: `Hapus Semua Bahan (${entry.title})`,
+                                message: `Apakah Anda yakin ingin menghapus seluruh komponen bahan baku pada kategori "${entry.title}"?`,
+                                onConfirm: () => {
+                                  updateCategoryEntry(entry.id, (cur) => ({ ...cur, bahanList: [] }));
+                                },
+                              });
+                            }}
+                            className="flex items-center gap-1 px-2.5 py-1.5 bg-rose-50 hover:bg-rose-100 text-rose-600 rounded-lg text-[11px] font-bold transition shadow-xs cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            Hapus Semua
+                          </button>
+                        </div>
+                      </div>
+
+                      {highlightInfo && (
+                        <div className="bg-amber-50 border border-amber-300 rounded-xl px-3.5 py-2 flex items-center justify-between gap-2 text-[11px] text-amber-900">
+                          <span>
+                            <strong>Isian ditempel dari &ldquo;{highlightInfo.from}&rdquo;.</strong> Kolom{" "}
+                            <strong>BERAT (BB)</strong> disorot — silakan ubah angka BB sesuai standar porsi kategori ini &amp; tekan{" "}
+                            <kbd className="px-1.5 py-0.5 bg-white border border-amber-300 rounded text-[10px] font-mono">
+                              Enter
+                            </kbd>{" "}
+                            untuk lanjut ke baris berikutnya.
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setPastedHighlightMap((prev) => {
+                                const next = { ...prev };
+                                delete next[`cat_${entry.id}`];
+                                return next;
+                              })
+                            }
+                            className="px-2 py-0.5 rounded bg-white border border-amber-300 text-[10px] font-bold hover:bg-amber-100 shrink-0 cursor-pointer"
+                          >
+                            Selesai
+                          </button>
+                        </div>
+                      )}
+
+                      {renderCategoryFoodCostTable(entry, false)}
+
+                      <div className="bg-slate-50 p-3 rounded-xl border border-slate-200/60 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-bold text-slate-700 flex items-center gap-1.5">
+                            <Sliders className="w-3.5 h-3.5 text-indigo-500" />
+                            Rujukan AKG {entry.title}:
+                          </span>
+                          <select
+                            value={entry.akgType || getDefaultAkgTypeForGroup(entry.sasaranIds, entry.porsi)}
+                            onChange={(e) =>
+                              updateCategoryEntry(entry.id, (cur) => ({ ...cur, akgType: e.target.value }))
+                            }
+                            className="bg-white border border-slate-200 rounded-lg text-xs px-2 py-1 text-slate-700 font-bold focus:outline-none"
+                          >
+                            {Object.entries(TARGET_AKG_LIMITS).map(([key, val]) => (
+                              <option key={key} value={key}>
+                                {val.label}
+                              </option>
+                            ))}
+                            <option value="custom">✍️ Target Kustom (Input Manual)</option>
+                          </select>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <span className="text-[11px] font-bold text-slate-600">Buffer Kategori (%):</span>
+                          {[2.5, 3, 5].map((pctVal) => (
+                            <button
+                              key={pctVal}
+                              type="button"
+                              onClick={() =>
+                                updateCategoryEntry(entry.id, (cur) => ({ ...cur, bufferPct: pctVal }))
+                              }
+                              className={`px-2 py-1 rounded-lg text-[10px] font-mono font-bold border transition cursor-pointer ${
+                                (entry.bufferPct ?? 5) === pctVal
+                                  ? "bg-indigo-600 text-white border-indigo-600"
+                                  : "bg-white text-slate-700 border-slate-200 hover:bg-slate-100"
+                              }`}
+                            >
+                              {pctVal}%
+                            </button>
+                          ))}
+                          <input
+                            type="number"
+                            step="0.5"
+                            min="0"
+                            max="50"
+                            value={entry.bufferPct ?? 5}
+                            onChange={(e) =>
+                              updateCategoryEntry(entry.id, (cur) => ({
+                                ...cur,
+                                bufferPct: Math.max(0, Number(e.target.value) || 0),
+                              }))
+                            }
+                            className="w-16 bg-white border border-slate-200 rounded-lg text-xs px-2 py-1 text-center font-mono font-bold text-slate-800"
+                          />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })
+              )
             ) : (
               <>
-                {/* Table 1: Porsi Besar Block (Shown when scope is all or besar) */}
+                {/* Table 1: Porsi Besar Block (Shown when scope is all or besar in gabung_porsi mode) */}
                 {showBesarTable && (
                   <div id="fc-block-besar" className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden space-y-3 p-4">
                     <div className="flex items-center justify-between flex-wrap gap-2">
@@ -4346,7 +6694,73 @@ export default function FoodCostTab({
                           Jumlah: <span className="text-slate-800 font-bold">{pmBesar} PM</span>
                         </p>
                       </div>
-                      <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopyFoodCost(
+                              `Porsi Besar Hari ${selectedDay}`,
+                              "besar",
+                              currentDayData.porsiBesarBahan || [],
+                              currentDayData.bufferPct
+                            )
+                          }
+                          className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-extrabold transition cursor-pointer"
+                        >
+                          <Copy className="w-3.5 h-3.5 text-indigo-600" />
+                          Salin Semua Isian
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handlePasteToTarget(
+                              "porsi",
+                              "besar",
+                              `Porsi Besar Hari ${selectedDay}`,
+                              (currentDayData.porsiBesarBahan || []).length
+                            )
+                          }
+                          className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-extrabold transition cursor-pointer ${
+                            copiedFoodCost
+                              ? "bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300"
+                              : "bg-slate-50 hover:bg-slate-100 text-slate-500 border border-slate-200"
+                          }`}
+                        >
+                          <ClipboardCheck className="w-3.5 h-3.5" />
+                          Tempel Isian
+                        </button>
+                        {copySourceOptions.filter((o) => o.key !== "porsi:besar").length > 0 && (
+                          <select
+                            value=""
+                            onChange={(e) => {
+                              const picked = copySourceOptions.find((o) => o.key === e.target.value);
+                              if (!picked) return;
+                              handlePasteToTarget(
+                                "porsi",
+                                "besar",
+                                `Porsi Besar Hari ${selectedDay}`,
+                                (currentDayData.porsiBesarBahan || []).length,
+                                {
+                                  sourceLabel: picked.label,
+                                  sourcePorsi: picked.porsi,
+                                  copiedAt: "Langsung",
+                                  bufferPct: picked.bufferPct,
+                                  bahanList: picked.bahanList,
+                                }
+                              );
+                            }}
+                            className="bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 px-2 py-1.5 max-w-[160px] cursor-pointer focus:outline-none"
+                          >
+                            <option value="">Salin dari...</option>
+                            {copySourceOptions
+                              .filter((o) => o.key !== "porsi:besar")
+                              .map((opt) => (
+                                <option key={opt.key} value={opt.key}>
+                                  {opt.label}
+                                </option>
+                              ))}
+                          </select>
+                        )}
                         <button
                           id="btn-add-ing-besar"
                           type="button"
@@ -4378,6 +6792,28 @@ export default function FoodCostTab({
                       </div>
                     </div>
 
+                    {pastedHighlightMap["besar"] && (
+                      <div className="bg-amber-50 border border-amber-300 rounded-xl px-3.5 py-2 flex items-center justify-between gap-2 text-[11px] text-amber-900">
+                        <span>
+                          <strong>Isian ditempel dari &ldquo;{pastedHighlightMap["besar"].from}&rdquo;.</strong> Kolom{" "}
+                          <strong>BERAT (BB)</strong> disorot — ubah angka BB &amp; tekan Enter untuk lanjut baris berikutnya.
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPastedHighlightMap((prev) => {
+                              const next = { ...prev };
+                              delete next["besar"];
+                              return next;
+                            })
+                          }
+                          className="px-2 py-0.5 rounded bg-white border border-amber-300 text-[10px] font-bold hover:bg-amber-100 shrink-0 cursor-pointer"
+                        >
+                          Selesai
+                        </button>
+                      </div>
+                    )}
+
                     {/* Tanda Kategori Terpilih di atas Tabel Porsi Besar */}
                     {renderCategorySignBanner("besar", false)}
 
@@ -4405,7 +6841,7 @@ export default function FoodCostTab({
                   </div>
                 )}
 
-                {/* Table 2: Porsi Kecil Block (Shown when scope is all or kecil) */}
+                {/* Table 2: Porsi Kecil Block (Shown when scope is all or kecil in gabung_porsi mode) */}
                 {showKecilTable && (
                   <div id="fc-block-kecil" className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden space-y-3 p-4">
                     <div className="flex items-center justify-between flex-wrap gap-2">
@@ -4427,7 +6863,73 @@ export default function FoodCostTab({
                           Jumlah: <span className="text-slate-800 font-bold">{pmKecil} PM</span>
                         </p>
                       </div>
-                      <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopyFoodCost(
+                              `Porsi Kecil Hari ${selectedDay}`,
+                              "kecil",
+                              currentDayData.porsiKecilBahan || [],
+                              currentDayData.bufferPct
+                            )
+                          }
+                          className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-extrabold transition cursor-pointer"
+                        >
+                          <Copy className="w-3.5 h-3.5 text-indigo-600" />
+                          Salin Semua Isian
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handlePasteToTarget(
+                              "porsi",
+                              "kecil",
+                              `Porsi Kecil Hari ${selectedDay}`,
+                              (currentDayData.porsiKecilBahan || []).length
+                            )
+                          }
+                          className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-extrabold transition cursor-pointer ${
+                            copiedFoodCost
+                              ? "bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300"
+                              : "bg-slate-50 hover:bg-slate-100 text-slate-500 border border-slate-200"
+                          }`}
+                        >
+                          <ClipboardCheck className="w-3.5 h-3.5" />
+                          Tempel Isian
+                        </button>
+                        {copySourceOptions.filter((o) => o.key !== "porsi:kecil").length > 0 && (
+                          <select
+                            value=""
+                            onChange={(e) => {
+                              const picked = copySourceOptions.find((o) => o.key === e.target.value);
+                              if (!picked) return;
+                              handlePasteToTarget(
+                                "porsi",
+                                "kecil",
+                                `Porsi Kecil Hari ${selectedDay}`,
+                                (currentDayData.porsiKecilBahan || []).length,
+                                {
+                                  sourceLabel: picked.label,
+                                  sourcePorsi: picked.porsi,
+                                  copiedAt: "Langsung",
+                                  bufferPct: picked.bufferPct,
+                                  bahanList: picked.bahanList,
+                                }
+                              );
+                            }}
+                            className="bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 px-2 py-1.5 max-w-[160px] cursor-pointer focus:outline-none"
+                          >
+                            <option value="">Salin dari...</option>
+                            {copySourceOptions
+                              .filter((o) => o.key !== "porsi:kecil")
+                              .map((opt) => (
+                                <option key={opt.key} value={opt.key}>
+                                  {opt.label}
+                                </option>
+                              ))}
+                          </select>
+                        )}
                         <button
                           id="btn-add-ing-kecil"
                           type="button"
@@ -4458,6 +6960,28 @@ export default function FoodCostTab({
                         </button>
                       </div>
                     </div>
+
+                    {pastedHighlightMap["kecil"] && (
+                      <div className="bg-amber-50 border border-amber-300 rounded-xl px-3.5 py-2 flex items-center justify-between gap-2 text-[11px] text-amber-900">
+                        <span>
+                          <strong>Isian ditempel dari &ldquo;{pastedHighlightMap["kecil"].from}&rdquo;.</strong> Kolom{" "}
+                          <strong>BERAT (BB)</strong> disorot — ubah angka BB &amp; tekan Enter untuk lanjut baris berikutnya.
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setPastedHighlightMap((prev) => {
+                              const next = { ...prev };
+                              delete next["kecil"];
+                              return next;
+                            })
+                          }
+                          className="px-2 py-0.5 rounded bg-white border border-amber-300 text-[10px] font-bold hover:bg-amber-100 shrink-0 cursor-pointer"
+                        >
+                          Selesai
+                        </button>
+                      </div>
+                    )}
 
                     {/* Tanda Kategori Terpilih di atas Tabel Porsi Kecil */}
                     {renderCategorySignBanner("kecil", false)}
@@ -4650,7 +7174,66 @@ export default function FoodCostTab({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 self-end sm:self-auto">
+                    <div className="flex flex-wrap items-center gap-1.5 self-end sm:self-auto">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleCopyFoodCost(table.namaTabel, table.porsi, table.bahanList || [], table.bufferPct)
+                        }
+                        className="flex items-center gap-1 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-lg text-xs font-extrabold transition cursor-pointer"
+                      >
+                        <Copy className="w-3.5 h-3.5 text-indigo-600" />
+                        Salin Semua Isian
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handlePasteToTarget(
+                            "custom",
+                            table.id,
+                            table.namaTabel,
+                            (table.bahanList || []).length
+                          )
+                        }
+                        className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-extrabold transition cursor-pointer ${
+                          copiedFoodCost
+                            ? "bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300"
+                            : "bg-slate-50 hover:bg-slate-100 text-slate-500 border border-slate-200"
+                        }`}
+                      >
+                        <ClipboardCheck className="w-3.5 h-3.5" />
+                        Tempel Isian
+                      </button>
+                      {copySourceOptions.length > 0 && (
+                        <select
+                          value=""
+                          onChange={(e) => {
+                            const picked = copySourceOptions.find((o) => o.key === e.target.value);
+                            if (!picked) return;
+                            handlePasteToTarget(
+                              "custom",
+                              table.id,
+                              table.namaTabel,
+                              (table.bahanList || []).length,
+                              {
+                                sourceLabel: picked.label,
+                                sourcePorsi: picked.porsi,
+                                copiedAt: "Langsung",
+                                bufferPct: picked.bufferPct,
+                                bahanList: picked.bahanList,
+                              }
+                            );
+                          }}
+                          className="bg-white border border-slate-200 rounded-lg text-xs font-bold text-slate-700 px-2 py-1.5 max-w-[150px] cursor-pointer focus:outline-none"
+                        >
+                          <option value="">Salin dari...</option>
+                          {copySourceOptions.map((opt) => (
+                            <option key={opt.key} value={opt.key}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      )}
                       <button
                         type="button"
                         onClick={() => addIngredientToCustomTable(table.id)}
@@ -4669,6 +7252,28 @@ export default function FoodCostTab({
                       </button>
                     </div>
                   </div>
+
+                  {pastedHighlightMap[`custom_${table.id}`] && (
+                    <div className="bg-amber-50 border border-amber-300 rounded-xl px-3.5 py-2 flex items-center justify-between gap-2 text-[11px] text-amber-900">
+                      <span>
+                        <strong>Isian ditempel dari &ldquo;{pastedHighlightMap[`custom_${table.id}`].from}&rdquo;.</strong> Kolom{" "}
+                        <strong>BERAT (BB)</strong> disorot — ubah angka BB &amp; tekan Enter untuk lanjut baris berikutnya.
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setPastedHighlightMap((prev) => {
+                            const next = { ...prev };
+                            delete next[`custom_${table.id}`];
+                            return next;
+                          })
+                        }
+                        className="px-2 py-0.5 rounded bg-white border border-amber-300 text-[10px] font-bold hover:bg-amber-100 shrink-0 cursor-pointer"
+                      >
+                        Selesai
+                      </button>
+                    </div>
+                  )}
 
                   {renderCustomFoodCostTable(table, false)}
 
@@ -4813,66 +7418,106 @@ export default function FoodCostTab({
               className="bg-white p-8 border border-slate-400 shadow-md w-full max-w-[297mm] min-w-[210mm] text-slate-950 print:text-black print:border-none print:shadow-none print:p-0 print:m-0 space-y-10"
               style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
             >
-              {/* SHEET 1: PORSI BESAR PAGE */}
-              {(!appliedConfig.confirmed || showBesarTable) && (
-                <div className="space-y-6 print:break-after-page">
-                  <KopSuratRenderHeader
-                    kopLine1={kopLine1}
-                    kopLine2={kopLine2}
-                    kopLine3={kopLine3}
-                    kopLine4={kopLine4}
-                    leftLogo={leftLogo}
-                    rightLogo={rightLogo}
-                    leftLogoCrop={leftLogoCrop}
-                    rightLogoCrop={rightLogoCrop}
-                    kopConfig={kopConfig}
-                    docKey="foodcost"
-                  />
+              {/* SHEETS: PER-KATEGORI OR PORSI BESAR/KECIL */}
+              {isPerKategoriMode ? (
+                resolvedCategoryEntries.map((entry, entryIdx) => {
+                  const entryPm = categoryCalcResultsMap[entry.id]?.pmCount ?? getEntryEffectivePmCount(entry);
+                  return (
+                    <div
+                      key={entry.id}
+                      className={`space-y-6 ${entryIdx > 0 ? "print:break-before-page pt-10 print:pt-0" : ""}`}
+                    >
+                      <KopSuratRenderHeader
+                        kopLine1={kopLine1}
+                        kopLine2={kopLine2}
+                        kopLine3={kopLine3}
+                        kopLine4={kopLine4}
+                        leftLogo={leftLogo}
+                        rightLogo={rightLogo}
+                        leftLogoCrop={leftLogoCrop}
+                        rightLogoCrop={rightLogoCrop}
+                        kopConfig={kopConfig}
+                        docKey="foodcost"
+                      />
 
-                  <div className="text-center space-y-1">
-                    <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: '13pt' }}>
-                      LAPORAN KOMPONEN BAHAN BAKU & FOOD COST - PORSI BESAR
-                    </h3>
-                    <p className="text-xs font-bold text-slate-700 uppercase">
-                      SIKLUS HARI KE-{selectedDay} ({selectedType}) | NAMA MENU: {namaMenuHariIni || "-"} | JUMLAH PM: {pmBesar} ORANG
-                    </p>
-                  </div>
+                      <div className="text-center space-y-1">
+                        <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: "13pt" }}>
+                          LAPORAN KOMPONEN BAHAN BAKU &amp; FOOD COST - {entry.title.toUpperCase()}
+                        </h3>
+                        <p className="text-xs font-bold text-slate-700 uppercase">
+                          SIKLUS HARI KE-{selectedDay} ({selectedType}) | NAMA MENU: {namaMenuHariIni || "-"} | PORSI:{" "}
+                          {entry.porsi.toUpperCase()} | JUMLAH PM: {entryPm} ORANG
+                        </p>
+                      </div>
 
-                  {renderCategorySignBanner("besar", true)}
+                      {renderCategoryFoodCostTable(entry, true)}
+                    </div>
+                  );
+                })
+              ) : (
+                <>
+                  {/* SHEET 1: PORSI BESAR PAGE */}
+                  {(!appliedConfig.confirmed || showBesarTable) && (
+                    <div className="space-y-6 print:break-after-page">
+                      <KopSuratRenderHeader
+                        kopLine1={kopLine1}
+                        kopLine2={kopLine2}
+                        kopLine3={kopLine3}
+                        kopLine4={kopLine4}
+                        leftLogo={leftLogo}
+                        rightLogo={rightLogo}
+                        leftLogoCrop={leftLogoCrop}
+                        rightLogoCrop={rightLogoCrop}
+                        kopConfig={kopConfig}
+                        docKey="foodcost"
+                      />
 
-                  {renderFoodCostTable("besar", true)}
-                </div>
-              )}
+                      <div className="text-center space-y-1">
+                        <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: '13pt' }}>
+                          LAPORAN KOMPONEN BAHAN BAKU &amp; FOOD COST - PORSI BESAR
+                        </h3>
+                        <p className="text-xs font-bold text-slate-700 uppercase">
+                          SIKLUS HARI KE-{selectedDay} ({selectedType}) | NAMA MENU: {namaMenuHariIni || "-"} | JUMLAH PM: {pmBesar} ORANG
+                        </p>
+                      </div>
 
-              {/* SHEET 2: PORSI KECIL PAGE */}
-              {(!appliedConfig.confirmed || showKecilTable) && (
-                <div className={`space-y-6 ${(!appliedConfig.confirmed || showBesarTable) ? "print:break-before-page pt-10 print:pt-0" : ""}`}>
-                  <KopSuratRenderHeader
-                    kopLine1={kopLine1}
-                    kopLine2={kopLine2}
-                    kopLine3={kopLine3}
-                    kopLine4={kopLine4}
-                    leftLogo={leftLogo}
-                    rightLogo={rightLogo}
-                    leftLogoCrop={leftLogoCrop}
-                    rightLogoCrop={rightLogoCrop}
-                    kopConfig={kopConfig}
-                    docKey="foodcost"
-                  />
+                      {renderCategorySignBanner("besar", true)}
 
-                  <div className="text-center space-y-1">
-                    <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: '13pt' }}>
-                      LAPORAN KOMPONEN BAHAN BAKU & FOOD COST - PORSI KECIL
-                    </h3>
-                    <p className="text-xs font-bold text-slate-700 uppercase">
-                      SIKLUS HARI KE-{selectedDay} ({selectedType}) | NAMA MENU: {namaMenuHariIni || "-"} | JUMLAH PM: {pmKecil} ORANG
-                    </p>
-                  </div>
+                      {renderFoodCostTable("besar", true)}
+                    </div>
+                  )}
 
-                  {renderCategorySignBanner("kecil", true)}
+                  {/* SHEET 2: PORSI KECIL PAGE */}
+                  {(!appliedConfig.confirmed || showKecilTable) && (
+                    <div className={`space-y-6 ${(!appliedConfig.confirmed || showBesarTable) ? "print:break-before-page pt-10 print:pt-0" : ""}`}>
+                      <KopSuratRenderHeader
+                        kopLine1={kopLine1}
+                        kopLine2={kopLine2}
+                        kopLine3={kopLine3}
+                        kopLine4={kopLine4}
+                        leftLogo={leftLogo}
+                        rightLogo={rightLogo}
+                        leftLogoCrop={leftLogoCrop}
+                        rightLogoCrop={rightLogoCrop}
+                        kopConfig={kopConfig}
+                        docKey="foodcost"
+                      />
 
-                  {renderFoodCostTable("kecil", true)}
-                </div>
+                      <div className="text-center space-y-1">
+                        <h3 className="font-black text-black uppercase tracking-wide" style={{ fontSize: '13pt' }}>
+                          LAPORAN KOMPONEN BAHAN BAKU &amp; FOOD COST - PORSI KECIL
+                        </h3>
+                        <p className="text-xs font-bold text-slate-700 uppercase">
+                          SIKLUS HARI KE-{selectedDay} ({selectedType}) | NAMA MENU: {namaMenuHariIni || "-"} | JUMLAH PM: {pmKecil} ORANG
+                        </p>
+                      </div>
+
+                      {renderCategorySignBanner("kecil", true)}
+
+                      {renderFoodCostTable("kecil", true)}
+                    </div>
+                  )}
+                </>
               )}
 
               {/* SHEETS FOR CUSTOM TABLES */}
@@ -5693,48 +8338,87 @@ export default function FoodCostTab({
               <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-200">
                 <span className="font-bold text-slate-500 uppercase text-[10px]">Mode Tampilan:</span>
                 <span className="font-black text-slate-900">
-                  {draftScope === "kecil"
-                    ? "Porsi Kecil"
-                    : draftScope === "besar"
-                      ? "Porsi Besar"
-                      : "Semua Food Cost (Porsi Kecil & Porsi Besar)"}
+                  {draftLayoutMode === "per_kategori"
+                    ? "Masing-Masing 1 Kategori (Bisa Gabungan Pilihan)"
+                    : draftScope === "kecil"
+                      ? "Gabung Porsi Kecil"
+                      : draftScope === "besar"
+                        ? "Gabung Porsi Besar"
+                        : "Gabung Semua Porsi (Kecil & Besar)"}
                 </span>
               </div>
 
-              {(draftScope === "kecil" || draftScope === "all") && (
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between">
-                    <span className="font-black text-indigo-800 uppercase text-[10px]">
-                      Kategori Porsi Kecil ({draftKecilIds.length})
-                    </span>
-                    <span className="font-mono font-bold text-indigo-800">
-                      {draftKecilIds.reduce((sum, id) => sum + getSasaranPmCount(id, "kecil"), 0)} PM
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-slate-700 font-medium">
-                    {draftKecilIds.length > 0
-                      ? draftKecilIds.map((id) => getSasaranLabel(id)).join(", ")
-                      : "-"}
-                  </p>
-                </div>
-              )}
+              {draftLayoutMode === "per_kategori" ? (
+                (() => {
+                  const groups = (
+                    draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey)
+                  ).filter((g) => draftScope === "all" || g.porsi === draftScope);
+                  const totalPmPreview = groups.reduce(
+                    (sum, g) => sum + getEntryAutoPmCount(g.sasaranIds, g.porsi),
+                    0
+                  );
+                  return (
+                    <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                      <div className="flex items-center justify-between">
+                        <span className="font-black text-emerald-800 uppercase text-[10px]">
+                          Panel Kategori Aktif ({groups.length})
+                        </span>
+                        <span className="font-mono font-bold text-emerald-800">{totalPmPreview} PM</span>
+                      </div>
+                      <div className="space-y-1">
+                        {groups.map((g) => (
+                          <div
+                            key={g.id}
+                            className="flex items-center justify-between bg-white px-2.5 py-1.5 rounded-lg border border-slate-200 text-[11px]"
+                          >
+                            <span className="font-bold text-slate-800">{g.title}</span>
+                            <span className="font-mono font-bold text-slate-600">
+                              {g.porsi === "besar" ? "Besar" : "Kecil"} · {getEntryAutoPmCount(g.sasaranIds, g.porsi)} PM
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : (
+                <>
+                  {(draftScope === "kecil" || draftScope === "all") && (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-black text-indigo-800 uppercase text-[10px]">
+                          Kategori Porsi Kecil ({draftKecilIds.length})
+                        </span>
+                        <span className="font-mono font-bold text-indigo-800">
+                          {draftKecilIds.reduce((sum, id) => sum + getSasaranPmCount(id, "kecil"), 0)} PM
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-700 font-medium">
+                        {draftKecilIds.length > 0
+                          ? draftKecilIds.map((id) => getSasaranLabel(id)).join(", ")
+                          : "-"}
+                      </p>
+                    </div>
+                  )}
 
-              {(draftScope === "besar" || draftScope === "all") && (
-                <div className="space-y-1 pt-1">
-                  <div className="flex items-center justify-between">
-                    <span className="font-black text-cyan-800 uppercase text-[10px]">
-                      Kategori Porsi Besar ({draftBesarIds.length})
-                    </span>
-                    <span className="font-mono font-bold text-cyan-800">
-                      {draftBesarIds.reduce((sum, id) => sum + getSasaranPmCount(id, "besar"), 0)} PM
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-slate-700 font-medium">
-                    {draftBesarIds.length > 0
-                      ? draftBesarIds.map((id) => getSasaranLabel(id)).join(", ")
-                      : "-"}
-                  </p>
-                </div>
+                  {(draftScope === "besar" || draftScope === "all") && (
+                    <div className="space-y-1 pt-1">
+                      <div className="flex items-center justify-between">
+                        <span className="font-black text-cyan-800 uppercase text-[10px]">
+                          Kategori Porsi Besar ({draftBesarIds.length})
+                        </span>
+                        <span className="font-mono font-bold text-cyan-800">
+                          {draftBesarIds.reduce((sum, id) => sum + getSasaranPmCount(id, "besar"), 0)} PM
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-700 font-medium">
+                        {draftBesarIds.length > 0
+                          ? draftBesarIds.map((id) => getSasaranLabel(id)).join(", ")
+                          : "-"}
+                      </p>
+                    </div>
+                  )}
+                </>
               )}
             </div>
 
@@ -5747,7 +8431,7 @@ export default function FoodCostTab({
                   className="mt-0.5 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
                 />
                 <span className="text-indigo-950 font-semibold leading-snug">
-                  Otomatis salin & petakan bahan makanan dari Master Menu (<strong>{namaMenuHariIni}</strong>) jika tabel masih kosong.
+                  Otomatis salin &amp; petakan bahan makanan dari Master Menu (<strong>{namaMenuHariIni}</strong>) jika tabel masih kosong.
                 </span>
               </label>
             )}
@@ -5767,7 +8451,59 @@ export default function FoodCostTab({
                 className="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-xs font-black transition shadow-sm cursor-pointer flex items-center gap-1.5"
               >
                 <CheckCircle2 className="w-4 h-4" />
-                Ya, Konfirmasi & Tampilkan Otomatis
+                Ya, Konfirmasi &amp; Tampilkan Otomatis
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PASTE CONFIRMATION MODAL WHEN TARGET ALREADY HAS DATA */}
+      {pasteConfirmModal?.isOpen && (
+        <div
+          className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center z-[9999] p-4 no-print"
+          onClick={() => setPasteConfirmModal(null)}
+        >
+          <div
+            className="bg-white border border-slate-200 rounded-3xl p-6 shadow-2xl w-full max-w-md space-y-4"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 rounded-xl bg-amber-50 text-amber-700 shrink-0">
+                <ClipboardCheck className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h4 className="font-black text-slate-900 text-sm uppercase tracking-tight">
+                  Tabel Tujuan Sudah Terisi
+                </h4>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Food Cost <strong>&ldquo;{pasteConfirmModal.targetLabel}&rdquo;</strong> saat ini sudah memiliki{" "}
+                  <strong>{pasteConfirmModal.existingCount} bahan</strong>. Pilih cara menempel isian yang disalin:
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row sm:items-center justify-end gap-2 pt-2 border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setPasteConfirmModal(null)}
+                className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold transition cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={pasteConfirmModal.onAppend}
+                className="px-3.5 py-2 bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-800 rounded-xl text-xs font-black transition cursor-pointer"
+              >
+                Tambahkan di Bawahnya
+              </button>
+              <button
+                type="button"
+                onClick={pasteConfirmModal.onReplace}
+                className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-black transition shadow-xs cursor-pointer"
+              >
+                Ganti Semua Isian
               </button>
             </div>
           </div>

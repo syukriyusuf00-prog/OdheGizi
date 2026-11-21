@@ -424,6 +424,28 @@ export interface BahanMakananInput {
   jumlahBufferCustomVal?: string | number;
 }
 
+export interface FoodCostCategoryGroup {
+  id: string;
+  title: string;
+  porsi: "besar" | "kecil";
+  sasaranIds: string[];
+}
+
+export interface FoodCostCategoryEntry {
+  id: string;
+  title: string;
+  porsi: "besar" | "kecil";
+  sasaranIds: string[];
+  bahanList: BahanMakananInput[];
+  bufferPct?: number;
+  customPmCount?: number;
+  akgType?: string;
+  akgMode?: string;
+  nutrientModes?: Record<string, string>;
+  customAkgValues?: Record<string, number>;
+  kriteriaPm?: string;
+}
+
 export interface FoodCostDay {
   jenisMenu: "Basah" | "Alergi" | "Kering" | "MP-ASI" | "3B-Basah" | "3B-Alergi" | "3B-Kering";
   hariKe: number; // 1 to N
@@ -433,6 +455,8 @@ export interface FoodCostDay {
   masterMenuPlanId?: string;
   porsiBesarBahan: BahanMakananInput[];
   porsiKecilBahan: BahanMakananInput[];
+  activeMode?: "porsi" | "kategori";
+  categoryEntries?: FoodCostCategoryEntry[];
   bufferPct: number; // 2.5, 3, 5, or custom
   bumbuPct?: number; // default 10 or custom %
   customPmBesarCount?: number;

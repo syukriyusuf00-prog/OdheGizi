@@ -257,6 +257,121 @@ function buildFoodCostAndNotaForDay(
 
   uniqueFC.forEach((fc) => {
     const isAlergi = fc.jenisMenu.includes("Alergi");
+    const effectiveBumbuPct = fc.bumbuPct !== undefined ? fc.bumbuPct : defaultBumbuPct;
+
+    const mapBahan = (items: ReturnType<typeof calculateDay>["porsiBesarItems"]) =>
+      items
+        .filter((it) => it.nama && it.nama.trim() !== "")
+        .map((it) => ({
+          nama: it.nama,
+          beratBB: it.beratBB,
+          urt: it.urt || "-",
+          kebutuhanKg: it.totalKebutuhanKg || 0,
+          jumlahBuffer: Number(it.butir || 0),
+          hargaSatuan: it.hargaSatuan || 0,
+          hargaTotal: it.hargaTotal || 0,
+        }));
+
+    const aggregateNotaItems = (items: ReturnType<typeof calculateDay>["porsiBesarItems"]) => {
+      items.forEach((it) => {
+        const rawName = (it.nama || "").trim();
+        if (!rawName || rawName.toLowerCase() === "ketik bahan...") return;
+        const qty = Number(it.butir || 0) > 0 ? Number(it.butir) : Number(it.totalKebutuhanKg || 0);
+        if (qty <= 0) return;
+
+        const key = rawName.toLowerCase();
+        let satuan = "Kg";
+        if (it.bufferBase === "potong") satuan = "Potong";
+        else if (it.bufferBase === "ekor") satuan = "Ekor";
+        else if (it.bufferBase === "custom") satuan = guessSatuanNota(rawName);
+
+        if (!notaAgg[key]) {
+          notaAgg[key] = {
+            nama: rawName,
+            jumlah: Number(qty.toFixed(1)),
+            satuan,
+            hargaSatuan: it.hargaSatuan || 0,
+            total: Number((qty * (it.hargaSatuan || 0)).toFixed(0)),
+          };
+        } else {
+          notaAgg[key].jumlah = Number((notaAgg[key].jumlah + qty).toFixed(1));
+          if ((it.hargaSatuan || 0) > notaAgg[key].hargaSatuan) {
+            notaAgg[key].hargaSatuan = it.hargaSatuan || 0;
+          }
+          notaAgg[key].total = Number((notaAgg[key].jumlah * notaAgg[key].hargaSatuan).toFixed(0));
+        }
+      });
+    };
+
+    if (
+      fc.activeMode === "kategori" &&
+      Array.isArray(fc.categoryEntries) &&
+      fc.categoryEntries.length > 0
+    ) {
+      fc.categoryEntries.forEach((ce) => {
+        if (!ce.bahanList || ce.bahanList.length === 0) return;
+        let entryPm = 0;
+        if (ce.customPmCount !== undefined) {
+          entryPm = Math.max(0, Number(ce.customPmCount) || 0);
+        } else {
+          (ce.sasaranIds || []).forEach((sId) => {
+            const sasItem = (dayPM.sasaran || []).find((item) => item.id === sId);
+            if (!sasItem) return;
+            const isShared =
+              sId === "sampel" ||
+              (besarSasaranIds.includes(sId) && kecilSasaranIds.includes(sId));
+            if (isAlergi) {
+              const cAlergi =
+                ce.porsi === "besar"
+                  ? Number(sasItem.alergiBesar) || 0
+                  : Number(sasItem.alergiKecil) || 0;
+              const cNormal = isShared
+                ? Number(ce.porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
+                : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+              entryPm += cAlergi > 0 ? cAlergi : cNormal;
+            } else {
+              entryPm += isShared
+                ? Number(ce.porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
+                : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+            }
+          });
+        }
+
+        const entryBuf = ce.bufferPct ?? fc.bufferPct ?? 5;
+        const calcCat =
+          ce.porsi === "besar"
+            ? calculateDay(ce.bahanList, [], entryPm, 0, entryBuf, tkpiMap, effectiveBumbuPct)
+            : calculateDay([], ce.bahanList, 0, entryPm, entryBuf, tkpiMap, effectiveBumbuPct);
+
+        const hargaPorsi = ce.porsi === "besar" ? porsiBesarHarga : porsiKecilHarga;
+        const rabTotal = entryPm * hargaPorsi;
+        const actualTotal =
+          ce.porsi === "besar" ? calcCat.subtotalBesarCost : calcCat.subtotalKecilCost;
+
+        foodCosts.push({
+          jenisMenu: `${fc.jenisMenu} · ${ce.title}`,
+          namaMenu: fc.namaMenu || "",
+          bufferPct: entryBuf,
+          bumbuPct: effectiveBumbuPct,
+          pmKecil: ce.porsi === "kecil" ? calcCat.jumlahPMKecil : 0,
+          pmBesar: ce.porsi === "besar" ? calcCat.jumlahPMBesar : 0,
+          rabTotal,
+          actualTotal,
+          costPerPorsiKecil: ce.porsi === "kecil" ? calcCat.costPerPorsiKecil : 0,
+          costPerPorsiBesar: ce.porsi === "besar" ? calcCat.costPerPorsiBesar : 0,
+          energiBesar: ce.porsi === "besar" ? calcCat.nutrisiPorsiBesar?.energi || 0 : 0,
+          proteinBesar: ce.porsi === "besar" ? calcCat.nutrisiPorsiBesar?.protein || 0 : 0,
+          energiKecil: ce.porsi === "kecil" ? calcCat.nutrisiPorsiKecil?.energi || 0 : 0,
+          proteinKecil: ce.porsi === "kecil" ? calcCat.nutrisiPorsiKecil?.protein || 0 : 0,
+          bahanBesar: ce.porsi === "besar" ? mapBahan(calcCat.porsiBesarItems) : [],
+          bahanKecil: ce.porsi === "kecil" ? mapBahan(calcCat.porsiKecilItems) : [],
+        });
+
+        aggregateNotaItems([...calcCat.porsiBesarItems, ...calcCat.porsiKecilItems]);
+      });
+      return;
+    }
+
     let pmBesar = 0;
     let pmKecil = 0;
 
@@ -289,7 +404,6 @@ function buildFoodCostAndNotaForDay(
     if (fc.customPmBesarCount !== undefined) pmBesar = fc.customPmBesarCount;
     if (fc.customPmKecilCount !== undefined) pmKecil = fc.customPmKecilCount;
 
-    const effectiveBumbuPct = fc.bumbuPct !== undefined ? fc.bumbuPct : defaultBumbuPct;
     const calc = calculateDay(
       fc.porsiBesarBahan || [],
       fc.porsiKecilBahan || [],
@@ -302,19 +416,6 @@ function buildFoodCostAndNotaForDay(
 
     const rabTotal = pmBesar * porsiBesarHarga + pmKecil * porsiKecilHarga;
     const actualTotal = calc.subtotalBesarCost + calc.subtotalKecilCost;
-
-    const mapBahan = (items: typeof calc.porsiBesarItems) =>
-      items
-        .filter((it) => it.nama && it.nama.trim() !== "")
-        .map((it) => ({
-          nama: it.nama,
-          beratBB: it.beratBB,
-          urt: it.urt || "-",
-          kebutuhanKg: it.totalKebutuhanKg || 0,
-          jumlahBuffer: Number(it.butir || 0),
-          hargaSatuan: it.hargaSatuan || 0,
-          hargaTotal: it.hargaTotal || 0,
-        }));
 
     foodCosts.push({
       jenisMenu: fc.jenisMenu,
@@ -336,34 +437,7 @@ function buildFoodCostAndNotaForDay(
     });
 
     // Aggregate into Nota Pesanan
-    [...calc.porsiBesarItems, ...calc.porsiKecilItems].forEach((it) => {
-      const rawName = (it.nama || "").trim();
-      if (!rawName || rawName.toLowerCase() === "ketik bahan...") return;
-      const qty = Number(it.butir || 0) > 0 ? Number(it.butir) : Number(it.totalKebutuhanKg || 0);
-      if (qty <= 0) return;
-
-      const key = rawName.toLowerCase();
-      let satuan = "Kg";
-      if (it.bufferBase === "potong") satuan = "Potong";
-      else if (it.bufferBase === "ekor") satuan = "Ekor";
-      else if (it.bufferBase === "custom") satuan = guessSatuanNota(rawName);
-
-      if (!notaAgg[key]) {
-        notaAgg[key] = {
-          nama: rawName,
-          jumlah: Number(qty.toFixed(1)),
-          satuan,
-          hargaSatuan: it.hargaSatuan || 0,
-          total: Number((qty * (it.hargaSatuan || 0)).toFixed(0)),
-        };
-      } else {
-        notaAgg[key].jumlah = Number((notaAgg[key].jumlah + qty).toFixed(1));
-        if ((it.hargaSatuan || 0) > notaAgg[key].hargaSatuan) {
-          notaAgg[key].hargaSatuan = it.hargaSatuan || 0;
-        }
-        notaAgg[key].total = Number((notaAgg[key].jumlah * notaAgg[key].hargaSatuan).toFixed(0));
-      }
-    });
+    aggregateNotaItems([...calc.porsiBesarItems, ...calc.porsiKecilItems]);
   });
 
   // Check manual saved Nota Pesanan items from localStorage for active day
