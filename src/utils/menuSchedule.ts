@@ -4,6 +4,7 @@
  */
 
 import {
+  KelompokSasaranPM,
   MasterMenu,
   MasterMenuDietType,
   MasterMenuDurationType,
@@ -17,6 +18,7 @@ export interface SasaranKategoriDef {
   label: string;
   shortLabel: string;
   group: "sekolah" | "tigaB" | "mpAsi";
+  isAlergi?: boolean;
 }
 
 // 12 Kelompok Sasaran sesuai Gambar 2 & Juknis BGN
@@ -35,9 +37,103 @@ export const SASARAN_KATEGORI_LIST: SasaranKategoriDef[] = [
   { id: "ibu_menyusui", label: "Ibu Menyusui", shortLabel: "Ibu Menyusui", group: "tigaB" },
 ];
 
+export const isAlergiSasaranId = (id: string): boolean => id.startsWith("alergi_");
+
+export const stripAlergiPrefix = (id: string): string => id.replace(/^alergi_/, "");
+
+// 12 Kelompok Sasaran Kategori Diet/Alergi (mengambil jumlah dari kolom Diet/Alergi Tabel 2 PM)
+export const ALERGI_KATEGORI_LIST: SasaranKategoriDef[] = SASARAN_KATEGORI_LIST.map((s) => ({
+  id: `alergi_${s.id}`,
+  label: `Alergi · ${s.label}`,
+  shortLabel: `Alergi ${s.shortLabel}`,
+  group: s.group,
+  isAlergi: true,
+}));
+
+export const ALL_KATEGORI_WITH_ALERGI: SasaranKategoriDef[] = [
+  ...SASARAN_KATEGORI_LIST,
+  ...ALERGI_KATEGORI_LIST,
+];
+
 export const SEKOLAH_SASARAN_IDS = SASARAN_KATEGORI_LIST.filter((s) => s.group === "sekolah").map((s) => s.id);
 export const TIGAB_SASARAN_IDS = SASARAN_KATEGORI_LIST.filter((s) => s.group === "tigaB").map((s) => s.id);
 export const MPASI_SASARAN_IDS = SASARAN_KATEGORI_LIST.filter((s) => s.group === "mpAsi").map((s) => s.id);
+
+export const DEFAULT_KECIL_SASARAN_IDS = [
+  "tk_paud_lb",
+  "sd_kelas_1_3",
+  "anak_balita",
+  "anak_balita_13_59",
+  "balita_6_11",
+];
+
+export function resolveCategoryPorsiDefault(
+  sId: string,
+  kecilIds: string[] = DEFAULT_KECIL_SASARAN_IDS,
+  besarIds?: string[]
+): "besar" | "kecil" {
+  const baseId = stripAlergiPrefix(sId);
+  const inKecil = kecilIds.includes(baseId);
+  const inBesar = besarIds ? besarIds.includes(baseId) : !DEFAULT_KECIL_SASARAN_IDS.includes(baseId);
+  if (inKecil && !inBesar) return "kecil";
+  if (inBesar && !inKecil) return "besar";
+  if (DEFAULT_KECIL_SASARAN_IDS.includes(baseId)) return "kecil";
+  return "besar";
+}
+
+/**
+ * Resolves exact PM count from Tabel 2 Penerima Manfaat (`harianPM[day].sasaran`)
+ * for both standard categories ("Tanpa Alergi") and Alergi categories (`alergi_<id>`).
+ */
+export function resolveSasaranPmFromTable2(
+  sasaranList: KelompokSasaranPM[] | undefined,
+  sId: string,
+  porsi?: "besar" | "kecil",
+  forceAlergi?: boolean,
+  sharedPortionIds?: string[]
+): number {
+  if (!Array.isArray(sasaranList) || sasaranList.length === 0) return 0;
+  const isAlergi = isAlergiSasaranId(sId);
+  const baseId = stripAlergiPrefix(sId);
+  const sasItem = sasaranList.find((item) => item.id === baseId);
+  if (!sasItem) return 0;
+
+  const isShared =
+    baseId === "sampel" ||
+    (Array.isArray(sharedPortionIds) && sharedPortionIds.includes(baseId));
+
+  if (isAlergi) {
+    if (porsi && isShared) {
+      return porsi === "besar"
+        ? Number(sasItem.alergiBesar) || 0
+        : Number(sasItem.alergiKecil) || 0;
+    }
+    return (Number(sasItem.alergiKecil) || 0) + (Number(sasItem.alergiBesar) || 0);
+  }
+
+  if (forceAlergi) {
+    const cAlergi =
+      porsi && isShared
+        ? porsi === "besar"
+          ? Number(sasItem.alergiBesar) || 0
+          : Number(sasItem.alergiKecil) || 0
+        : (Number(sasItem.alergiKecil) || 0) + (Number(sasItem.alergiBesar) || 0);
+    const cNormal =
+      porsi && isShared
+        ? porsi === "besar"
+          ? Number(sasItem.porsiBesar) || 0
+          : Number(sasItem.porsiKecil) || 0
+        : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+    return cAlergi > 0 ? cAlergi : cNormal;
+  }
+
+  if (porsi && isShared) {
+    return porsi === "besar"
+      ? Number(sasItem.porsiBesar) || 0
+      : Number(sasItem.porsiKecil) || 0;
+  }
+  return (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
+}
 
 export const DEFAULT_SCHEDULE_CONFIG: MasterMenuScheduleConfig = {
   durationType: "2_minggu",
@@ -380,9 +476,23 @@ export function groupDatesIntoWeeks(dates: string[]): MasterMenuWeekBlock[] {
 
 export function buildCategoryLabelFromIds(sasaranIds: string[]): string {
   if (!sasaranIds || sasaranIds.length === 0) return "BELUM ADA KATEGORI";
-  if (sasaranIds.length === SASARAN_KATEGORI_LIST.length) return "SEMUA KATEGORI SASARAN";
+  if (sasaranIds.length === ALL_KATEGORI_WITH_ALERGI.length) {
+    return "SEMUA KATEGORI (STANDAR & ALERGI)";
+  }
+  if (
+    sasaranIds.length === SASARAN_KATEGORI_LIST.length &&
+    SASARAN_KATEGORI_LIST.every((s) => sasaranIds.includes(s.id))
+  ) {
+    return "SEMUA KATEGORI SASARAN";
+  }
+  if (
+    sasaranIds.length === ALERGI_KATEGORI_LIST.length &&
+    ALERGI_KATEGORI_LIST.every((s) => sasaranIds.includes(s.id))
+  ) {
+    return "SEMUA KATEGORI DIET ALERGI";
+  }
 
-  const selectedDefs = SASARAN_KATEGORI_LIST.filter((s) => sasaranIds.includes(s.id));
+  const selectedDefs = ALL_KATEGORI_WITH_ALERGI.filter((s) => sasaranIds.includes(s.id));
   if (selectedDefs.length === 0) return "KATEGORI KUSTOM";
   if (selectedDefs.length <= 3) {
     return selectedDefs.map((s) => s.shortLabel).join(", ");
@@ -484,9 +594,18 @@ export function syncMasterMenuToLegacy(menu: MasterMenu): MasterMenu {
   const findPlanFor = (sasaranSubset: string[], diet: MasterMenuDietType): MasterMenuPlan | undefined => {
     return (
       plans.find(
-        (p) => p.dietType === diet && p.sasaranIds.some((id) => sasaranSubset.includes(id))
+        (p) =>
+          p.dietType === diet &&
+          p.sasaranIds.some((id) => sasaranSubset.includes(stripAlergiPrefix(id)))
       ) ||
-      plans.find((p) => p.sasaranIds.some((id) => sasaranSubset.includes(id)))
+      (diet === "Alergi"
+        ? plans.find((p) =>
+            p.sasaranIds.some(
+              (id) => isAlergiSasaranId(id) && sasaranSubset.includes(stripAlergiPrefix(id))
+            )
+          )
+        : undefined) ||
+      plans.find((p) => p.sasaranIds.some((id) => sasaranSubset.includes(stripAlergiPrefix(id))))
     );
   };
 

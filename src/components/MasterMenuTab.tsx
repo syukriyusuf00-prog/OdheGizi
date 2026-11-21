@@ -5,8 +5,8 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 import {
+  HariPM,
   MasterMenu,
-  MasterMenuDietType,
   MasterMenuDurationType,
   MasterMenuPlan,
   MasterMenuScheduleConfig,
@@ -21,9 +21,11 @@ import AutoSignatureBlock from "./AutoSignatureBlock";
 import PrintPreviewModal from "./PrintPreviewModal";
 import {
   SASARAN_KATEGORI_LIST,
-  SEKOLAH_SASARAN_IDS,
-  TIGAB_SASARAN_IDS,
-  MPASI_SASARAN_IDS,
+  ALERGI_KATEGORI_LIST,
+  ALL_KATEGORI_WITH_ALERGI,
+  isAlergiSasaranId,
+  resolveCategoryPorsiDefault,
+  resolveSasaranPmFromTable2,
   buildCategoryLabelFromIds,
   composeMenuName,
   computeNextPeriodStart,
@@ -44,10 +46,14 @@ import {
   Calendar,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Clipboard,
+  Combine,
   Copy,
   Download,
   Eye,
+  EyeOff,
   Image as ImageIcon,
   Layers,
   LayoutGrid,
@@ -57,7 +63,7 @@ import {
   Send,
   Table2,
   Trash2,
-  Users,
+  X,
 } from "lucide-react";
 
 interface MasterMenuTabProps {
@@ -65,6 +71,11 @@ interface MasterMenuTabProps {
   onChange: (updated: MasterMenu) => void;
   profile?: SPPGProfile;
   onProfileChange?: (updated: SPPGProfile) => void;
+  harianPM?: HariPM[];
+  pmSettings?: {
+    porsiKecilSasaranIds?: string[];
+    porsiBesarSasaranIds?: string[];
+  };
   onSendToFoodCost?: (updatedMenu: MasterMenu, dates: string[]) => void;
   onNavigateToFoodCost?: () => void;
   customLogo?: string;
@@ -99,13 +110,6 @@ const DURATION_OPTIONS: { value: MasterMenuDurationType; label: string; hint: st
   { value: "1_bulan", label: "1 Bulan Penuh", hint: "Kalender" },
 ];
 
-const DIET_OPTIONS: { value: MasterMenuDietType; label: string }[] = [
-  { value: "Standar", label: "Standar (Basah)" },
-  { value: "Alergi", label: "Diet Alergi" },
-  { value: "Kering", label: "Kering / Kudapan" },
-  { value: "MP-ASI", label: "MP-ASI (6-11 Bln)" },
-];
-
 const MENU_COMPONENT_ROWS: {
   key: keyof Pick<MenuItem, "karbohidrat" | "laukHewani" | "laukNabati" | "sayur" | "buah" | "susu">;
   label: string;
@@ -124,6 +128,8 @@ export default function MasterMenuTab({
   onChange,
   profile,
   onProfileChange,
+  harianPM = [],
+  pmSettings,
   onSendToFoodCost,
   onNavigateToFoodCost,
   customLogo,
@@ -173,14 +179,69 @@ export default function MasterMenuTab({
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
   const [isDownloading, setIsDownloading] = useState<string | null>(null);
   const [copiedItem, setCopiedItem] = useState<{ sourceLabel: string; item: MenuItem } | null>(null);
-  const [justPastedDay, setJustPastedDay] = useState<number | null>(null);
+  const [justPastedKey, setJustPastedKey] = useState<string | null>(null);
   const [sendFeedback, setSendFeedback] = useState<string | null>(null);
+  const [showCategoryPicker, setShowCategoryPicker] = useState<boolean>(true);
+  const [hiddenPlanIds, setHiddenPlanIds] = useState<Record<string, boolean>>({});
+  const [categoryViewFilter, setCategoryViewFilter] = useState<
+    "all" | "pm_positive" | "standar" | "alergi"
+  >("all");
+  const [mergeCustomPlanTitle, setMergeCustomPlanTitle] = useState<string>("");
   const [confirmModal, setConfirmModal] = useState<{
     title: string;
     message: string;
     confirmLabel: string;
     onConfirm: () => void;
   } | null>(null);
+
+  // Source Tabel 2 Penerima Manfaat (ambil dari hari pertama yang terisi di harianPM)
+  const table2SasaranList = useMemo(() => {
+    if (!Array.isArray(harianPM) || harianPM.length === 0) return [];
+    const populatedDay = harianPM.find((h) =>
+      (h.sasaran || []).some(
+        (s) =>
+          (Number(s.porsiKecil) || 0) > 0 ||
+          (Number(s.porsiBesar) || 0) > 0 ||
+          (Number(s.alergiKecil) || 0) > 0 ||
+          (Number(s.alergiBesar) || 0) > 0
+      )
+    );
+    return (populatedDay || harianPM[0])?.sasaran || [];
+  }, [harianPM]);
+
+  const kecilSettingIds = pmSettings?.porsiKecilSasaranIds;
+  const besarSettingIds = pmSettings?.porsiBesarSasaranIds;
+  const sharedPortionIds = useMemo(() => {
+    if (!Array.isArray(kecilSettingIds) || !Array.isArray(besarSettingIds)) return ["sampel"];
+    return Array.from(
+      new Set([
+        "sampel",
+        ...kecilSettingIds.filter((id) => besarSettingIds.includes(id)),
+      ])
+    );
+  }, [kecilSettingIds, besarSettingIds]);
+
+  const getMasterSasaranPorsi = (sId: string): "besar" | "kecil" =>
+    resolveCategoryPorsiDefault(sId, kecilSettingIds, besarSettingIds);
+
+  const getMasterSasaranPmCount = (sId: string, forceAlergi?: boolean): number => {
+    const porsi = getMasterSasaranPorsi(sId);
+    return resolveSasaranPmFromTable2(
+      table2SasaranList,
+      sId,
+      porsi,
+      forceAlergi,
+      sharedPortionIds
+    );
+  };
+
+  const getPlanTotalPm = (plan: MasterMenuPlan): number => {
+    const isAlergiPlan = plan.dietType === "Alergi";
+    return (plan.sasaranIds || []).reduce(
+      (sum, sId) => sum + getMasterSasaranPmCount(sId, isAlergiPlan && !isAlergiSasaranId(sId)),
+      0
+    );
+  };
 
   // Sync KOP defaults when profile updates and no custom localStorage exists
   useEffect(() => {
@@ -286,6 +347,20 @@ export default function MasterMenuTab({
       ...normalizedMenu,
       activePlanId: planId,
     });
+    const targetId =
+      viewMode === "cards"
+        ? `master-plan-cards-${planId}`
+        : `master-plan-section-${planId}`;
+    setTimeout(() => {
+      document.getElementById(targetId)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 60);
+  };
+
+  const toggleHidePlan = (planId: string) => {
+    setHiddenPlanIds((prev) => ({
+      ...prev,
+      [planId]: !prev[planId],
+    }));
   };
 
   const handleAddPlan = () => {
@@ -358,18 +433,23 @@ export default function MasterMenuTab({
     }));
   };
 
-  const handleApplySasaranPreset = (ids: string[], title: string, diet?: MasterMenuDietType) => {
-    updateActivePlan((p) => ({
-      ...p,
-      sasaranIds: [...ids],
-      title,
-      dietType: diet || p.dietType,
-    }));
+  const updatePlanById = (planId: string, updater: (plan: MasterMenuPlan) => MasterMenuPlan) => {
+    const nextPlans = plans.map((p) => (p.id === planId ? updater(p) : p));
+    commitMenuUpdate({
+      ...normalizedMenu,
+      plans: nextPlans,
+    });
   };
 
-  const handleDayFieldChange = (dayIndex: number, field: keyof MenuItem, value: string) => {
-    if (!activePlan) return;
-    const nextDays = resizeMenuDays(activePlan.days, totalDays);
+  const handlePlanDayFieldChange = (
+    planId: string,
+    dayIndex: number,
+    field: keyof MenuItem,
+    value: string
+  ) => {
+    const targetPlan = plans.find((p) => p.id === planId);
+    if (!targetPlan) return;
+    const nextDays = resizeMenuDays(targetPlan.days, totalDays);
     const current = normalizeMenuItem(nextDays[dayIndex]);
     const updatedItem: MenuItem = {
       ...current,
@@ -414,41 +494,56 @@ export default function MasterMenuTab({
     }
 
     nextDays[dayIndex] = updatedItem;
-    updateActivePlan((p) => ({ ...p, days: nextDays }));
+    updatePlanById(planId, (p) => ({ ...p, days: nextDays }));
   };
 
-  const getDayMenuItem = (dayIndex: number): MenuItem => {
-    if (!activePlan) return createEmptyMenuItem();
-    return normalizeMenuItem(activePlan.days[dayIndex]);
-  };
+  const getPlanDayMenuItem = (plan: MasterMenuPlan, dayIndex: number): MenuItem =>
+    normalizeMenuItem(plan.days[dayIndex]);
 
-  const handleCopyDay = (dayIdx: number) => {
-    const item = getDayMenuItem(dayIdx);
+  const handleCopyDay = (plan: MasterMenuPlan, dayIdx: number) => {
+    const item = getPlanDayMenuItem(plan, dayIdx);
     setCopiedItem({
-      sourceLabel: `${activePlan?.title || "Menu"} • Hari ${dayIdx + 1}`,
+      sourceLabel: `${plan.title || "Menu"} • Hari ${dayIdx + 1}`,
       item: { ...item },
     });
   };
 
-  const handlePasteDay = (dayIdx: number) => {
-    if (!copiedItem || !activePlan) return;
-    const nextDays = resizeMenuDays(activePlan.days, totalDays);
+  const handlePasteDay = (planId: string, dayIdx: number) => {
+    if (!copiedItem) return;
+    const targetPlan = plans.find((p) => p.id === planId);
+    if (!targetPlan) return;
+    const nextDays = resizeMenuDays(targetPlan.days, totalDays);
     nextDays[dayIdx] = { ...normalizeMenuItem(copiedItem.item) };
-    updateActivePlan((p) => ({ ...p, days: nextDays }));
-    setJustPastedDay(dayIdx);
-    setTimeout(() => setJustPastedDay(null), 1500);
+    updatePlanById(planId, (p) => ({ ...p, days: nextDays }));
+    const pasteKey = `${planId}:${dayIdx}`;
+    setJustPastedKey(pasteKey);
+    setTimeout(() => setJustPastedKey((cur) => (cur === pasteKey ? null : cur)), 1500);
   };
 
-  const handleResetDay = (dayIdx: number) => {
+  const handleResetDay = (plan: MasterMenuPlan, dayIdx: number) => {
     setConfirmModal({
       title: `Kosongkan Menu Hari Ke-${dayIdx + 1}?`,
-      message: `Seluruh isian Makanan Pokok, Lauk, Sayuran, Buah, dan Susu pada Hari Ke-${dayIdx + 1} (${formatIndonesianDate(plannedDates[dayIdx]) || ""}) akan dikosongkan.`,
+      message: `Seluruh isian Makanan Pokok, Lauk, Sayuran, Buah, dan Susu pada Hari Ke-${dayIdx + 1} (${formatIndonesianDate(plannedDates[dayIdx]) || ""}) untuk paket "${plan.title}" akan dikosongkan.`,
       confirmLabel: "Kosongkan Hari Ini",
       onConfirm: () => {
-        if (!activePlan) return;
-        const nextDays = resizeMenuDays(activePlan.days, totalDays);
+        const nextDays = resizeMenuDays(plan.days, totalDays);
         nextDays[dayIdx] = createEmptyMenuItem();
-        updateActivePlan((p) => ({ ...p, days: nextDays }));
+        updatePlanById(plan.id, (p) => ({ ...p, days: nextDays }));
+        setConfirmModal(null);
+      },
+    });
+  };
+
+  const handleResetPlanDays = (plan: MasterMenuPlan) => {
+    setConfirmModal({
+      title: `Reset Semua ${totalDays} Hari pada Paket "${plan.title}"?`,
+      message: `Seluruh isian menu (${totalDays} hari) pada paket "${plan.title}" akan dikosongkan.`,
+      confirmLabel: "Ya, Reset Paket Ini",
+      onConfirm: () => {
+        updatePlanById(plan.id, (p) => ({
+          ...p,
+          days: Array.from({ length: totalDays }, () => createEmptyMenuItem()),
+        }));
         setConfirmModal(null);
       },
     });
@@ -456,18 +551,7 @@ export default function MasterMenuTab({
 
   const handleResetActivePlanDays = () => {
     if (!activePlan) return;
-    setConfirmModal({
-      title: `Reset Semua ${totalDays} Hari pada Paket Aktif?`,
-      message: `Seluruh isian menu (${totalDays} hari) pada paket "${activePlan.title}" akan dikosongkan.`,
-      confirmLabel: "Ya, Reset Paket Ini",
-      onConfirm: () => {
-        updateActivePlan((p) => ({
-          ...p,
-          days: Array.from({ length: totalDays }, () => createEmptyMenuItem()),
-        }));
-        setConfirmModal(null);
-      },
-    });
+    handleResetPlanDays(activePlan);
   };
 
   const handleSendMenuToFoodCost = () => {
@@ -500,23 +584,30 @@ export default function MasterMenuTab({
 
   const defaultLogoSrc = customLogo || "/assets/images/app_logo_sppg.png";
 
-  const bannerCategoryTitle = useMemo(() => {
-    if (!activePlan) return "";
-    const titlePart = (activePlan.title || buildCategoryLabelFromIds(activePlan.sasaranIds)).toUpperCase();
+  const getPlanBannerHeadline = (plan: MasterMenuPlan): string => {
+    const titlePart = (plan.title || buildCategoryLabelFromIds(plan.sasaranIds)).toUpperCase();
     const dietSuffix =
-      activePlan.dietType && activePlan.dietType !== "Standar"
-        ? ` (${activePlan.dietType.toUpperCase()})`
+      plan.dietType && plan.dietType !== "Standar"
+        ? ` (${plan.dietType.toUpperCase()})`
         : "";
-    return `${titlePart}${dietSuffix}`;
-  }, [activePlan]);
-
-  const masterBannerHeadline = useMemo(() => {
+    const catTitle = `${titlePart}${dietSuffix}`.trim();
     if (scheduleConfig.durationType === "1_bulan") {
       const monthName = formatIndonesianMonthYear(scheduleConfig.calendarMonth).toUpperCase();
-      return `MASTER MENU ${monthName} (${totalDays} HARI) ${bannerCategoryTitle}`.trim();
+      return `MASTER MENU ${monthName} (${totalDays} HARI) ${catTitle}`.trim();
     }
-    return `MASTER MENU ${totalDays} HARI ${bannerCategoryTitle}`.trim();
-  }, [scheduleConfig.durationType, scheduleConfig.calendarMonth, totalDays, bannerCategoryTitle]);
+    return `MASTER MENU ${totalDays} HARI ${catTitle}`.trim();
+  };
+
+  const masterBannerHeadline = useMemo(() => {
+    if (plans.length > 1) {
+      if (scheduleConfig.durationType === "1_bulan") {
+        const monthName = formatIndonesianMonthYear(scheduleConfig.calendarMonth).toUpperCase();
+        return `MASTER MENU ${monthName} (${totalDays} HARI) — ${plans.length} PAKET`;
+      }
+      return `MASTER MENU ${totalDays} HARI — ${plans.length} PAKET`;
+    }
+    return activePlan ? getPlanBannerHeadline(activePlan) : `MASTER MENU ${totalDays} HARI`;
+  }, [plans, activePlan, scheduleConfig.durationType, scheduleConfig.calendarMonth, totalDays]);
 
   const activeKopLeftSrc = leftLogo || defaultLogoSrc;
 
@@ -741,8 +832,36 @@ export default function MasterMenuTab({
           <div className="flex flex-wrap items-center gap-2 shrink-0">
             <button
               type="button"
+              id="btn-toggle-category-picker"
+              onClick={() => setShowCategoryPicker((prev) => !prev)}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer transition whitespace-nowrap border ${
+                showCategoryPicker
+                  ? "bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200"
+                  : "bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200"
+              }`}
+              title={showCategoryPicker ? "Sembunyikan pilihan kategori sasaran" : "Tampilkan pilihan kategori sasaran"}
+            >
+              {showCategoryPicker ? (
+                <>
+                  <EyeOff className="w-3.5 h-3.5" />
+                  <span>Sembunyikan Menu Kategori</span>
+                  <ChevronUp className="w-3.5 h-3.5" />
+                </>
+              ) : (
+                <>
+                  <Eye className="w-3.5 h-3.5" />
+                  <span>Tampilkan Menu Kategori</span>
+                  <ChevronDown className="w-3.5 h-3.5" />
+                </>
+              )}
+            </button>
+            <button
+              type="button"
               id="btn-add-menu-plan"
-              onClick={handleAddPlan}
+              onClick={() => {
+                handleAddPlan();
+                setShowCategoryPicker(true);
+              }}
               className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-pointer transition whitespace-nowrap"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -771,198 +890,283 @@ export default function MasterMenuTab({
         </div>
 
         {/* Plan Switcher Row */}
-        <div className="flex flex-wrap gap-2">
-          {plans.map((p) => {
-            const isActive = activePlan?.id === p.id;
-            const catCount = p.sasaranIds.length;
-            return (
-              <button
-                key={p.id}
-                type="button"
-                onClick={() => handleSelectPlan(p.id)}
-                className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition text-left cursor-pointer ${
-                  isActive
-                    ? "bg-slate-900 text-white border-slate-900 shadow-xs"
-                    : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
-                }`}
-              >
-                <div className="flex items-center gap-2 whitespace-nowrap">
-                  <span>{p.title || "Paket Tanpa Judul"}</span>
-                  <span
-                    className={`text-[10px] font-mono ${
-                      isActive ? "text-emerald-300" : "text-slate-400"
-                    }`}
-                  >
-                    {p.dietType} · {catCount} Kategori
-                  </span>
-                </div>
-              </button>
-            );
-          })}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap gap-2">
+            {plans.map((p) => {
+              const isActive = activePlan?.id === p.id;
+              const catCount = p.sasaranIds.length;
+              const planPm = getPlanTotalPm(p);
+              const isHidden = !!hiddenPlanIds[p.id];
+              const hasAlergiBadge =
+                p.dietType === "Alergi" || p.sasaranIds.some((id) => isAlergiSasaranId(id));
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => handleSelectPlan(p.id)}
+                  className={`px-3.5 py-2 rounded-xl text-xs font-bold border transition text-left cursor-pointer ${
+                    isActive
+                      ? "bg-slate-900 text-white border-slate-900 shadow-xs"
+                      : hasAlergiBadge
+                        ? "bg-orange-50/70 text-slate-800 border-orange-200 hover:bg-orange-100/70"
+                        : "bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100"
+                  }`}
+                >
+                  <div className="flex items-center gap-2 whitespace-nowrap">
+                    <span>{p.title || "Paket Tanpa Judul"}</span>
+                    <span
+                      className={`text-[10px] font-mono ${
+                        isActive ? "text-emerald-300" : hasAlergiBadge ? "text-orange-700" : "text-slate-400"
+                      }`}
+                    >
+                      {p.dietType} · {catCount} Kategori · {planPm.toLocaleString("id-ID")} PM
+                    </span>
+                    {isHidden && (
+                      <span className="px-1.5 py-0.5 rounded bg-slate-200/80 text-slate-700 text-[9px] font-bold">
+                        Disembunyikan
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          {Object.values(hiddenPlanIds).some(Boolean) && (
+            <button
+              type="button"
+              onClick={() => setHiddenPlanIds({})}
+              className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer whitespace-nowrap"
+            >
+              Tampilkan Semua Menu ({plans.length})
+            </button>
+          )}
         </div>
 
-        {/* Active Plan Config: Title + Diet + Multi-Category Sasaran Grid (Gambar 2) */}
-        {activePlan && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 pt-2">
-            {/* Left col: Title, Diet & Quick Presets */}
-            <div className="lg:col-span-4 space-y-4">
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-slate-600 block">
-                  Label Kategori pada Header Tabel (cth: 1-3 SD)
-                </label>
-                <input
-                  type="text"
-                  id="input-plan-title"
-                  value={activePlan.title}
-                  onChange={(e) =>
-                    updateActivePlan((p) => ({ ...p, title: e.target.value }))
-                  }
-                  placeholder="Misal: 1-3 SD atau TK/PAUD & SD 1-3"
-                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600"
-                />
-              </div>
+        {/* Active Plan Config: Multi-Category Sasaran Grid (Gambar 2 - Collapsible) */}
+        {activePlan && showCategoryPicker && (
+          <div className="pt-2">
+            {/* Kelompok Kategori & Jumlah Manfaat Tabel 2 (Gambar 2 + Kategori Alergi) */}
+            <div className="space-y-3">
+              {(() => {
+                const visibleCategories = ALL_KATEGORI_WITH_ALERGI.filter((cat) => {
+                  const pmCnt = getMasterSasaranPmCount(cat.id);
+                  if (categoryViewFilter === "pm_positive") return pmCnt > 0;
+                  if (categoryViewFilter === "standar") return !cat.isAlergi;
+                  if (categoryViewFilter === "alergi") return !!cat.isAlergi;
+                  return true;
+                });
+                const selectedTotalPm = getPlanTotalPm(activePlan);
 
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-slate-600 block">
-                  Jenis Diet / Sinkronisasi Food Cost
-                </label>
-                <select
-                  id="select-plan-diet"
-                  value={activePlan.dietType}
-                  onChange={(e) =>
-                    updateActivePlan((p) => ({
-                      ...p,
-                      dietType: e.target.value as MasterMenuDietType,
-                    }))
-                  }
-                  className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold text-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600"
-                >
-                  {DIET_OPTIONS.map((d) => (
-                    <option key={d.value} value={d.value}>
-                      {d.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-[11px] font-bold text-slate-600 block">
-                  Preset Cepat Gabungan Kategori
-                </label>
-                <div className="flex flex-wrap gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleApplySasaranPreset(["tk_paud_lb", "sd_kelas_1_3"], "1-3 SD & TK/PAUD")
-                    }
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold cursor-pointer"
-                  >
-                    TK & 1-3 SD
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleApplySasaranPreset(
-                        ["sd_kelas_4_6", "smp_mts_smplb", "sma_smk_ma", "pendidik", "tenaga_kependidikan"],
-                        "SD 4-6, SMP, SMA & Pendidik"
-                      )
-                    }
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold cursor-pointer"
-                  >
-                    SD 4-6 s/d SMA
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleApplySasaranPreset(SEKOLAH_SASARAN_IDS, "Usia Sekolah & Pendidik")
-                    }
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold cursor-pointer"
-                  >
-                    Semua Sekolah
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleApplySasaranPreset(
-                        ["anak_balita", "anak_balita_13_59", "ibu_hamil", "ibu_menyusui"],
-                        "3B (Balita, Bumil & Busui)"
-                      )
-                    }
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold cursor-pointer"
-                  >
-                    Kelompok 3B
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleApplySasaranPreset(
-                        MPASI_SASARAN_IDS,
-                        "Balita 6-11 Bulan (MP-ASI)",
-                        "MP-ASI"
-                      )
-                    }
-                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-semibold cursor-pointer"
-                  >
-                    Balita 6-11 Bln
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleApplySasaranPreset(
-                        SASARAN_KATEGORI_LIST.map((s) => s.id),
-                        "Semua Kelompok Sasaran"
-                      )
-                    }
-                    className="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 rounded-lg text-[11px] font-semibold cursor-pointer"
-                  >
-                    Gabung Semua (12)
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Right col: 12 Kelompok Sasaran Multi-Select matching Gambar 2 */}
-            <div className="lg:col-span-8">
-              <div className="border border-slate-300 rounded-xl overflow-hidden">
-                <div
-                  className="px-3.5 py-2 border-b border-slate-300 flex items-center justify-between"
-                  style={{ backgroundColor: "#92D050" }}
-                >
-                  <div className="flex items-center gap-2 text-xs font-extrabold text-slate-950">
-                    <Users className="w-3.5 h-3.5" />
-                    <span>Kelompok Sasaran (Pilih Bebas Satu atau Beberapa Kategori)</span>
-                  </div>
-                  <span className="text-[11px] font-bold text-slate-900 font-mono">
-                    {activePlan.sasaranIds.length} / {SASARAN_KATEGORI_LIST.length} dipilih
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 divide-y sm:divide-y-0 bg-white">
-                  {SASARAN_KATEGORI_LIST.map((sasaran) => {
-                    const checked = activePlan.sasaranIds.includes(sasaran.id);
-                    return (
-                      <label
-                        key={sasaran.id}
-                        className={`flex items-center gap-2.5 px-3 py-2.5 text-xs border-b border-r border-slate-200 cursor-pointer transition select-none ${
-                          checked
-                            ? "bg-emerald-50/70 text-slate-950 font-semibold"
-                            : "bg-white text-slate-700 hover:bg-slate-50"
-                        }`}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() => handleToggleSasaran(sasaran.id)}
-                          className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500 cursor-pointer shrink-0"
-                        />
-                        <span className="truncate" title={sasaran.label}>
-                          {sasaran.label}
+                return (
+                  <div className="border border-slate-200 rounded-2xl p-4 bg-slate-50/40 space-y-3.5">
+                    {/* Header bar matching Gambar 2 */}
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="text-[10px] font-black text-slate-600 uppercase tracking-wider block">
+                          KELOMPOK KATEGORI &amp; JUMLAH PENERIMA MANFAAT (DARI TABEL 2)
                         </span>
-                      </label>
-                    );
-                  })}
-                </div>
-              </div>
+                        <p className="text-[11px] text-slate-500">
+                          Centang 1 atau beberapa kartu kategori (Standar maupun{" "}
+                          <strong className="text-orange-700">Diet Alergi</strong>). Jumlah PM diambil otomatis dari Tabel 2.
+                        </p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setCategoryViewFilter((f) => (f === "pm_positive" ? "all" : "pm_positive"))
+                          }
+                          className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-extrabold transition cursor-pointer ${
+                            categoryViewFilter === "pm_positive"
+                              ? "bg-emerald-600 text-white border-emerald-600"
+                              : "bg-emerald-50 hover:bg-emerald-100 border-emerald-200 text-emerald-800"
+                          }`}
+                        >
+                          Hanya Ada PM &gt; 0
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCategoryViewFilter("standar")}
+                          className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-extrabold transition cursor-pointer ${
+                            categoryViewFilter === "standar"
+                              ? "bg-slate-900 text-white border-slate-900"
+                              : "bg-white hover:bg-slate-100 border-slate-200 text-slate-700"
+                          }`}
+                        >
+                          Standar ({SASARAN_KATEGORI_LIST.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCategoryViewFilter("alergi")}
+                          className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-extrabold transition cursor-pointer ${
+                            categoryViewFilter === "alergi"
+                              ? "bg-orange-600 text-white border-orange-600"
+                              : "bg-orange-50 hover:bg-orange-100 border-orange-200 text-orange-800"
+                          }`}
+                        >
+                          Kategori Alergi ({ALERGI_KATEGORI_LIST.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCategoryViewFilter("all")}
+                          className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-extrabold transition cursor-pointer ${
+                            categoryViewFilter === "all"
+                              ? "bg-indigo-600 text-white border-indigo-600"
+                              : "bg-indigo-50 hover:bg-indigo-100 border-indigo-200 text-indigo-700"
+                          }`}
+                        >
+                          Semua ({ALL_KATEGORI_WITH_ALERGI.length})
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Card Grid matching Gambar 2 */}
+                    {visibleCategories.length === 0 ? (
+                      <div className="p-6 rounded-xl bg-white border border-dashed border-slate-200 text-center text-xs text-slate-500">
+                        Belum ada kategori dengan jumlah PM &gt; 0 di Tabel 2. Klik{" "}
+                        <button
+                          type="button"
+                          onClick={() => setCategoryViewFilter("all")}
+                          className="text-indigo-600 font-bold hover:underline cursor-pointer"
+                        >
+                          Semua ({ALL_KATEGORI_WITH_ALERGI.length})
+                        </button>{" "}
+                        untuk melihat semua kategori.
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 max-h-[430px] overflow-y-auto pr-1">
+                        {visibleCategories.map((sasaran) => {
+                          const checked = activePlan.sasaranIds.includes(sasaran.id);
+                          const porsi = getMasterSasaranPorsi(sasaran.id);
+                          const pmCount = getMasterSasaranPmCount(sasaran.id);
+                          const isAlergi = !!sasaran.isAlergi;
+
+                          return (
+                            <div
+                              key={sasaran.id}
+                              className={`rounded-xl border p-3 transition flex items-start justify-between gap-2 ${
+                                checked
+                                  ? isAlergi
+                                    ? "bg-orange-50/90 border-orange-400 ring-2 ring-orange-500/20 shadow-xs"
+                                    : "bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 shadow-xs"
+                                  : isAlergi
+                                    ? "bg-orange-50/30 border-orange-200/80 hover:border-orange-300"
+                                    : "bg-white border-slate-200 hover:border-slate-300"
+                              }`}
+                            >
+                              <label className="flex items-start gap-2 cursor-pointer min-w-0 flex-1 select-none">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => handleToggleSasaran(sasaran.id)}
+                                  className={`mt-0.5 w-4 h-4 rounded shrink-0 cursor-pointer ${
+                                    isAlergi
+                                      ? "border-orange-300 text-orange-600 focus:ring-orange-500"
+                                      : "border-indigo-300 text-indigo-600 focus:ring-indigo-500"
+                                  }`}
+                                />
+                                <div className="min-w-0">
+                                  <span
+                                    className="text-xs font-black text-slate-900 block break-words leading-snug"
+                                    title={sasaran.label}
+                                  >
+                                    {sasaran.label}
+                                  </span>
+                                  <div className="flex flex-wrap items-center gap-1 mt-1">
+                                    <span
+                                      className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase ${
+                                        porsi === "besar"
+                                          ? "bg-amber-100 text-amber-800"
+                                          : "bg-cyan-100 text-cyan-800"
+                                      }`}
+                                    >
+                                      {porsi === "besar" ? "Porsi Besar" : "Porsi Kecil"}
+                                    </span>
+                                    {isAlergi && (
+                                      <span className="px-1.5 py-0.5 rounded bg-orange-100 text-orange-800 text-[9px] font-black uppercase">
+                                        Diet Alergi
+                                      </span>
+                                    )}
+                                    <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-[9px] font-mono font-bold text-slate-700 tabular-nums">
+                                      {pmCount.toLocaleString("id-ID")} PM
+                                    </span>
+                                  </div>
+                                </div>
+                              </label>
+
+                              {checked && activePlan.sasaranIds.length > 1 && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleToggleSasaran(sasaran.id)}
+                                  title="Batalkan centang kategori ini"
+                                  className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer shrink-0"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Bottom Action Bar matching Gambar 2 */}
+                    <div className="p-3.5 rounded-xl bg-indigo-50 border-2 border-indigo-200 flex flex-col xl:flex-row xl:items-center justify-between gap-3">
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2 flex-1">
+                        <span className="text-xs font-black text-indigo-950 shrink-0">
+                          {activePlan.sasaranIds.length} Kategori Dipilih ({selectedTotalPm.toLocaleString("id-ID")} PM):
+                        </span>
+                        <input
+                          type="text"
+                          value={mergeCustomPlanTitle}
+                          onChange={(e) => setMergeCustomPlanTitle(e.target.value)}
+                          placeholder="Nama Paket Menu gabungan (opsional, kosongkan agar otomatis)"
+                          className="flex-1 bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                        />
+                      </div>
+                      <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          disabled={activePlan.sasaranIds.length === 0}
+                          onClick={() => {
+                            const nextTitle =
+                              mergeCustomPlanTitle.trim() ||
+                              buildCategoryLabelFromIds(activePlan.sasaranIds);
+                            const allAlergiSelected =
+                              activePlan.sasaranIds.length > 0 &&
+                              activePlan.sasaranIds.every((id) => isAlergiSasaranId(id));
+                            updateActivePlan((p) => ({
+                              ...p,
+                              title: nextTitle,
+                              dietType: allAlergiSelected ? "Alergi" : p.dietType,
+                            }));
+                            setMergeCustomPlanTitle("");
+                          }}
+                          className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white rounded-xl text-xs font-black flex items-center gap-1.5 shadow-xs transition cursor-pointer disabled:cursor-not-allowed"
+                        >
+                          <Combine className="w-3.5 h-3.5" />
+                          Satukan {activePlan.sasaranIds.length} Kategori Terpilih ke Paket Ini
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            updateActivePlan((p) => ({
+                              ...p,
+                              sasaranIds: [],
+                              title: "BELUM ADA KATEGORI",
+                            }));
+                            setMergeCustomPlanTitle("");
+                          }}
+                          className="px-3 py-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 rounded-xl text-xs font-bold transition cursor-pointer"
+                        >
+                          Batal Pilih
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </div>
         )}
@@ -1090,125 +1294,190 @@ export default function MasterMenuTab({
         </div>
       </div>
 
-      {/* SECTION 4A: CARD INPUT VIEW (for detailed card editing + explicit Nama Menu Food Cost) */}
-      {viewMode === "cards" && activePlan && (
-        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 no-print">
-          {plannedDates.map((dateStr, idx) => {
-            const item = getDayMenuItem(idx);
-            const autoComposed = composeMenuName(item);
+      {/* SECTION 4A: CARD INPUT VIEW — ALL SELECTED MASTER MENU PLANS STACKED VERTICALLY */}
+      {viewMode === "cards" && plans.length > 0 && (
+        <div className="space-y-6 no-print">
+          {plans.map((plan, planIdx) => {
+            const isHidden = !!hiddenPlanIds[plan.id];
+            const planPm = getPlanTotalPm(plan);
+            const hasAlergi = plan.dietType === "Alergi" || plan.sasaranIds.some((id) => isAlergiSasaranId(id));
             return (
               <div
-                key={idx}
-                className="bg-white rounded-2xl border border-slate-200 p-4 space-y-3 flex flex-col justify-between"
+                key={plan.id}
+                id={`master-plan-cards-${plan.id}`}
+                className="bg-slate-50/70 rounded-2xl border border-slate-200 p-4 space-y-4"
               >
-                <div className="space-y-3">
-                  <div className="flex items-start justify-between gap-2 pb-2.5 border-b border-slate-100">
-                    <div>
-                      <span className="text-[11px] font-extrabold text-emerald-700 font-mono block">
-                        MENU {idx + 1} · {formatIndonesianDate(dateStr)}
-                      </span>
-                      <span className="text-xs font-bold text-slate-800 block mt-0.5 truncate max-w-[230px]">
-                        {autoComposed || "Belum diisi"}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-1 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => handleCopyDay(idx)}
-                        className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-600 cursor-pointer"
-                        title="Salin menu hari ini"
-                      >
-                        <Copy className="w-3.5 h-3.5" />
-                      </button>
-                      {copiedItem && (
-                        <button
-                          type="button"
-                          onClick={() => handlePasteDay(idx)}
-                          className={`p-1.5 rounded-lg cursor-pointer ${
-                            justPastedDay === idx
-                              ? "bg-emerald-100 text-emerald-700"
-                              : "hover:bg-indigo-50 text-indigo-600"
-                          }`}
-                          title="Tempel menu tersalin"
-                        >
-                          {justPastedDay === idx ? (
-                            <Check className="w-3.5 h-3.5" />
-                          ) : (
-                            <Clipboard className="w-3.5 h-3.5" />
-                          )}
-                        </button>
-                      )}
-                      <button
-                        type="button"
-                        onClick={() => handleResetDay(idx)}
-                        className="p-1.5 rounded-lg hover:bg-rose-50 text-rose-500 cursor-pointer"
-                        title="Kosongkan hari ini"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-slate-200/80">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-lg bg-slate-900 text-white text-[10px] font-black uppercase">
+                      Paket {planIdx + 1}
+                    </span>
+                    <h4 className="text-sm font-extrabold text-slate-900">
+                      {plan.title || "Paket Tanpa Judul"}
+                    </h4>
+                    <span
+                      className={`px-2 py-0.5 rounded-lg text-[10px] font-bold ${
+                        hasAlergi ? "bg-orange-100 text-orange-800" : "bg-emerald-100 text-emerald-800"
+                      }`}
+                    >
+                      {plan.dietType} · {plan.sasaranIds.length} Kategori · {planPm.toLocaleString("id-ID")} PM
+                    </span>
                   </div>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        commitMenuUpdate({ ...normalizedMenu, activePlanId: plan.id });
+                        setShowCategoryPicker(true);
+                      }}
+                      className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 text-[11px] font-bold text-slate-700 cursor-pointer"
+                    >
+                      Edit Kategori
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleHidePlan(plan.id)}
+                      className="px-2.5 py-1.5 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 text-[11px] font-bold text-slate-700 flex items-center gap-1 cursor-pointer"
+                    >
+                      {isHidden ? (
+                        <>
+                          <Eye className="w-3.5 h-3.5 text-indigo-600" />
+                          Tampilkan Menu
+                        </>
+                      ) : (
+                        <>
+                          <EyeOff className="w-3.5 h-3.5 text-slate-500" />
+                          Sembunyikan Menu
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
 
-                  <div className="space-y-2 text-xs">
-                    <div>
-                      <label className="text-[10px] font-bold text-indigo-700 block mb-0.5">
-                        Nama Menu (Otomatis ke Panel Food Cost)
-                      </label>
-                      <input
-                        type="text"
-                        value={item.namaMenu}
-                        onChange={(e) => handleDayFieldChange(idx, "namaMenu", e.target.value)}
-                        placeholder={
-                          autoComposed ||
-                          "Ketik dipisah koma: Nasi Putih, Ikan Goreng, Tahu, Sayur, Buah, Susu"
-                        }
-                        className="w-full px-2.5 py-1.5 bg-indigo-50/40 border border-indigo-200 rounded-lg text-xs font-bold text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
-                      />
-                      <p className="text-[10px] text-slate-500 mt-1 leading-tight">
-                        Pisahkan dengan tanda koma (<span className="font-bold text-indigo-700">,</span>) untuk mengisi otomatis baris Makanan Pokok → Lauk Hewani → Lauk Nabati → Sayuran → Buah → Susu.
-                      </p>
-                    </div>
-
-                    {MENU_COMPONENT_ROWS.map((row, rowIdx) => {
-                      const hasCommaDraft = (item.namaMenu || "").includes(",");
-                      const activeCommaStep = hasCommaDraft
-                        ? Math.min(MENU_COMPONENT_ROWS.length - 1, (item.namaMenu || "").split(",").length - 1)
-                        : -1;
-                      const isActiveStep = activeCommaStep === rowIdx;
+                {!isHidden && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                    {plannedDates.map((dateStr, idx) => {
+                      const item = getPlanDayMenuItem(plan, idx);
+                      const autoComposed = composeMenuName(item);
+                      const pasteKey = `${plan.id}:${idx}`;
                       return (
-                        <div key={row.key} className="grid grid-cols-12 items-center gap-2">
-                          <span
-                            className={`col-span-4 text-[11px] font-semibold ${
-                              isActiveStep ? "text-indigo-700 font-bold" : "text-slate-600"
-                            }`}
-                          >
-                            {row.label}
-                          </span>
-                          <input
-                            type="text"
-                            value={item[row.key] || ""}
-                            onChange={(e) => handleDayFieldChange(idx, row.key, e.target.value)}
-                            placeholder={row.placeholder}
-                            className={`col-span-8 px-2.5 py-1.5 rounded-lg text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:bg-white border ${
-                              isActiveStep
-                                ? "bg-indigo-50/50 border-indigo-300"
-                                : (item[row.key] || "").trim()
-                                  ? "bg-emerald-50/35 border-emerald-200"
-                                  : "bg-slate-50 border-slate-200"
-                            }`}
-                          />
+                        <div
+                          key={idx}
+                          className="bg-white rounded-2xl border border-slate-200 p-4 space-y-3 flex flex-col justify-between"
+                        >
+                          <div className="space-y-3">
+                            <div className="flex items-start justify-between gap-2 pb-2.5 border-b border-slate-100">
+                              <div>
+                                <span className="text-[11px] font-extrabold text-emerald-700 font-mono block">
+                                  MENU {idx + 1} · {formatIndonesianDate(dateStr)}
+                                </span>
+                                <span className="text-xs font-bold text-slate-800 block mt-0.5 truncate max-w-[230px]">
+                                  {autoComposed || "Belum diisi"}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1 shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() => handleCopyDay(plan, idx)}
+                                  className="p-1.5 rounded-lg hover:bg-slate-100 text-slate-600 cursor-pointer"
+                                  title="Salin menu hari ini"
+                                >
+                                  <Copy className="w-3.5 h-3.5" />
+                                </button>
+                                {copiedItem && (
+                                  <button
+                                    type="button"
+                                    onClick={() => handlePasteDay(plan.id, idx)}
+                                    className={`p-1.5 rounded-lg cursor-pointer ${
+                                      justPastedKey === pasteKey
+                                        ? "bg-emerald-100 text-emerald-700"
+                                        : "hover:bg-indigo-50 text-indigo-600"
+                                    }`}
+                                    title="Tempel menu tersalin"
+                                  >
+                                    {justPastedKey === pasteKey ? (
+                                      <Check className="w-3.5 h-3.5" />
+                                    ) : (
+                                      <Clipboard className="w-3.5 h-3.5" />
+                                    )}
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => handleResetDay(plan, idx)}
+                                  className="p-1.5 rounded-lg hover:bg-rose-50 text-rose-500 cursor-pointer"
+                                  title="Kosongkan hari ini"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+
+                            <div className="space-y-2 text-xs">
+                              <div>
+                                <label className="text-[10px] font-bold text-indigo-700 block mb-0.5">
+                                  Nama Menu (Otomatis ke Panel Food Cost)
+                                </label>
+                                <input
+                                  type="text"
+                                  value={item.namaMenu}
+                                  onChange={(e) => handlePlanDayFieldChange(plan.id, idx, "namaMenu", e.target.value)}
+                                  placeholder={
+                                    autoComposed ||
+                                    "Ketik dipisah koma: Nasi Putih, Ikan Goreng, Tahu, Sayur, Buah, Susu"
+                                  }
+                                  className="w-full px-2.5 py-1.5 bg-indigo-50/40 border border-indigo-200 rounded-lg text-xs font-bold text-slate-800 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                />
+                                <p className="text-[10px] text-slate-500 mt-1 leading-tight">
+                                  Pisahkan dengan tanda koma (<span className="font-bold text-indigo-700">,</span>) untuk mengisi otomatis baris Makanan Pokok → Lauk Hewani → Lauk Nabati → Sayuran → Buah → Susu.
+                                </p>
+                              </div>
+
+                              {MENU_COMPONENT_ROWS.map((row, rowIdx) => {
+                                const hasCommaDraft = (item.namaMenu || "").includes(",");
+                                const activeCommaStep = hasCommaDraft
+                                  ? Math.min(MENU_COMPONENT_ROWS.length - 1, (item.namaMenu || "").split(",").length - 1)
+                                  : -1;
+                                const isActiveStep = activeCommaStep === rowIdx;
+                                return (
+                                  <div key={row.key} className="grid grid-cols-12 items-center gap-2">
+                                    <span
+                                      className={`col-span-4 text-[11px] font-semibold ${
+                                        isActiveStep ? "text-indigo-700 font-bold" : "text-slate-600"
+                                      }`}
+                                    >
+                                      {row.label}
+                                    </span>
+                                    <input
+                                      type="text"
+                                      value={item[row.key] || ""}
+                                      onChange={(e) => handlePlanDayFieldChange(plan.id, idx, row.key, e.target.value)}
+                                      placeholder={row.placeholder}
+                                      className={`col-span-8 px-2.5 py-1.5 rounded-lg text-xs text-slate-800 focus:outline-none focus:ring-1 focus:ring-emerald-500 focus:bg-white border ${
+                                        isActiveStep
+                                          ? "bg-indigo-50/50 border-indigo-300"
+                                          : (item[row.key] || "").trim()
+                                            ? "bg-emerald-50/35 border-emerald-200"
+                                            : "bg-slate-50 border-slate-200"
+                                      }`}
+                                    />
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
                         </div>
                       );
                     })}
                   </div>
-                </div>
+                )}
               </div>
             );
           })}
         </div>
       )}
 
-      {/* SECTION 4B: TABEL MASTER MENU RESMI (GAMBAR 1 - ALWAYS RENDERED FOR PRINT / TABLE EDIT / PRINT PREVIEW) */}
+      {/* SECTION 4B: TABEL MASTER MENU RESMI — MENAMPILKAN KESELURUHAN MASTER MENU YANG DIPILIH BERGULIR KE BAWAH */}
       <div
         className={`${
           viewMode === "cards" ? "hidden print:block" : "block"
@@ -1216,155 +1485,230 @@ export default function MasterMenuTab({
       >
         <div
           id="print-area-master-menu"
-          className="bg-white p-4 sm:p-6 mx-auto border border-slate-300 shadow-sm min-w-[980px] max-w-[1400px] text-black print:shadow-none print:border-none print:p-0 print:max-w-full"
+          className="space-y-8 print:space-y-0 mx-auto min-w-[980px] max-w-[1400px] print:max-w-full"
           style={{ fontFamily: "Arial, Helvetica, sans-serif" }}
         >
-          {/* KOP SURAT TERPUSAT SPPG */}
-          <KopSuratRenderHeader
-            kopLine1={kopLine1 || "BADAN GIZI NASIONAL"}
-            kopLine2={kopLine2 || "SATUAN PELAYANAN PEMENUHAN GIZI"}
-            kopLine3={kopLine3 || profile?.namaLembaga || "SPPG"}
-            kopLine4={kopLine4 || (profile?.alamat ? `Alamat : ${profile.alamat}` : "")}
-            leftLogo={activeKopLeftSrc}
-            rightLogo={rightLogo}
-            leftLogoCrop={leftLogoCrop}
-            rightLogoCrop={rightLogoCrop}
-            kopConfig={kopConfig}
-            docKey="menu"
-          />
-
-          {/* FULL-WIDTH GREEN TITLE BANNER (GAMBAR 1) */}
-          <table className="w-full border-collapse border border-black text-[10.5pt]">
-            <thead>
-              <tr>
-                <th
-                  className="border border-black py-1.5 px-2 text-center font-extrabold uppercase text-black"
-                  style={{ backgroundColor: "#00B050", fontSize: "14pt" }}
-                >
-                  {masterBannerHeadline}
-                </th>
-              </tr>
-            </thead>
-          </table>
-
-          {/* WEEKLY BLOCKS MATCHING GAMBAR 1 */}
-          {weekBlocks.map((week) => {
-            const colWidthPct = `${84 / Math.max(week.days.length, 1)}%`;
+          {plans.map((plan, planIdx) => {
+            const isHidden = !!hiddenPlanIds[plan.id];
+            const planHeadline = getPlanBannerHeadline(plan);
+            const planPm = getPlanTotalPm(plan);
+            const hasAlergi = plan.dietType === "Alergi" || plan.sasaranIds.some((id) => isAlergiSasaranId(id));
             return (
-              <table
-                key={week.weekNumber}
-                className="w-full border-collapse border border-black table-fixed -mt-[1px] break-inside-avoid"
-                style={{ fontSize: "10pt" }}
+              <div
+                key={plan.id}
+                id={`master-plan-section-${plan.id}`}
+                className={`bg-white border border-slate-300 shadow-sm text-black print:shadow-none print:border-none ${
+                  planIdx > 0 ? "print:break-before-page" : ""
+                } ${isHidden ? "no-print" : ""}`}
               >
-                <thead>
-                  {/* Yellow Header Row: Kelompok Bahan Makanan + Calendar Dates */}
-                  <tr style={{ backgroundColor: "#FFFF00" }}>
-                    <th
-                      className="border border-black py-1.5 px-2 text-center font-bold text-black align-middle"
-                      style={{ backgroundColor: "#FFFF00", width: "16%" }}
+                {/* Plan Toolbar Bar (no-print): Edit Kategori + Sembunyikan/Tampilkan Menu */}
+                <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 no-print">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="px-2 py-0.5 rounded-md bg-slate-900 text-white text-[10px] font-black uppercase">
+                      Master Menu {planIdx + 1}
+                    </span>
+                    <span className="text-xs font-extrabold text-slate-900">
+                      {plan.title || "Paket Tanpa Judul"}
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                        hasAlergi ? "bg-orange-100 text-orange-800" : "bg-emerald-100 text-emerald-800"
+                      }`}
                     >
-                      {week.weekNumber === 1
-                        ? "Kelompok Bahan Makanan"
-                        : "Kelompok bahan makanan"}
-                    </th>
-                    {week.days.map((d) => (
-                      <th
-                        key={d.dayIndex}
-                        className="border border-black py-1.5 px-1.5 text-center font-bold text-black align-middle"
-                        style={{ backgroundColor: "#FFFF00", width: colWidthPct }}
-                      >
-                        {formatIndonesianDate(d.dateStr) || `Hari ${d.menuNumber}`}
-                      </th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {/* 6 Component Rows matching Gambar 1 */}
-                  {MENU_COMPONENT_ROWS.map((comp) => (
-                    <tr key={comp.key} className="bg-white">
-                      <td className="border border-black py-1 px-2 text-left font-bold text-black align-middle bg-white">
-                        {comp.label}
-                      </td>
-                      {week.days.map((d) => {
-                        const dayItem = getDayMenuItem(d.dayIndex);
-                        const val = dayItem[comp.key] || "";
-                        return (
-                          <td
-                            key={d.dayIndex}
-                            className="border border-black p-0.5 text-center align-middle bg-white"
+                      {plan.dietType} · {plan.sasaranIds.length} Kategori · {planPm.toLocaleString("id-ID")} PM
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        commitMenuUpdate({ ...normalizedMenu, activePlanId: plan.id });
+                        setShowCategoryPicker(true);
+                      }}
+                      className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 text-[11px] font-bold text-slate-700 cursor-pointer"
+                    >
+                      Edit Kategori
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleResetPlanDays(plan)}
+                      className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-[11px] font-bold text-rose-700 cursor-pointer"
+                    >
+                      Reset
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => toggleHidePlan(plan.id)}
+                      className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 hover:bg-slate-100 text-[11px] font-bold text-slate-700 flex items-center gap-1 cursor-pointer"
+                    >
+                      {isHidden ? (
+                        <>
+                          <Eye className="w-3.5 h-3.5 text-indigo-600" />
+                          Tampilkan Menu
+                        </>
+                      ) : (
+                        <>
+                          <EyeOff className="w-3.5 h-3.5 text-slate-500" />
+                          Sembunyikan Menu
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {!isHidden && (
+                  <div className="p-4 sm:p-6 print:p-0">
+                    {/* KOP SURAT TERPUSAT SPPG */}
+                    <KopSuratRenderHeader
+                      kopLine1={kopLine1 || "BADAN GIZI NASIONAL"}
+                      kopLine2={kopLine2 || "SATUAN PELAYANAN PEMENUHAN GIZI"}
+                      kopLine3={kopLine3 || profile?.namaLembaga || "SPPG"}
+                      kopLine4={kopLine4 || (profile?.alamat ? `Alamat : ${profile.alamat}` : "")}
+                      leftLogo={activeKopLeftSrc}
+                      rightLogo={rightLogo}
+                      leftLogoCrop={leftLogoCrop}
+                      rightLogoCrop={rightLogoCrop}
+                      kopConfig={kopConfig}
+                      docKey="menu"
+                    />
+
+                    {/* FULL-WIDTH GREEN TITLE BANNER (GAMBAR 1) */}
+                    <table className="w-full border-collapse border border-black text-[10.5pt]">
+                      <thead>
+                        <tr>
+                          <th
+                            className="border border-black py-1.5 px-2 text-center font-extrabold uppercase text-black"
+                            style={{ backgroundColor: "#00B050", fontSize: "14pt" }}
                           >
-                            {viewMode === "print" ? (
-                              <div className="px-1 py-1 text-center font-medium text-black leading-tight min-h-[26px] flex items-center justify-center">
-                                {val}
-                              </div>
-                            ) : (
-                              <textarea
-                                rows={val.length > 26 ? 2 : 1}
-                                value={val}
-                                onChange={(e) =>
-                                  handleDayFieldChange(d.dayIndex, comp.key, e.target.value)
-                                }
-                                placeholder="-"
-                                className="w-full text-center bg-transparent border-0 focus:ring-1 focus:ring-emerald-600 focus:bg-emerald-50/30 rounded-xs px-1 py-0.5 text-black font-medium leading-tight resize-none overflow-hidden"
-                                style={{ fontSize: "10pt" }}
-                              />
+                            {planHeadline}
+                          </th>
+                        </tr>
+                      </thead>
+                    </table>
+
+                    {/* WEEKLY BLOCKS MATCHING GAMBAR 1 */}
+                    {weekBlocks.map((week) => {
+                      const colWidthPct = `${84 / Math.max(week.days.length, 1)}%`;
+                      return (
+                        <table
+                          key={week.weekNumber}
+                          className="w-full border-collapse border border-black table-fixed -mt-[1px] break-inside-avoid"
+                          style={{ fontSize: "10pt" }}
+                        >
+                          <thead>
+                            {/* Yellow Header Row: Kelompok Bahan Makanan + Calendar Dates */}
+                            <tr style={{ backgroundColor: "#FFFF00" }}>
+                              <th
+                                className="border border-black py-1.5 px-2 text-center font-bold text-black align-middle"
+                                style={{ backgroundColor: "#FFFF00", width: "16%" }}
+                              >
+                                {week.weekNumber === 1
+                                  ? "Kelompok Bahan Makanan"
+                                  : "Kelompok bahan makanan"}
+                              </th>
+                              {week.days.map((d) => (
+                                <th
+                                  key={d.dayIndex}
+                                  className="border border-black py-1.5 px-1.5 text-center font-bold text-black align-middle"
+                                  style={{ backgroundColor: "#FFFF00", width: colWidthPct }}
+                                >
+                                  {formatIndonesianDate(d.dateStr) || `Hari ${d.menuNumber}`}
+                                </th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {/* 6 Component Rows matching Gambar 1 */}
+                            {MENU_COMPONENT_ROWS.map((comp) => (
+                              <tr key={comp.key} className="bg-white">
+                                <td className="border border-black py-1 px-2 text-left font-bold text-black align-middle bg-white">
+                                  {comp.label}
+                                </td>
+                                {week.days.map((d) => {
+                                  const dayItem = getPlanDayMenuItem(plan, d.dayIndex);
+                                  const val = dayItem[comp.key] || "";
+                                  return (
+                                    <td
+                                      key={d.dayIndex}
+                                      className="border border-black p-0.5 text-center align-middle bg-white"
+                                    >
+                                      {viewMode === "print" ? (
+                                        <div className="px-1 py-1 text-center font-medium text-black leading-tight min-h-[26px] flex items-center justify-center">
+                                          {val}
+                                        </div>
+                                      ) : (
+                                        <textarea
+                                          rows={val.length > 26 ? 2 : 1}
+                                          value={val}
+                                          onChange={(e) =>
+                                            handlePlanDayFieldChange(plan.id, d.dayIndex, comp.key, e.target.value)
+                                          }
+                                          placeholder="-"
+                                          className="w-full text-center bg-transparent border-0 focus:ring-1 focus:ring-emerald-600 focus:bg-emerald-50/30 rounded-xs px-1 py-0.5 text-black font-medium leading-tight resize-none overflow-hidden"
+                                          style={{ fontSize: "10pt" }}
+                                        />
+                                      )}
+                                    </td>
+                                  );
+                                })}
+                              </tr>
+                            ))}
+
+                            {/* Optional Inline Nama Menu row (hidden when printing so printed table matches Gambar 1) */}
+                            {viewMode === "table" && (
+                              <tr className="bg-slate-50 no-print">
+                                <td className="border border-black py-1 px-2 text-left font-bold text-indigo-800 text-[9pt] align-middle">
+                                  Nama Menu (Food Cost)
+                                </td>
+                                {week.days.map((d) => {
+                                  const dayItem = getPlanDayMenuItem(plan, d.dayIndex);
+                                  const autoComposed = composeMenuName(dayItem);
+                                  return (
+                                    <td key={d.dayIndex} className="border border-black p-0.5 align-middle">
+                                      <input
+                                        type="text"
+                                        value={dayItem.namaMenu || ""}
+                                        onChange={(e) =>
+                                          handlePlanDayFieldChange(plan.id, d.dayIndex, "namaMenu", e.target.value)
+                                        }
+                                        placeholder={autoComposed || `Menu ${d.menuNumber}`}
+                                        title="Opsional: isi judul menu khusus atau biarkan kosong untuk otomatis dari komponen di atas"
+                                        className="w-full text-center bg-white/80 border-0 focus:ring-1 focus:ring-indigo-500 px-1 py-0.5 text-[9pt] font-semibold text-indigo-900 placeholder:text-slate-400"
+                                      />
+                                    </td>
+                                  );
+                                })}
+                              </tr>
                             )}
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  ))}
 
-                  {/* Optional Inline Nama Menu row (hidden when printing so printed table matches Gambar 1) */}
-                  {viewMode === "table" && (
-                    <tr className="bg-slate-50 no-print">
-                      <td className="border border-black py-1 px-2 text-left font-bold text-indigo-800 text-[9pt] align-middle">
-                        Nama Menu (Food Cost)
-                      </td>
-                      {week.days.map((d) => {
-                        const dayItem = getDayMenuItem(d.dayIndex);
-                        const autoComposed = composeMenuName(dayItem);
-                        return (
-                          <td key={d.dayIndex} className="border border-black p-0.5 align-middle">
-                            <input
-                              type="text"
-                              value={dayItem.namaMenu || ""}
-                              onChange={(e) =>
-                                handleDayFieldChange(d.dayIndex, "namaMenu", e.target.value)
-                              }
-                              placeholder={autoComposed || `Menu ${d.menuNumber}`}
-                              title="Opsional: isi judul menu khusus atau biarkan kosong untuk otomatis dari komponen di atas"
-                              className="w-full text-center bg-white/80 border-0 focus:ring-1 focus:ring-indigo-500 px-1 py-0.5 text-[9pt] font-semibold text-indigo-900 placeholder:text-slate-400"
-                            />
-                          </td>
-                        );
-                      })}
-                    </tr>
-                  )}
-
-                  {/* Green Summary Footer Row: Minggu Ke- X | MENU 1..N */}
-                  <tr style={{ backgroundColor: "#00B050" }}>
-                    <td
-                      className="border border-black py-1 px-2 text-center font-bold text-black align-middle"
-                      style={{ backgroundColor: "#00B050" }}
-                    >
-                      Minggu Ke- {week.weekNumber}
-                    </td>
-                    {week.days.map((d) => (
-                      <td
-                        key={d.dayIndex}
-                        className="border border-black py-1 px-1 text-center font-bold text-black align-middle font-mono"
-                        style={{ backgroundColor: "#00B050" }}
-                      >
-                        MENU {d.menuNumber}
-                      </td>
-                    ))}
-                  </tr>
-                </tbody>
-              </table>
+                            {/* Green Summary Footer Row: Minggu Ke- X | MENU 1..N */}
+                            <tr style={{ backgroundColor: "#00B050" }}>
+                              <td
+                                className="border border-black py-1 px-2 text-center font-bold text-black align-middle"
+                                style={{ backgroundColor: "#00B050" }}
+                              >
+                                Minggu Ke- {week.weekNumber}
+                              </td>
+                              {week.days.map((d) => (
+                                <td
+                                  key={d.dayIndex}
+                                  className="border border-black py-1 px-1 text-center font-bold text-black align-middle font-mono"
+                                  style={{ backgroundColor: "#00B050" }}
+                                >
+                                  MENU {d.menuNumber}
+                                </td>
+                              ))}
+                            </tr>
+                          </tbody>
+                        </table>
+                      );
+                    })}
+                    <AutoSignatureBlock profile={profile} docKey="menu" />
+                  </div>
+                )}
+              </div>
             );
           })}
-          <AutoSignatureBlock profile={profile} docKey="menu" />
         </div>
       </div>
 

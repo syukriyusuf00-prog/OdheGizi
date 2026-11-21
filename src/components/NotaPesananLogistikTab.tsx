@@ -14,6 +14,7 @@ import {
   DEFAULT_UNIFIED_KOP_CONFIG,
 } from "../types";
 import { calculateDay, formatRupiah } from "../utils/calc";
+import { resolveSasaranPmFromTable2 } from "../utils/menuSchedule";
 import {
   Printer,
   Download,
@@ -685,26 +686,12 @@ export default function NotaPesananLogistikTab({
         matchingDays.forEach((dayData) => {
           const isAlergi = dayData.jenisMenu.includes("Alergi");
 
-          const getCategoryPmCount = (sId: string, porsi: "besar" | "kecil"): number => {
-            const sasItem = dayPM.sasaran?.find((item) => item.id === sId);
-            if (!sasItem) return 0;
-            const isShared =
-              sId === "sampel" ||
-              (besarSasaranIds.includes(sId) && kecilSasaranIds.includes(sId));
-            if (isAlergi) {
-              const cAlergi =
-                porsi === "besar"
-                  ? Number(sasItem.alergiBesar) || 0
-                  : Number(sasItem.alergiKecil) || 0;
-              const cNormal = isShared
-                ? Number(porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
-                : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
-              return cAlergi > 0 ? cAlergi : cNormal;
-            }
-            return isShared
-              ? Number(porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
-              : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
-          };
+          const sharedIds = [
+            "sampel",
+            ...besarSasaranIds.filter((id) => kecilSasaranIds.includes(id)),
+          ];
+          const getCategoryPmCount = (sId: string, porsi: "besar" | "kecil"): number =>
+            resolveSasaranPmFromTable2(dayPM.sasaran, sId, porsi, isAlergi, sharedIds);
 
           if (
             dayData.activeMode === "kategori" &&

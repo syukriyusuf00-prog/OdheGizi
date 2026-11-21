@@ -55,6 +55,7 @@ import {
   ensureMasterMenuPlans,
   formatIndonesianDate,
   formatIndonesianMonthYear,
+  resolveSasaranPmFromTable2,
 } from "../utils/menuSchedule";
 import {
   ArchiveCategory,
@@ -314,27 +315,15 @@ function buildFoodCostAndNotaForDay(
         if (ce.customPmCount !== undefined) {
           entryPm = Math.max(0, Number(ce.customPmCount) || 0);
         } else {
-          (ce.sasaranIds || []).forEach((sId) => {
-            const sasItem = (dayPM.sasaran || []).find((item) => item.id === sId);
-            if (!sasItem) return;
-            const isShared =
-              sId === "sampel" ||
-              (besarSasaranIds.includes(sId) && kecilSasaranIds.includes(sId));
-            if (isAlergi) {
-              const cAlergi =
-                ce.porsi === "besar"
-                  ? Number(sasItem.alergiBesar) || 0
-                  : Number(sasItem.alergiKecil) || 0;
-              const cNormal = isShared
-                ? Number(ce.porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
-                : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
-              entryPm += cAlergi > 0 ? cAlergi : cNormal;
-            } else {
-              entryPm += isShared
-                ? Number(ce.porsi === "besar" ? sasItem.porsiBesar : sasItem.porsiKecil) || 0
-                : (Number(sasItem.porsiKecil) || 0) + (Number(sasItem.porsiBesar) || 0);
-            }
-          });
+          const sharedIds = [
+            "sampel",
+            ...besarSasaranIds.filter((id) => kecilSasaranIds.includes(id)),
+          ];
+          entryPm = (ce.sasaranIds || []).reduce(
+            (sum, sId) =>
+              sum + resolveSasaranPmFromTable2(dayPM.sasaran, sId, ce.porsi, isAlergi, sharedIds),
+            0
+          );
         }
 
         const entryBuf = ce.bufferPct ?? fc.bufferPct ?? 5;

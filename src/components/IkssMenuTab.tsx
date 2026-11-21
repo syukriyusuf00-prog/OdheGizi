@@ -58,6 +58,8 @@ import {
   SASARAN_KATEGORI_LIST,
   composeMenuName,
   ensureMasterMenuPlans,
+  resolveSasaranPmFromTable2,
+  stripAlergiPrefix,
 } from "../utils/menuSchedule";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
 import { printElementSmart, exportToPDF } from "../lib/printUtils";
@@ -1009,12 +1011,16 @@ export default function IkssMenuTab({
               Array.isArray(fc.categoryEntries) &&
               fc.categoryEntries.length > 0
             ) {
+              const isAlergi = fc.jenisMenu.toLowerCase().includes("alergi");
               const matchingEntries = fc.categoryEntries.filter((ce) =>
-                (ce.sasaranIds || []).some((id) => wsSasaranSet.has(id))
+                (ce.sasaranIds || []).some((id) =>
+                  isAlergi
+                    ? wsSasaranSet.has(id) || wsSasaranSet.has(stripAlergiPrefix(id))
+                    : wsSasaranSet.has(id)
+                )
               );
               const targetEntries = matchingEntries.length > 0 ? matchingEntries : fc.categoryEntries;
               const dayPM = pmByDay.get(hariKe);
-              const isAlergi = fc.jenisMenu.toLowerCase().includes("alergi");
 
               for (let eIdx = 0; eIdx < targetEntries.length; eIdx++) {
                 const ce = targetEntries[eIdx];
@@ -1027,17 +1033,11 @@ export default function IkssMenuTab({
                 if (ce.customPmCount !== undefined) {
                   cePm = Math.max(0, Number(ce.customPmCount) || 0);
                 } else if (dayPM?.sasaran) {
-                  (ce.sasaranIds || []).forEach((sId) => {
-                    const sas = dayPM.sasaran?.find((x) => x.id === sId);
-                    if (!sas) return;
-                    if (isAlergi) {
-                      const cA = ce.porsi === "besar" ? Number(sas.alergiBesar) || 0 : Number(sas.alergiKecil) || 0;
-                      const cN = ce.porsi === "besar" ? Number(sas.porsiBesar) || 0 : Number(sas.porsiKecil) || 0;
-                      cePm += cA > 0 ? cA : cN;
-                    } else {
-                      cePm += ce.porsi === "besar" ? Number(sas.porsiBesar) || 0 : Number(sas.porsiKecil) || 0;
-                    }
-                  });
+                  cePm = (ce.sasaranIds || []).reduce(
+                    (sum, sId) =>
+                      sum + resolveSasaranPmFromTable2(dayPM.sasaran, sId, ce.porsi, isAlergi, ["sampel"]),
+                    0
+                  );
                 }
 
                 const calcCat =

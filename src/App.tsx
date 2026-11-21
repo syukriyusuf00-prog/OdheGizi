@@ -23,7 +23,7 @@ import {
 } from "./initialData";
 import { INITIAL_TKPI_DATABASE } from "./tkpiData";
 import { getCountsForDay } from "./utils/calc";
-import { composeMenuName, ensureMasterMenuPlans, MPASI_SASARAN_IDS, SEKOLAH_SASARAN_IDS } from "./utils/menuSchedule";
+import { composeMenuName, ensureMasterMenuPlans, isAlergiSasaranId, MPASI_SASARAN_IDS, SEKOLAH_SASARAN_IDS, stripAlergiPrefix } from "./utils/menuSchedule";
 
 // Components
 import SPPGProfileTab from "./components/SPPGProfileTab";
@@ -3714,6 +3714,8 @@ export default function App() {
             menu={masterMenu} 
             onChange={setMasterMenu} 
             profile={profile}
+            harianPM={harianPM}
+            pmSettings={pmSettings}
             onProfileChange={(updatedProfile) => {
               autoArchiveOnDateChange(profile, updatedProfile.periodeDates || []);
               setProfile(updatedProfile);
@@ -3758,14 +3760,22 @@ export default function App() {
 
               plans.forEach((plan) => {
                 const targets: FoodCostDay["jenisMenu"][] = [];
-                const hasSekolah = plan.sasaranIds.some((id) => SEKOLAH_SASARAN_IDS.includes(id));
-                const hasMpAsi = plan.sasaranIds.some((id) => MPASI_SASARAN_IDS.includes(id));
-                const has3B = plan.sasaranIds.some((id) =>
-                  ["anak_balita", "anak_balita_13_59", "ibu_hamil", "ibu_menyusui"].includes(id)
+                const hasSekolah = plan.sasaranIds.some((id) =>
+                  SEKOLAH_SASARAN_IDS.includes(stripAlergiPrefix(id))
                 );
+                const hasMpAsi = plan.sasaranIds.some((id) =>
+                  MPASI_SASARAN_IDS.includes(stripAlergiPrefix(id))
+                );
+                const has3B = plan.sasaranIds.some((id) =>
+                  ["anak_balita", "anak_balita_13_59", "ibu_hamil", "ibu_menyusui"].includes(
+                    stripAlergiPrefix(id)
+                  )
+                );
+                const isAlergiPlan =
+                  plan.dietType === "Alergi" || plan.sasaranIds.some((id) => isAlergiSasaranId(id));
 
                 if (hasSekolah) {
-                  if (plan.dietType === "Alergi") targets.push("Alergi");
+                  if (isAlergiPlan) targets.push("Alergi");
                   else if (plan.dietType === "Kering") targets.push("Kering");
                   else targets.push("Basah");
                 }
@@ -3773,7 +3783,7 @@ export default function App() {
                   targets.push("MP-ASI");
                 }
                 if (has3B) {
-                  if (plan.dietType === "Alergi") targets.push("3B-Alergi");
+                  if (isAlergiPlan) targets.push("3B-Alergi");
                   else if (plan.dietType === "Kering") targets.push("3B-Kering");
                   else if (plan.dietType !== "MP-ASI") targets.push("3B-Basah");
                 }

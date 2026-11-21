@@ -6,9 +6,9 @@
 import React, { useState, useEffect, useRef, useMemo } from "react";
 import { FoodCostDay, TKPIItem, MasterMenu, HariPM, SPPGProfile, UnifiedKopConfig, DEFAULT_UNIFIED_KOP_CONFIG } from "../types";
 import { calculateDay, formatRupiah, getCountsForDay, getDayPMBreakdown, getPeriodPMAndRABSummary } from "../utils/calc";
-import { composeMenuName, formatIndonesianDate } from "../utils/menuSchedule";
+import { composeMenuName, formatIndonesianDate, resolveSasaranPmFromTable2 } from "../utils/menuSchedule";
 import { TARGET_AKG_LIMITS } from "../tkpiData";
-import { PieChart, ListOrdered, PiggyBank, CalendarRange, CalendarDays, TrendingDown, TrendingUp, AlertTriangle, Printer, Download, Image as ImageIcon, Eye, X, ZoomIn, RefreshCw, RotateCcw, FlaskConical, Users, Wallet } from "lucide-react";
+import { PieChart, ListOrdered, PiggyBank, CalendarRange, CalendarDays, TrendingDown, TrendingUp, AlertTriangle, Printer, Download, Image as ImageIcon, Eye, X, ZoomIn, RefreshCw, RotateCcw, Users, Wallet } from "lucide-react";
 import { downloadElementAsImage, exportToPDF, printElementSmart } from "../lib/printUtils";
 import { KopSuratRenderHeader, LogoCrop } from "./KopSuratConfigSection";
 import AutoSignatureBlock from "./AutoSignatureBlock";
@@ -373,11 +373,18 @@ export default function DashboardOutputs({
       const entryPm =
         ce.customPmCount !== undefined
           ? Math.max(0, Number(ce.customPmCount) || 0)
-          : (ce.sasaranIds || []).reduce((sum, sId) => {
-              const sas = dayPM?.sasaran?.find((x) => x.id === sId);
-              if (!sas) return sum;
-              return sum + (ce.porsi === "besar" ? Number(sas.porsiBesar) || 0 : Number(sas.porsiKecil) || 0);
-            }, 0);
+          : (ce.sasaranIds || []).reduce(
+              (sum, sId) =>
+                sum +
+                resolveSasaranPmFromTable2(
+                  dayPM?.sasaran,
+                  sId,
+                  ce.porsi,
+                  String(fcDay.jenisMenu || "").toLowerCase().includes("alergi"),
+                  ["sampel"]
+                ),
+              0
+            );
       const entryBuf = ce.bufferPct ?? fcDay.bufferPct ?? 5;
       const res =
         ce.porsi === "besar"
@@ -688,109 +695,7 @@ export default function DashboardOutputs({
 
         {/* Ringkasan PM & Estimasi RAB Harian (dengan Tanggal) + Keseluruhan Periode */}
         <div className="space-y-3">
-          {/* Row 1: 4 Category Breakdown Cards (Non-Overlapping) */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            {/* Card 1: PORSI BESAR */}
-            <div className="bg-[#ECFEFF]/70 border border-cyan-200/70 rounded-2xl p-4 flex flex-col justify-between shadow-xs">
-              <div>
-                <div className="flex items-center justify-between gap-1">
-                  <span className="text-[10px] font-black text-cyan-800 uppercase tracking-wider">
-                    Porsi Besar (H-{selectedDashboardDay})
-                  </span>
-                  <span className="text-[10px] font-semibold text-cyan-700/80">Tanpa Alergi</span>
-                </div>
-                <div className="mt-1.5 flex items-baseline gap-1.5">
-                  <span className="text-2xl font-black text-cyan-950 tracking-tight tabular-nums">
-                    {dailyBreakdown.nonSampelBesar.toLocaleString("id-ID")}
-                  </span>
-                  <span className="text-xs text-cyan-700 font-bold">Porsi</span>
-                </div>
-              </div>
-              <div className="mt-2 pt-2 border-t border-cyan-200/70 flex items-center justify-between text-[11px]">
-                <span className="text-cyan-700 font-medium">Estimasi RAB</span>
-                <span className="font-extrabold font-mono text-cyan-950">
-                  {formatIDRCompact(dailyBreakdown.rabNonSampelBesar)}
-                </span>
-              </div>
-            </div>
-
-            {/* Card 2: PORSI KECIL */}
-            <div className="bg-[#EEF2FF]/70 border border-indigo-200/70 rounded-2xl p-4 flex flex-col justify-between shadow-xs">
-              <div>
-                <div className="flex items-center justify-between gap-1">
-                  <span className="text-[10px] font-black text-indigo-800 uppercase tracking-wider">
-                    Porsi Kecil (H-{selectedDashboardDay})
-                  </span>
-                  <span className="text-[10px] font-semibold text-indigo-700/80">Tanpa Alergi</span>
-                </div>
-                <div className="mt-1.5 flex items-baseline gap-1.5">
-                  <span className="text-2xl font-black text-indigo-950 tracking-tight tabular-nums">
-                    {dailyBreakdown.nonSampelKecil.toLocaleString("id-ID")}
-                  </span>
-                  <span className="text-xs text-indigo-700 font-bold">Porsi</span>
-                </div>
-              </div>
-              <div className="mt-2 pt-2 border-t border-indigo-200/70 flex items-center justify-between text-[11px]">
-                <span className="text-indigo-700 font-medium">Estimasi RAB</span>
-                <span className="font-extrabold font-mono text-indigo-950">
-                  {formatIDRCompact(dailyBreakdown.rabNonSampelKecil)}
-                </span>
-              </div>
-            </div>
-
-            {/* Card 3: PM ALERGI */}
-            <div className="bg-[#FEF3C7]/70 border border-amber-200/80 rounded-2xl p-4 flex flex-col justify-between shadow-xs">
-              <div>
-                <div className="flex items-center justify-between gap-1">
-                  <span className="text-[10px] font-black text-amber-800 uppercase tracking-wider">
-                    PM Alergi (H-{selectedDashboardDay})
-                  </span>
-                  <span className="text-[10px] font-semibold text-amber-800">
-                    B: {dailyBreakdown.nonSampelAlergiBesar} · K: {dailyBreakdown.nonSampelAlergiKecil}
-                  </span>
-                </div>
-                <div className="mt-1.5 flex items-baseline gap-1.5">
-                  <span className="text-2xl font-black text-amber-950 tracking-tight tabular-nums">
-                    {(dailyBreakdown.nonSampelAlergiBesar + dailyBreakdown.nonSampelAlergiKecil).toLocaleString("id-ID")}
-                  </span>
-                  <span className="text-xs text-amber-700 font-bold">Porsi</span>
-                </div>
-              </div>
-              <div className="mt-2 pt-2 border-t border-amber-200/70 text-[11px] text-amber-900 font-medium">
-                B: <strong className="font-mono">{formatIDRCompact(dailyBreakdown.rabNonSampelAlergiBesar)}</strong> · K:{" "}
-                <strong className="font-mono">{formatIDRCompact(dailyBreakdown.rabNonSampelAlergiKecil)}</strong>
-              </div>
-            </div>
-
-            {/* Card 4: SAMPEL */}
-            <div className="bg-blue-50/80 border border-blue-200/80 rounded-2xl p-4 flex flex-col justify-between shadow-xs">
-              <div>
-                <div className="flex items-center justify-between gap-1">
-                  <span className="text-[10px] font-black text-blue-800 uppercase tracking-wider flex items-center gap-1">
-                    <FlaskConical className="w-3.5 h-3.5" />
-                    Sampel (H-{selectedDashboardDay})
-                  </span>
-                  <span className="text-[10px] font-semibold text-blue-800">
-                    B: {dailyBreakdown.sampelBesar} · K: {dailyBreakdown.sampelKecil}
-                  </span>
-                </div>
-                <div className="mt-1.5 flex items-baseline gap-1.5">
-                  <span className="text-2xl font-black text-blue-950 tracking-tight tabular-nums">
-                    {dailyBreakdown.totalSampel.toLocaleString("id-ID")}
-                  </span>
-                  <span className="text-xs text-blue-700 font-bold">Porsi</span>
-                </div>
-              </div>
-              <div className="mt-2 pt-2 border-t border-blue-200/70 flex items-center justify-between text-[11px]">
-                <span className="text-blue-700 font-medium">Estimasi RAB</span>
-                <span className="font-extrabold font-mono text-blue-950">
-                  {formatIDRCompact(dailyBreakdown.rabSampel)}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Row 2: 2 Wide Daily Hero Cards WITH DATE (Total PM Harian & Total RAB Harian) */}
+          {/* 2 Wide Daily Hero Cards WITH DATE (Total PM Harian & Total RAB Harian) */}
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
             {/* TOTAL PM HARIAN */}
             <div className="bg-[#1E1B4B] border border-indigo-950 text-white rounded-2xl p-4 space-y-3 shadow-sm">

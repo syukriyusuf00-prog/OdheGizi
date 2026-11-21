@@ -36,7 +36,6 @@ import {
   AlertTriangle,
   AlertCircle,
   ShieldCheck,
-  SlidersHorizontal,
   Users,
   Settings,
   ChevronDown,
@@ -276,12 +275,9 @@ export default function PenerimaManfaatTab({
   const [formSampelChoice, setFormSampelChoice] = useState<SampelChoiceMode>("none");
   const [formSampelBesar, setFormSampelBesar] = useState<string>("");
   const [formSampelKecil, setFormSampelKecil] = useState<string>("");
-  const [formGuruChoice, setFormGuruChoice] = useState<"none" | "ada">("none");
-  const [formGuruBesar, setFormGuruBesar] = useState<string>("");
-  const [formGuruAlergiBesar, setFormGuruAlergiBesar] = useState<string>("");
 
   // Capacity validation & inline cell error feedback state
-  const [manualSchoolCapacity, setManualSchoolCapacity] = useState<number | null>(() => {
+  const [manualSchoolCapacity] = useState<number | null>(() => {
     try {
       const saved = localStorage.getItem("sisper_manual_school_capacity");
       if (!saved) return null;
@@ -291,9 +287,6 @@ export default function PenerimaManfaatTab({
       return null;
     }
   });
-  const [showCapacityEditor, setShowCapacityEditor] = useState<boolean>(false);
-  const [capacityInputDraft, setCapacityInputDraft] = useState<string>("");
-  const [capacityInputError, setCapacityInputError] = useState<string | null>(null);
   const [inlineCellError, setInlineCellError] = useState<{
     cellKey: string;
     table: "tabel1" | "tabel2";
@@ -546,15 +539,6 @@ export default function PenerimaManfaatTab({
       formSampelChoice === "kecil" || formSampelChoice === "both"
         ? validatePortionString(formSampelKecil, "Sampel Porsi Kecil")
         : validatePortionString("", "Sampel Porsi Kecil");
-    const guruBesar =
-      inputMode === "sekolah" && formGuruChoice === "ada"
-        ? validatePortionString(formGuruBesar, "Guru Porsi Besar")
-        : validatePortionString("", "Guru Porsi Besar");
-    const guruAlergiBesar =
-      inputMode === "sekolah" && formGuruChoice === "ada"
-        ? validatePortionString(formGuruAlergiBesar, "Alergi Guru")
-        : validatePortionString("", "Alergi Guru");
-
     const fields = {
       bumil,
       busui,
@@ -564,8 +548,6 @@ export default function PenerimaManfaatTab({
       alergiKecil,
       sampelBesar,
       sampelKecil,
-      guruBesar,
-      guruAlergiBesar,
     };
 
     const invalidErrors = Object.values(fields)
@@ -586,7 +568,6 @@ export default function PenerimaManfaatTab({
     const draftSampelBesar = sampelBesar.value;
     const draftSampelKecil = sampelKecil.value;
     const draftSampelTotal = draftSampelBesar + draftSampelKecil;
-    const draftGuruTotal = guruBesar.value + guruAlergiBesar.value;
     const draftRowTotal =
       draftBesar + draftKecil + draftAlergiBesar + draftAlergiKecil + draftSampelTotal;
 
@@ -619,7 +600,7 @@ export default function PenerimaManfaatTab({
       0,
       activeSchoolPortions.schoolWithSampleTotal - prevRowSchoolAndSample + draftSchoolAndSample
     );
-    const projectedTotalPM = Math.max(0, totalPM - prevRowTotal + draftRowTotal + draftGuruTotal);
+    const projectedTotalPM = Math.max(0, totalPM - prevRowTotal + draftRowTotal);
 
     const matchedSchool =
       inputMode === "sekolah" && formNama.trim()
@@ -676,9 +657,6 @@ export default function PenerimaManfaatTab({
     formSampelChoice,
     formSampelBesar,
     formSampelKecil,
-    formGuruChoice,
-    formGuruBesar,
-    formGuruAlergiBesar,
     editingRowId,
     activeUraian,
     activeSchoolPortions.schoolWithSampleTotal,
@@ -734,50 +712,6 @@ export default function PenerimaManfaatTab({
     if (!formValidation.fields.alergiKecil.isValid) setFormAlergiKecil("0");
     if (!formValidation.fields.sampelBesar.isValid) setFormSampelBesar("0");
     if (!formValidation.fields.sampelKecil.isValid) setFormSampelKecil("0");
-    if (!formValidation.fields.guruBesar.isValid) setFormGuruBesar("0");
-    if (!formValidation.fields.guruAlergiBesar.isValid) setFormGuruAlergiBesar("0");
-  };
-
-  const handleSaveManualCapacity = () => {
-    const check = validatePortionString(capacityInputDraft, "Kapasitas total sekolah");
-    if (!check.isValid) {
-      setCapacityInputError(check.error);
-      return;
-    }
-    if (check.value <= 0) {
-      setCapacityInputError("Masukkan kapasitas lebih dari 0, atau klik Reset untuk memakai data sekolah terdaftar.");
-      return;
-    }
-    setManualSchoolCapacity(check.value);
-    try {
-      localStorage.setItem("sisper_manual_school_capacity", String(check.value));
-    } catch {
-      // ignore storage errors
-    }
-    setCapacityInputError(null);
-    setShowCapacityEditor(false);
-    triggerAlert(
-      "success",
-      `Batas kapasitas total sekolah diatur ke ${check.value.toLocaleString("id-ID")} porsi.`
-    );
-  };
-
-  const handleResetManualCapacity = () => {
-    setManualSchoolCapacity(null);
-    try {
-      localStorage.removeItem("sisper_manual_school_capacity");
-    } catch {
-      // ignore storage errors
-    }
-    setCapacityInputDraft("");
-    setCapacityInputError(null);
-    setShowCapacityEditor(false);
-    triggerAlert(
-      "info",
-      capacityInfo.registeredTotal > 0
-        ? `Kapasitas dikembalikan ke data ${capacityInfo.schoolCount} sekolah terdaftar (${capacityInfo.registeredTotal.toLocaleString("id-ID")} porsi).`
-        : "Batas kapasitas manual telah dihapus."
-    );
   };
 
   // Switch mode tab in Dedicated Input Panel
@@ -797,36 +731,24 @@ export default function PenerimaManfaatTab({
       setFormSampelChoice("none");
       setFormSampelBesar("");
       setFormSampelKecil("");
-      setFormGuruChoice("none");
-      setFormGuruBesar("");
-      setFormGuruAlergiBesar("");
     } else if (mode === "tiga_b") {
       setFormKategori("posyandu_3b");
       setFormBalitaTarget("anak_balita");
       setFormSampelChoice("none");
       setFormSampelBesar("");
       setFormSampelKecil("");
-      setFormGuruChoice("none");
-      setFormGuruBesar("");
-      setFormGuruAlergiBesar("");
     } else if (mode === "tenaga") {
       setFormKategori("tenaga_kependidikan");
       setFormNama("Tenaga Pendidikan");
       setFormSampelChoice("none");
       setFormSampelBesar("");
       setFormSampelKecil("");
-      setFormGuruChoice("none");
-      setFormGuruBesar("");
-      setFormGuruAlergiBesar("");
     } else {
       setFormKategori("sampel");
       setFormNama("Sampel Makanan");
       setFormSampelChoice("both");
       setFormSampelBesar("1");
       setFormSampelKecil("1");
-      setFormGuruChoice("none");
-      setFormGuruBesar("");
-      setFormGuruAlergiBesar("");
     }
   };
 
@@ -856,9 +778,6 @@ export default function PenerimaManfaatTab({
     setFormPorsiKecil("");
     setFormAlergiBesar("");
     setFormAlergiKecil("");
-    setFormGuruChoice("none");
-    setFormGuruBesar("");
-    setFormGuruAlergiBesar("");
     if (inputMode === "sampel") {
       setFormSampelChoice("both");
       setFormSampelBesar("1");
@@ -942,46 +861,9 @@ export default function PenerimaManfaatTab({
       sampelKecil: parsedSampelKecil,
     };
 
-    let nextUraian = editingRowId
+    const nextUraian = editingRowId
       ? activeUraian.map((u) => (u.id === editingRowId ? rowPayload : u))
       : [...activeUraian, rowPayload];
-
-    const parsedGuruBesar = inputMode === "sekolah" ? formValidation.fields.guruBesar.value : 0;
-    const parsedGuruAlergiBesar = inputMode === "sekolah" ? formValidation.fields.guruAlergiBesar.value : 0;
-    const addedGuruTotal = parsedGuruBesar + parsedGuruAlergiBesar;
-
-    if (addedGuruTotal > 0) {
-      const existingTendikIdx = nextUraian.findIndex(
-        (u) => u.kategori === "tenaga_kependidikan"
-      );
-      if (existingTendikIdx >= 0) {
-        nextUraian = nextUraian.map((u, idx) =>
-          idx === existingTendikIdx
-            ? {
-                ...u,
-                porsiBesar: (Number(u.porsiBesar) || 0) + parsedGuruBesar,
-                alergiBesar: (Number(u.alergiBesar) || 0) + parsedGuruAlergiBesar,
-              }
-            : u
-        );
-      } else {
-        nextUraian = [
-          ...nextUraian,
-          {
-            id: `uraian_guru_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-            nama: "Tenaga Pendidikan",
-            tipeUnit: "tenaga",
-            kategori: "tenaga_kependidikan",
-            porsiBesar: parsedGuruBesar,
-            porsiKecil: 0,
-            alergiBesar: parsedGuruAlergiBesar,
-            alergiKecil: 0,
-            sampelBesar: 0,
-            sampelKecil: 0,
-          },
-        ];
-      }
-    }
 
     const nextSasaran = recalculateSasaranFromUraian(nextUraian);
     commitActiveDayUpdate(nextSasaran, nextUraian);
@@ -990,11 +872,6 @@ export default function PenerimaManfaatTab({
       triggerAlert(
         "info",
         `"${cleanedName}" disimpan, namun jumlah porsi saat ini melebihi kapasitas sekolah terdaftar. Mohon tinjau kembali peringatan kapasitas.`
-      );
-    } else if (addedGuruTotal > 0) {
-      triggerAlert(
-        "success",
-        `"${cleanedName}" disimpan & +${addedGuruTotal} porsi Guru otomatis masuk ke baris Tenaga Pendidikan (Tabel 1 & Tabel 2)!`
       );
     } else {
       triggerAlert(
@@ -1032,9 +909,6 @@ export default function PenerimaManfaatTab({
     }
     setFormSampelBesar(row.sampelBesar ? String(row.sampelBesar) : "");
     setFormSampelKecil(row.sampelKecil ? String(row.sampelKecil) : "");
-    setFormGuruChoice("none");
-    setFormGuruBesar("");
-    setFormGuruAlergiBesar("");
   };
 
   // Inline edit inside Tabel 1 -> auto-syncs Tabel 2 immediately with non-negative guard
@@ -1735,9 +1609,6 @@ export default function PenerimaManfaatTab({
             <Users className="w-5 h-5 text-indigo-600" />
             Penerima Manfaat ({effectiveTotalDays} Hari Perencanaan)
           </h2>
-          <p className="text-sm text-slate-500">
-            Input rincian Sekolah, 3B (Desa/Posyandu), Alergi, dan Sampel (Tabel 1) yang otomatis terekap ke Rekapitulasi Keseluruhan (Tabel 2).
-          </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <button
@@ -1873,108 +1744,9 @@ export default function PenerimaManfaatTab({
         </div>
       </div>
 
-      {/* Ringkasan Harian (Per Kategori + Total PM Harian & Estimasi RAB Harian dengan Tanggal) */}
+      {/* Ringkasan Harian (Total PM Harian & Estimasi RAB Harian dengan Tanggal) */}
       <div className="space-y-3 no-print">
-        {/* Row 1: 4 Category Breakdown Cards (Non-Overlapping) */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-          <div className="bg-emerald-50/75 p-4 rounded-2xl border border-emerald-200/80 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between gap-1">
-                <span className="text-[11px] font-bold text-emerald-800 uppercase tracking-wider">
-                  Porsi Besar (H-{selectedDay})
-                </span>
-                <span className="text-[10px] font-semibold text-emerald-700/80">Tanpa Alergi</span>
-              </div>
-              <div className="mt-1.5 flex items-baseline gap-1.5">
-                <span className="text-2xl font-black text-emerald-950 tabular-nums">
-                  {dailyBreakdown.nonSampelBesar.toLocaleString("id-ID")}
-                </span>
-                <span className="text-[11px] text-emerald-700 font-bold">Porsi</span>
-              </div>
-            </div>
-            <div className="mt-2 pt-2 border-t border-emerald-200/70 flex items-center justify-between text-[11px]">
-              <span className="text-emerald-700/90 font-medium">Estimasi RAB</span>
-              <span className="font-extrabold font-mono text-emerald-950">
-                {formatIDR(dailyBreakdown.rabNonSampelBesar)}
-              </span>
-            </div>
-          </div>
-
-          <div className="bg-sky-50/75 p-4 rounded-2xl border border-sky-200/80 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between gap-1">
-                <span className="text-[11px] font-bold text-sky-800 uppercase tracking-wider">
-                  Porsi Kecil (H-{selectedDay})
-                </span>
-                <span className="text-[10px] font-semibold text-sky-700/80">Tanpa Alergi</span>
-              </div>
-              <div className="mt-1.5 flex items-baseline gap-1.5">
-                <span className="text-2xl font-black text-sky-950 tabular-nums">
-                  {dailyBreakdown.nonSampelKecil.toLocaleString("id-ID")}
-                </span>
-                <span className="text-[11px] text-sky-700 font-bold">Porsi</span>
-              </div>
-            </div>
-            <div className="mt-2 pt-2 border-t border-sky-200/70 flex items-center justify-between text-[11px]">
-              <span className="text-sky-700/90 font-medium">Estimasi RAB</span>
-              <span className="font-extrabold font-mono text-sky-950">
-                {formatIDR(dailyBreakdown.rabNonSampelKecil)}
-              </span>
-            </div>
-          </div>
-
-          <div className="bg-orange-50/80 p-4 rounded-2xl border border-orange-200/80 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between gap-1">
-                <span className="text-[11px] font-bold text-orange-800 uppercase tracking-wider">
-                  Diet / Alergi (H-{selectedDay})
-                </span>
-                <span className="text-[10px] font-semibold text-orange-700">
-                  B: {dailyBreakdown.nonSampelAlergiBesar} · K: {dailyBreakdown.nonSampelAlergiKecil}
-                </span>
-              </div>
-              <div className="mt-1.5 flex items-baseline gap-1.5">
-                <span className="text-2xl font-black text-orange-950 tabular-nums">
-                  {(dailyBreakdown.nonSampelAlergiBesar + dailyBreakdown.nonSampelAlergiKecil).toLocaleString("id-ID")}
-                </span>
-                <span className="text-[11px] text-orange-700 font-bold">Porsi</span>
-              </div>
-            </div>
-            <div className="mt-2 pt-2 border-t border-orange-200/70 flex items-center justify-between text-[11px]">
-              <span className="text-orange-700/90 font-medium">
-                B: {formatIDR(dailyBreakdown.rabNonSampelAlergiBesar)} · K: {formatIDR(dailyBreakdown.rabNonSampelAlergiKecil)}
-              </span>
-            </div>
-          </div>
-
-          <div className="bg-blue-50/80 p-4 rounded-2xl border border-blue-200/80 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between gap-1">
-                <span className="text-[11px] font-bold text-blue-800 uppercase tracking-wider flex items-center gap-1">
-                  <FlaskConical className="w-3.5 h-3.5" />
-                  Sampel (H-{selectedDay})
-                </span>
-                <span className="text-[10px] font-semibold text-blue-700">
-                  B: {sampelPorsiBesar} · K: {sampelPorsiKecil}
-                </span>
-              </div>
-              <div className="mt-1.5 flex items-baseline gap-1.5">
-                <span className="text-2xl font-black text-blue-950 tabular-nums">
-                  {totalSampel.toLocaleString("id-ID")}
-                </span>
-                <span className="text-[11px] text-blue-700 font-bold">Porsi</span>
-              </div>
-            </div>
-            <div className="mt-2 pt-2 border-t border-blue-200/70 flex items-center justify-between text-[11px]">
-              <span className="text-blue-700/90 font-medium">Estimasi RAB</span>
-              <span className="font-extrabold font-mono text-blue-950">
-                {formatIDR(dailyBreakdown.rabSampel)}
-              </span>
-            </div>
-          </div>
-        </div>
-
-        {/* Row 2: 2 Wide Daily Hero Cards WITH DATE (Total PM Harian & Estimasi RAB Harian) */}
+        {/* 2 Wide Daily Hero Cards WITH DATE (Total PM Harian & Estimasi RAB Harian) */}
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
           {/* TOTAL PM HARIAN */}
           <div
@@ -2111,248 +1883,6 @@ export default function PenerimaManfaatTab({
             </div>
           </div>
         </div>
-      </div>
-
-      {/* MONITOR KAPASITAS TOTAL SEKOLAH TERDAFTAR & PERINGATAN VISUAL */}
-      <div
-        className={`rounded-2xl border p-4 shadow-xs space-y-3 transition-colors no-print ${
-          dayCapacityStatus.isOver
-            ? "bg-rose-50/90 border-rose-300"
-            : dayCapacityStatus.isNear
-            ? "bg-amber-50/80 border-amber-300"
-            : "bg-white border-slate-200"
-        }`}
-      >
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-          <div className="flex items-start gap-2.5">
-            {dayCapacityStatus.isOver ? (
-              <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
-            ) : dayCapacityStatus.isNear ? (
-              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-            ) : (
-              <ShieldCheck className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
-            )}
-            <div className="space-y-0.5">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs font-extrabold uppercase tracking-wider text-slate-900">
-                  Kapasitas Total Sekolah Terdaftar
-                </span>
-                {capacityInfo.capacitySource === "registered" && (
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-100 text-emerald-800 border border-emerald-200">
-                    {capacityInfo.schoolCount} Sekolah Terdaftar ·{" "}
-                    {capacityInfo.registeredTotal.toLocaleString("id-ID")} Porsi
-                  </span>
-                )}
-                {capacityInfo.capacitySource === "manual" && (
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-indigo-100 text-indigo-800 border border-indigo-200">
-                    Batas Manual: {capacityInfo.effectiveSchoolCapacity.toLocaleString("id-ID")} Porsi
-                  </span>
-                )}
-                {capacityInfo.capacitySource === "unset" && (
-                  <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-slate-100 text-slate-600 border border-slate-200">
-                    Belum Ada Batas Kapasitas Terdaftar
-                  </span>
-                )}
-              </div>
-              <p className="text-[11px] text-slate-600">
-                {capacityInfo.capacitySource === "registered" ? (
-                  <>
-                    Rincian terdaftar: Besar{" "}
-                    <strong>{capacityInfo.registeredBesar.toLocaleString("id-ID")}</strong> · Kecil{" "}
-                    <strong>{capacityInfo.registeredKecil.toLocaleString("id-ID")}</strong> · Alergi{" "}
-                    <strong>{capacityInfo.registeredAlergi.toLocaleString("id-ID")}</strong>
-                    {capacityInfo.registered3BTotal > 0 && (
-                      <>
-                        {" "}
-                        · 3B Terdaftar:{" "}
-                        <strong>{capacityInfo.registered3BTotal.toLocaleString("id-ID")}</strong>
-                      </>
-                    )}
-                  </>
-                ) : capacityInfo.capacitySource === "manual" ? (
-                  <>
-                    Menggunakan batas manual sebagai acuan validasi kapasitas porsi sekolah &amp; sampel harian.
-                  </>
-                ) : (
-                  <>
-                    Daftar master sekolah belum terisi. Klik <strong>Atur Kapasitas</strong> untuk menetapkan batas kapasitas total sekolah agar peringatan otomatis aktif.
-                  </>
-                )}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-3 shrink-0">
-            {dayCapacityStatus.capacity > 0 && (
-              <div className="text-right">
-                <div className="text-xs font-bold text-slate-800 tabular-nums">
-                  Terpakai (Sekolah &amp; Sampel):{" "}
-                  <span
-                    className={
-                      dayCapacityStatus.isSchoolOver
-                        ? "text-rose-700 font-black"
-                        : dayCapacityStatus.isNear
-                        ? "text-amber-700 font-black"
-                        : "text-emerald-700 font-black"
-                    }
-                  >
-                    {dayCapacityStatus.usedSchool.toLocaleString("id-ID")}
-                  </span>{" "}
-                  / {dayCapacityStatus.capacity.toLocaleString("id-ID")} Porsi (
-                  {dayCapacityStatus.pct}%)
-                </div>
-                {capacityInfo.registered3BTotal > 0 && (
-                  <div className="text-[10px] text-slate-500 tabular-nums">
-                    Total PM Gabungan (incl. 3B/Tendik):{" "}
-                    <strong className={dayCapacityStatus.isCombinedOver ? "text-rose-700" : "text-slate-700"}>
-                      {totalPM.toLocaleString("id-ID")}
-                    </strong>{" "}
-                    / {dayCapacityStatus.combinedCap.toLocaleString("id-ID")} Porsi
-                  </div>
-                )}
-              </div>
-            )}
-
-            <button
-              type="button"
-              onClick={() => {
-                setCapacityInputDraft(
-                  dayCapacityStatus.capacity > 0 ? String(dayCapacityStatus.capacity) : ""
-                );
-                setCapacityInputError(null);
-                setShowCapacityEditor((prev) => !prev);
-              }}
-              className="px-3 py-1.5 rounded-xl text-xs font-bold bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 flex items-center gap-1.5 cursor-pointer transition"
-            >
-              <SlidersHorizontal className="w-3.5 h-3.5 text-indigo-600" />
-              Atur Kapasitas
-            </button>
-          </div>
-        </div>
-
-        {/* Visual Utilization Progress Bar */}
-        {dayCapacityStatus.capacity > 0 && (
-          <div className="w-full h-2 rounded-full bg-slate-200/80 overflow-hidden">
-            <div
-              className={`h-full rounded-full transition-all duration-300 ${
-                dayCapacityStatus.isOver
-                  ? "bg-rose-600"
-                  : dayCapacityStatus.isNear
-                  ? "bg-amber-500"
-                  : "bg-emerald-500"
-              }`}
-              style={{ width: `${Math.min(100, dayCapacityStatus.pct)}%` }}
-            />
-          </div>
-        )}
-
-        {/* Prominent Visual Warning When Daily Portions Exceed Registered School Capacity */}
-        {dayCapacityStatus.isOver && (
-          <div
-            role="alert"
-            className="flex items-start gap-2.5 p-3 rounded-xl bg-rose-100/90 border border-rose-300 text-rose-950 text-xs"
-          >
-            <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-            <div className="space-y-0.5">
-              <p className="font-extrabold">
-                Peringatan: Jumlah porsi melebihi kapasitas total sekolah yang terdaftar!
-              </p>
-              <p className="text-rose-900">
-                {dayCapacityStatus.isSchoolOver ? (
-                  <>
-                    Total porsi Sekolah &amp; Sampel pada Hari Ke-{selectedDay} sebesar{" "}
-                    <strong>{dayCapacityStatus.usedSchool.toLocaleString("id-ID")} porsi</strong>{" "}
-                    melebihi kapasitas terdaftar{" "}
-                    <strong>{dayCapacityStatus.capacity.toLocaleString("id-ID")} porsi</strong>{" "}
-                    (kelebihan{" "}
-                    <strong>+{dayCapacityStatus.excessSchool.toLocaleString("id-ID")} porsi</strong>).
-                  </>
-                ) : (
-                  <>
-                    Total seluruh PM pada Hari Ke-{selectedDay} sebesar{" "}
-                    <strong>{totalPM.toLocaleString("id-ID")} porsi</strong> melebihi kapasitas
-                    gabungan terdaftar{" "}
-                    <strong>{dayCapacityStatus.combinedCap.toLocaleString("id-ID")} porsi</strong>{" "}
-                    (kelebihan{" "}
-                    <strong>+{dayCapacityStatus.excessCombined.toLocaleString("id-ID")} porsi</strong>).
-                  </>
-                )}{" "}
-                Harap periksa kembali input porsi kecil, besar, alergi, dan sampel.
-              </p>
-            </div>
-          </div>
-        )}
-
-        {/* Optional Inline Capacity Override Editor */}
-        {showCapacityEditor && (
-          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 flex flex-col sm:flex-row sm:items-end justify-between gap-3">
-            <div className="flex-1 space-y-1">
-              <label className="block text-[11px] font-bold text-slate-700">
-                Batas Kapasitas Total Sekolah (Porsi)
-              </label>
-              <div className="flex flex-wrap items-center gap-2">
-                <input
-                  type="number"
-                  min="1"
-                  value={capacityInputDraft}
-                  onKeyDown={handleFormNumericKeyDown}
-                  onChange={(e) => {
-                    setCapacityInputDraft(e.target.value);
-                    const check = validatePortionString(e.target.value, "Kapasitas");
-                    setCapacityInputError(check.isValid ? null : check.error);
-                  }}
-                  placeholder="Contoh: 2500"
-                  className={`w-40 px-3 py-1.5 text-sm font-bold font-mono rounded-lg border bg-white focus:outline-none ${
-                    capacityInputError
-                      ? "border-rose-500 ring-2 ring-rose-500/20"
-                      : "border-slate-300 focus:border-indigo-500"
-                  }`}
-                />
-                <button
-                  type="button"
-                  onClick={handleSaveManualCapacity}
-                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-indigo-600 hover:bg-indigo-700 text-white cursor-pointer"
-                >
-                  Simpan Batas
-                </button>
-                {activeSchoolPortions.schoolWithSampleTotal > 0 && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setCapacityInputDraft(String(activeSchoolPortions.schoolWithSampleTotal));
-                      setCapacityInputError(null);
-                    }}
-                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-100 cursor-pointer"
-                  >
-                    Pakai Total Hari Ini ({activeSchoolPortions.schoolWithSampleTotal.toLocaleString("id-ID")})
-                  </button>
-                )}
-                {manualSchoolCapacity !== null && (
-                  <button
-                    type="button"
-                    onClick={handleResetManualCapacity}
-                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-50 text-rose-700 hover:bg-rose-100 cursor-pointer"
-                  >
-                    Reset ke Data Terdaftar
-                  </button>
-                )}
-              </div>
-              {capacityInputError && (
-                <p className="text-[11px] font-bold text-rose-600 flex items-center gap-1">
-                  <AlertCircle className="w-3.5 h-3.5" />
-                  {capacityInputError}
-                </p>
-              )}
-            </div>
-            <button
-              type="button"
-              onClick={() => setShowCapacityEditor(false)}
-              className="text-xs font-semibold text-slate-500 hover:text-slate-800 self-start sm:self-end cursor-pointer"
-            >
-              Tutup
-            </button>
-          </div>
-        )}
       </div>
 
       {/* PANEL INPUT KHUSUS: SEKOLAH, 3B (DESA/POSYANDU), TENAGA PENDIDIKAN, & SAMPEL */}
@@ -2960,123 +2490,6 @@ export default function PenerimaManfaatTab({
               )}
             </div>
           </div>
-
-          {/* Row 3B: Pengaturan Guru / Tenaga Pendidik (langsung masuk ke Tabel Tenaga Pendidikan) */}
-          {inputMode === "sekolah" && (
-            <div
-              className={`p-3.5 rounded-xl border flex flex-col lg:flex-row lg:items-center justify-between gap-3 transition-colors ${
-                !formValidation.fields.guruBesar.isValid ||
-                !formValidation.fields.guruAlergiBesar.isValid
-                  ? "bg-rose-50/70 border-rose-300"
-                  : "bg-teal-50/70 border-teal-200"
-              }`}
-            >
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-1.5 text-xs font-bold text-teal-900">
-                  <GraduationCap className="w-4 h-4 text-teal-600" />
-                  <span>Pengaturan Guru / Tenaga Pendidik (Masuk ke Baris Tenaga Pendidikan)</span>
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setFormGuruChoice("none");
-                      setFormGuruBesar("");
-                      setFormGuruAlergiBesar("");
-                    }}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border transition cursor-pointer ${
-                      formGuruChoice === "none"
-                        ? "bg-teal-600 text-white border-teal-600 shadow-xs"
-                        : "bg-white text-teal-900 border-teal-200 hover:bg-teal-100/70"
-                    }`}
-                  >
-                    Tanpa Guru
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setFormGuruChoice("ada")}
-                    className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border transition cursor-pointer ${
-                      formGuruChoice === "ada"
-                        ? "bg-teal-600 text-white border-teal-600 shadow-xs"
-                        : "bg-white text-teal-900 border-teal-200 hover:bg-teal-100/70"
-                    }`}
-                  >
-                    Input Jumlah Guru
-                  </button>
-                  <span className="text-[11px] text-teal-800/90 font-medium pl-1">
-                    Otomatis masuk ke tabel <strong>Tenaga Pendidikan</strong> (Tabel 1 &amp; Baris 10 Tabel 2)
-                  </span>
-                </div>
-              </div>
-
-              {formGuruChoice === "ada" && (
-                <div className="flex flex-col items-start lg:items-end gap-1.5">
-                  <div className="flex flex-wrap items-center gap-2.5">
-                    <div
-                      className={`flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border ${
-                        !formValidation.fields.guruBesar.isValid
-                          ? "border-rose-500 ring-2 ring-rose-500/20"
-                          : "border-teal-200"
-                      }`}
-                    >
-                      <label className="text-[11px] font-bold text-teal-900 whitespace-nowrap">
-                        Jumlah Guru (Porsi Besar):
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1"
-                        value={formGuruBesar}
-                        onKeyDown={handleFormNumericKeyDown}
-                        onChange={(e) => setFormGuruBesar(e.target.value)}
-                        placeholder="0"
-                        aria-invalid={!formValidation.fields.guruBesar.isValid}
-                        className={`w-20 px-2 py-1 text-sm font-bold font-mono text-center border rounded-md focus:outline-none ${
-                          !formValidation.fields.guruBesar.isValid
-                            ? "bg-rose-50 border-rose-500 text-rose-900"
-                            : "bg-teal-50/40 border-teal-300 focus:border-teal-600"
-                        }`}
-                      />
-                    </div>
-                    <div
-                      className={`flex items-center gap-2 bg-white px-3 py-1.5 rounded-lg border ${
-                        !formValidation.fields.guruAlergiBesar.isValid
-                          ? "border-rose-500 ring-2 ring-rose-500/20"
-                          : "border-orange-200"
-                      }`}
-                    >
-                      <label className="text-[11px] font-bold text-orange-900 whitespace-nowrap">
-                        Guru Alergi:
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1"
-                        value={formGuruAlergiBesar}
-                        onKeyDown={handleFormNumericKeyDown}
-                        onChange={(e) => setFormGuruAlergiBesar(e.target.value)}
-                        placeholder="0"
-                        aria-invalid={!formValidation.fields.guruAlergiBesar.isValid}
-                        className={`w-16 px-2 py-1 text-sm font-bold font-mono text-center border rounded-md focus:outline-none ${
-                          !formValidation.fields.guruAlergiBesar.isValid
-                            ? "bg-rose-50 border-rose-500 text-rose-900"
-                            : "bg-orange-50/40 border-orange-300 focus:border-orange-600"
-                        }`}
-                      />
-                    </div>
-                  </div>
-                  {(!formValidation.fields.guruBesar.isValid ||
-                    !formValidation.fields.guruAlergiBesar.isValid) && (
-                    <p className="text-[11px] font-bold text-rose-600 flex items-center gap-1">
-                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                      {formValidation.fields.guruBesar.error ||
-                        formValidation.fields.guruAlergiBesar.error}
-                    </p>
-                  )}
-                </div>
-              )}
-            </div>
-          )}
 
           {/* Live Validation Error Summary (Negative / Invalid Input Blocker) */}
           {formValidation.hasNegativeOrInvalid && (
@@ -3930,204 +3343,6 @@ export default function PenerimaManfaatTab({
               </span>
             </div>
           </div>
-
-          {/* Quick Update Panel for Sampel & Guru (Tenaga Pendidikan) — langsung sinkron ke Tabel 1 & Tabel 2 */}
-          {(() => {
-            const tendikRow = activeSasaran.find((s) => s.id === "tenaga_kependidikan");
-            const tendikPB = Number(tendikRow?.porsiBesar) || 0;
-            const tendikAB = Number(tendikRow?.alergiBesar) || 0;
-            const sampelModeActive: SampelChoiceMode =
-              sampelPorsiBesar > 0 && sampelPorsiKecil > 0
-                ? "both"
-                : sampelPorsiBesar > 0
-                ? "besar"
-                : sampelPorsiKecil > 0
-                ? "kecil"
-                : "none";
-
-            return (
-              <div className="grid grid-cols-1 xl:grid-cols-2 gap-3 no-print">
-                {/* Pengaturan Cepat Sampel Makanan (Porsi Besar / Porsi Kecil) */}
-                <div className="p-3 rounded-xl bg-blue-50/70 border border-blue-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                  <div className="space-y-1.5">
-                    <div className="flex items-center gap-1.5 text-xs font-bold text-blue-900">
-                      <FlaskConical className="w-4 h-4 text-blue-600" />
-                      <span>Pengaturan Sampel Makanan (Porsi Besar / Porsi Kecil)</span>
-                    </div>
-                    <div className="flex flex-wrap items-center gap-1">
-                      {(
-                        [
-                          { id: "none", label: "Tanpa Sampel" },
-                          { id: "besar", label: "Sampel Porsi Besar" },
-                          { id: "kecil", label: "Sampel Porsi Kecil" },
-                          { id: "both", label: "Porsi Besar & Kecil" },
-                        ] as { id: SampelChoiceMode; label: string }[]
-                      ).map((opt) => (
-                        <button
-                          key={opt.id}
-                          type="button"
-                          onClick={() => {
-                            if (opt.id === "none") {
-                              syncSpecialCategoryFromTarget("sampel", { porsiBesar: 0, porsiKecil: 0 });
-                            } else if (opt.id === "besar") {
-                              syncSpecialCategoryFromTarget("sampel", {
-                                porsiBesar: sampelPorsiBesar > 0 ? sampelPorsiBesar : 1,
-                                porsiKecil: 0,
-                              });
-                            } else if (opt.id === "kecil") {
-                              syncSpecialCategoryFromTarget("sampel", {
-                                porsiBesar: 0,
-                                porsiKecil: sampelPorsiKecil > 0 ? sampelPorsiKecil : 1,
-                              });
-                            } else {
-                              syncSpecialCategoryFromTarget("sampel", {
-                                porsiBesar: sampelPorsiBesar > 0 ? sampelPorsiBesar : 1,
-                                porsiKecil: sampelPorsiKecil > 0 ? sampelPorsiKecil : 1,
-                              });
-                            }
-                          }}
-                          className={`px-2 py-1 rounded-lg text-[11px] font-bold border transition cursor-pointer ${
-                            sampelModeActive === opt.id
-                              ? "bg-blue-600 text-white border-blue-600 shadow-xs"
-                              : "bg-white text-blue-900 border-blue-200 hover:bg-blue-100/70"
-                          }`}
-                        >
-                          {opt.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2 shrink-0">
-                    <div className="flex items-center gap-1.5 bg-white px-2.5 py-1 rounded-lg border border-blue-200">
-                      <label className="text-[11px] font-bold text-blue-900 whitespace-nowrap">
-                        Besar:
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1"
-                        value={numInputVal(sampelPorsiBesar)}
-                        onKeyDown={(e) => handleTableNumericKeyDown(e, "quick-sampel-besar", "tabel2")}
-                        onChange={(e) => {
-                          if (isRawNegativeInput(e.target.value)) {
-                            triggerInlineCellError(
-                              "quick-sampel-besar",
-                              "tabel2",
-                              "Nilai sampel tidak boleh negatif (minimal 0)."
-                            );
-                            return;
-                          }
-                          syncSpecialCategoryFromTarget("sampel", {
-                            porsiBesar: Math.max(0, parseInt(e.target.value, 10) || 0),
-                          });
-                        }}
-                        placeholder="0"
-                        className="w-14 px-1.5 py-0.5 text-xs font-bold font-mono text-center bg-blue-50/40 border border-blue-300 rounded focus:outline-none focus:border-blue-600"
-                      />
-                    </div>
-                    <div className="flex items-center gap-1.5 bg-white px-2.5 py-1 rounded-lg border border-blue-200">
-                      <label className="text-[11px] font-bold text-blue-900 whitespace-nowrap">
-                        Kecil:
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1"
-                        value={numInputVal(sampelPorsiKecil)}
-                        onKeyDown={(e) => handleTableNumericKeyDown(e, "quick-sampel-kecil", "tabel2")}
-                        onChange={(e) => {
-                          if (isRawNegativeInput(e.target.value)) {
-                            triggerInlineCellError(
-                              "quick-sampel-kecil",
-                              "tabel2",
-                              "Nilai sampel tidak boleh negatif (minimal 0)."
-                            );
-                            return;
-                          }
-                          syncSpecialCategoryFromTarget("sampel", {
-                            porsiKecil: Math.max(0, parseInt(e.target.value, 10) || 0),
-                          });
-                        }}
-                        placeholder="0"
-                        className="w-14 px-1.5 py-0.5 text-xs font-bold font-mono text-center bg-blue-50/40 border border-blue-300 rounded focus:outline-none focus:border-blue-600"
-                      />
-                    </div>
-                  </div>
-                </div>
-
-                {/* Input Cepat Guru -> Tenaga Pendidikan (Baris 10 Tabel 2) */}
-                <div className="p-3 rounded-xl bg-teal-50/70 border border-teal-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
-                  <div className="space-y-0.5">
-                    <div className="flex items-center gap-1.5 text-xs font-bold text-teal-900">
-                      <GraduationCap className="w-4 h-4 text-teal-600" />
-                      <span>Input Cepat Guru / Tenaga Pendidik</span>
-                    </div>
-                    <p className="text-[11px] text-teal-800">
-                      Otomatis masuk ke baris <strong>Tenaga Pendidikan</strong> (Tabel 1 &amp; Baris 10 Tabel 2)
-                    </p>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2 shrink-0">
-                    <div className="flex items-center gap-1.5 bg-white px-2.5 py-1 rounded-lg border border-teal-200">
-                      <label className="text-[11px] font-bold text-teal-900 whitespace-nowrap">
-                        Guru (Porsi Besar):
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1"
-                        value={numInputVal(tendikPB)}
-                        onKeyDown={(e) => handleTableNumericKeyDown(e, "quick-guru-besar", "tabel2")}
-                        onChange={(e) => {
-                          if (isRawNegativeInput(e.target.value)) {
-                            triggerInlineCellError(
-                              "quick-guru-besar",
-                              "tabel2",
-                              "Nilai jumlah guru tidak boleh negatif (minimal 0)."
-                            );
-                            return;
-                          }
-                          syncSpecialCategoryFromTarget("tenaga_kependidikan", {
-                            porsiBesar: Math.max(0, parseInt(e.target.value, 10) || 0),
-                          });
-                        }}
-                        placeholder="0"
-                        className="w-16 px-1.5 py-0.5 text-xs font-bold font-mono text-center bg-teal-50/40 border border-teal-300 rounded focus:outline-none focus:border-teal-600"
-                      />
-                    </div>
-                    <div className="flex items-center gap-1.5 bg-white px-2.5 py-1 rounded-lg border border-orange-200">
-                      <label className="text-[11px] font-bold text-orange-900 whitespace-nowrap">
-                        Alergi:
-                      </label>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1"
-                        value={numInputVal(tendikAB)}
-                        onKeyDown={(e) => handleTableNumericKeyDown(e, "quick-guru-alergi", "tabel2")}
-                        onChange={(e) => {
-                          if (isRawNegativeInput(e.target.value)) {
-                            triggerInlineCellError(
-                              "quick-guru-alergi",
-                              "tabel2",
-                              "Nilai guru alergi tidak boleh negatif (minimal 0)."
-                            );
-                            return;
-                          }
-                          syncSpecialCategoryFromTarget("tenaga_kependidikan", {
-                            alergiBesar: Math.max(0, parseInt(e.target.value, 10) || 0),
-                          });
-                        }}
-                        placeholder="0"
-                        className="w-14 px-1.5 py-0.5 text-xs font-bold font-mono text-center bg-orange-50/40 border border-orange-300 rounded focus:outline-none focus:border-orange-600"
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            );
-          })()}
 
           {inlineCellError?.table === "tabel2" && (
             <div
