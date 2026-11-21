@@ -444,6 +444,8 @@ export interface FoodCostCategoryEntry {
   nutrientModes?: Record<string, string>;
   customAkgValues?: Record<string, number>;
   kriteriaPm?: string;
+  customMenuName?: string;
+  masterMenuPlanId?: string;
 }
 
 export interface FoodCostDay {

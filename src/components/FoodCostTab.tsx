@@ -11,6 +11,8 @@ import {
   FoodCostCategoryGroup,
   FoodCostCategoryEntry,
   MasterMenu,
+  MasterMenuPlan,
+  MenuItem,
   HariPM,
   UnifiedKopConfig,
   DEFAULT_UNIFIED_KOP_CONFIG,
@@ -62,6 +64,7 @@ import PrintPreviewModal from "./PrintPreviewModal";
 import {
   ALERGI_KATEGORI_LIST,
   ALL_KATEGORI_WITH_ALERGI,
+  buildCategoryLabelFromIds,
   composeMenuName,
   ensureMasterMenuPlans,
   formatIndonesianDate as formatScheduleIndonesianDate,
@@ -73,6 +76,7 @@ import {
   SASARAN_KATEGORI_LIST,
   SEKOLAH_SASARAN_IDS,
   stripAlergiPrefix,
+  syncMasterMenuToLegacy,
   TIGAB_SASARAN_IDS,
 } from "../utils/menuSchedule";
 
@@ -80,6 +84,7 @@ interface FoodCostTabProps {
   foodCostDays: FoodCostDay[];
   tkpiList: TKPIItem[];
   masterMenu: MasterMenu;
+  onMasterMenuChange?: (updated: MasterMenu) => void;
   harianPM: HariPM[];
   onFoodCostDaysChange: (updated: FoodCostDay[]) => void;
   profile?: any;
@@ -243,6 +248,7 @@ export default function FoodCostTab({
   foodCostDays,
   tkpiList,
   masterMenu,
+  onMasterMenuChange,
   harianPM,
   onFoodCostDaysChange,
   profile,
@@ -669,8 +675,8 @@ export default function FoodCostTab({
         };
         return {
           confirmed: parsed.confirmed !== undefined ? Boolean(parsed.confirmed) : true,
-          layoutMode: parsed.layoutMode === "gabung_porsi" ? "gabung_porsi" : "per_kategori",
-          scope: parsed.scope === "kecil" || parsed.scope === "besar" || parsed.scope === "all" ? parsed.scope : "all",
+          layoutMode: "per_kategori",
+          scope: "all",
           kecilIds: Array.isArray(parsed.kecilIds) ? parsed.kecilIds : defaultKecilIds,
           besarIds: Array.isArray(parsed.besarIds) ? parsed.besarIds : defaultBesarIds,
           categoryGroupsByGroup: {
@@ -686,7 +692,7 @@ export default function FoodCostTab({
         return {
           confirmed: true,
           layoutMode: "per_kategori",
-          scope: parsed.scope === "kecil" || parsed.scope === "besar" || parsed.scope === "all" ? parsed.scope : "all",
+          scope: "all",
           kecilIds: Array.isArray(parsed.kecilIds) ? parsed.kecilIds : defaultKecilIds,
           besarIds: Array.isArray(parsed.besarIds) ? parsed.besarIds : defaultBesarIds,
           categoryGroupsByGroup: defaultGroupsByGroup,
@@ -705,8 +711,8 @@ export default function FoodCostTab({
     };
   });
 
-  const [draftLayoutMode, setDraftLayoutMode] = useState<"per_kategori" | "gabung_porsi">(appliedConfig.layoutMode);
-  const [draftScope, setDraftScope] = useState<"kecil" | "besar" | "all">(appliedConfig.scope);
+  const [draftLayoutMode, setDraftLayoutMode] = useState<"per_kategori" | "gabung_porsi">("per_kategori");
+  const [draftScope, setDraftScope] = useState<"kecil" | "besar" | "all">("all");
   const [draftKecilIds, setDraftKecilIds] = useState<string[]>(appliedConfig.kecilIds);
   const [draftBesarIds, setDraftBesarIds] = useState<string[]>(appliedConfig.besarIds);
   const [draftCategoryGroupsByGroup, setDraftCategoryGroupsByGroup] = useState<
@@ -1390,6 +1396,395 @@ export default function FoodCostTab({
           ? "Menu MP-ASI (6-11 Bln)"
           : `Menu 3B ${selectedType}`
         : `Menu Sekolah ${selectedType}`);
+
+  // Per-category Master Menu matching & editable override helpers
+  const resolveMatchedPlanForSasaran = (
+    sasaranIds: string[],
+    entryPlanId?: string
+  ): MasterMenuPlan | undefined => {
+    if (!allPlans || allPlans.length === 0) return activeMatchedPlan;
+    const ids = sasaranIds || [];
+    const entryIsAlergi = ids.some((id) => isAlergiSasaranId(id)) || selectedType === "Alergi";
+    const entryIsMpAsi = ids.some((id) => MPASI_SASARAN_IDS.includes(stripAlergiPrefix(id)));
+
+    let bestPlan: MasterMenuPlan | undefined;
+    let bestScore = -Infinity;
+
+    allPlans.forEach((plan) => {
+      const planIds = plan.sasaranIds || [];
+      const planIsAlergi =
+        plan.dietType === "Alergi" || planIds.some((id) => isAlergiSasaranId(id));
+      const exactMatches = ids.filter((id) => planIds.includes(id)).length;
+      const baseMatches = ids.filter((id) =>
+        planIds.some((pid) => stripAlergiPrefix(pid) === stripAlergiPrefix(id))
+      ).length;
+
+      if (exactMatches === 0 && baseMatches === 0) return;
+
+      let score = exactMatches * 120 + baseMatches * 35;
+      if (entryIsAlergi === planIsAlergi) {
+        score += 220;
+      } else {
+        score -= 160;
+      }
+      if (!entryIsAlergi && entryIsMpAsi && plan.dietType === "MP-ASI") {
+        score += 90;
+      } else if (!entryIsAlergi && plan.dietType === targetDiet) {
+        score += 60;
+      }
+      if (entryPlanId && plan.id === entryPlanId) {
+        score += 45;
+      }
+      const planDayItem = plan.days?.[dayIndex]
+        ? normalizeMenuItem(plan.days[dayIndex])
+        : undefined;
+      if (planDayItem && composeMenuName(planDayItem)) {
+        score += 30;
+      }
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestPlan = plan;
+      }
+    });
+
+    if (bestPlan && bestScore > 0) return bestPlan;
+    if (entryPlanId) {
+      const byId = allPlans.find((p) => p.id === entryPlanId);
+      if (byId) return byId;
+    }
+    return activeMatchedPlan;
+  };
+
+  const resolveCategoryLegacyMenuItem = (sasaranIds: string[]): MenuItem | undefined => {
+    const ids = sasaranIds || [];
+    const isAlg = ids.some((id) => isAlergiSasaranId(id)) || selectedType === "Alergi";
+    const baseIds = ids.map((id) => stripAlergiPrefix(id));
+    if (baseIds.some((id) => MPASI_SASARAN_IDS.includes(id))) {
+      const raw = isAlg ? masterMenu.mpAsiAlergi?.[dayIndex] : masterMenu.mpAsi?.[dayIndex];
+      return raw ? normalizeMenuItem(raw) : undefined;
+    }
+    if (baseIds.some((id) => TIGAB_SASARAN_IDS.includes(id))) {
+      const raw = isAlg ? masterMenu.tigaBAlergi?.[dayIndex] : masterMenu.tigaB?.[dayIndex];
+      return raw ? normalizeMenuItem(raw) : undefined;
+    }
+    const raw = isAlg ? masterMenu.usiaSekolahAlergi?.[dayIndex] : masterMenu.usiaSekolah?.[dayIndex];
+    return raw ? normalizeMenuItem(raw) : undefined;
+  };
+
+  const resolveCategoryMenuItem = (entry: FoodCostCategoryEntry): MenuItem | undefined => {
+    const matchedPlan = resolveMatchedPlanForSasaran(entry.sasaranIds, entry.masterMenuPlanId);
+    const planItem = matchedPlan?.days?.[dayIndex]
+      ? normalizeMenuItem(matchedPlan.days[dayIndex])
+      : undefined;
+    if (planItem && composeMenuName(planItem)) return planItem;
+    const leg = resolveCategoryLegacyMenuItem(entry.sasaranIds);
+    if (leg && composeMenuName(leg)) return leg;
+    return effectiveMenuItem;
+  };
+
+  const resolveCategoryAutoMenuName = (entry: FoodCostCategoryEntry): string => {
+    const matchedPlan = resolveMatchedPlanForSasaran(entry.sasaranIds, entry.masterMenuPlanId);
+    const planItem = matchedPlan?.days?.[dayIndex]
+      ? normalizeMenuItem(matchedPlan.days[dayIndex])
+      : undefined;
+    const planName = composeMenuName(planItem);
+    if (planName) return planName;
+
+    const legItem = resolveCategoryLegacyMenuItem(entry.sasaranIds);
+    const legName = composeMenuName(legItem);
+    if (legName) return legName;
+
+    return (currentDayData.namaMenu || "").trim();
+  };
+
+  const resolveCategoryMenuName = (entry: FoodCostCategoryEntry): string => {
+    if (entry.customMenuName !== undefined) {
+      return entry.customMenuName;
+    }
+    return resolveCategoryAutoMenuName(entry) || namaMenuHariIni;
+  };
+
+  // Bi-directional Kelompok Sasaran sync: Master Menu <-> Food Cost (preserving Food Cost split/merge)
+  const MASTER_SASARAN_SIG_STORAGE_KEY = "sppg_fc_last_master_sasaran_list_v1";
+
+  const isUntouchedDefaultAlergiPlan = (plan: MasterMenuPlan): boolean => {
+    if (plan.id !== "plan_sekolah_alergi") return false;
+    const hasFilledDay = (plan.days || []).some((d) => Boolean(composeMenuName(normalizeMenuItem(d))));
+    if (hasFilledDay) return false;
+    const ids = plan.sasaranIds || [];
+    return (
+      ids.length === SEKOLAH_SASARAN_IDS.length &&
+      SEKOLAH_SASARAN_IDS.every((id) => ids.includes(id))
+    );
+  };
+
+  const extractMasterPlansSyncState = (plans: MasterMenuPlan[] | undefined) => {
+    if (!plans || plans.length === 0) return null;
+    const stdIds: string[] = [];
+    const algIds: string[] = [];
+    let hasExplicitAlergiSelection = false;
+
+    plans.forEach((plan) => {
+      if (isUntouchedDefaultAlergiPlan(plan)) return;
+      const planIsAlergi = plan.dietType === "Alergi";
+      (plan.sasaranIds || []).forEach((rawId) => {
+        if (isAlergiSasaranId(rawId)) {
+          hasExplicitAlergiSelection = true;
+          if (!algIds.includes(rawId)) algIds.push(rawId);
+        } else if (planIsAlergi) {
+          hasExplicitAlergiSelection = true;
+          const prefixed = `alergi_${rawId}`;
+          if (!algIds.includes(prefixed)) algIds.push(prefixed);
+        } else {
+          if (!stdIds.includes(rawId)) stdIds.push(rawId);
+        }
+      });
+    });
+
+    const combined = [...stdIds, ...algIds];
+    return {
+      stdIds,
+      algIds,
+      combined,
+      hasExplicitAlergiSelection,
+      signature: JSON.stringify({ stdIds, algIds, hasExplicitAlergiSelection }),
+    };
+  };
+
+  const reconcileGroupsWithMasterSasaranIds = (
+    currentGroups: FoodCostCategoryGroup[],
+    masterState: { stdIds: string[]; algIds: string[]; hasExplicitAlergiSelection: boolean }
+  ): FoodCostCategoryGroup[] => {
+    const allowedSet = new Set([...masterState.stdIds, ...masterState.algIds]);
+    const nextGroups: FoodCostCategoryGroup[] = [];
+
+    currentGroups.forEach((g) => {
+      const groupIsOnlyAlergi =
+        (g.sasaranIds || []).length > 0 &&
+        g.sasaranIds.every((id) => isAlergiSasaranId(id));
+
+      // Keep existing Food Cost Alergi groups untouched unless Master Menu explicitly configured Alergi categories
+      if (groupIsOnlyAlergi && !masterState.hasExplicitAlergiSelection) {
+        nextGroups.push(g);
+        return;
+      }
+
+      const keptIds = (g.sasaranIds || []).filter((id) => {
+        if (isAlergiSasaranId(id) && !masterState.hasExplicitAlergiSelection) return true;
+        return allowedSet.has(id);
+      });
+
+      if (keptIds.length === 0) return;
+
+      if (keptIds.length === g.sasaranIds.length) {
+        nextGroups.push(g);
+        return;
+      }
+
+      const prevAutoMergedTitle = g.sasaranIds.map((id) => resolveStaticSasaranLabel(id)).join(" + ");
+      const shouldRename =
+        keptIds.length === 1 ||
+        g.title === prevAutoMergedTitle ||
+        g.id.startsWith("cat_");
+
+      nextGroups.push({
+        ...g,
+        title: shouldRename
+          ? keptIds.length === 1
+            ? getSasaranLabel(keptIds[0])
+            : keptIds.map((id) => getSasaranLabel(id)).join(" + ")
+          : g.title,
+        sasaranIds: keptIds,
+      });
+    });
+
+    const alreadyAssigned = new Set(nextGroups.flatMap((g) => g.sasaranIds));
+    const missingFromMaster = [...masterState.stdIds, ...masterState.algIds].filter(
+      (id) => !alreadyAssigned.has(id)
+    );
+
+    missingFromMaster.forEach((sId) => {
+      nextGroups.push({
+        id: `cat_${sId}`,
+        title: getSasaranLabel(sId),
+        porsi: resolveDefaultPorsiForSasaran(sId),
+        sasaranIds: [sId],
+      });
+    });
+
+    if (nextGroups.length === 0) {
+      return buildDefaultGroupsForTabGroup(activeGroupKey);
+    }
+
+    return nextGroups;
+  };
+
+  // Sync Master Menu -> Food Cost on mount & whenever Master Menu plans change externally
+  React.useEffect(() => {
+    const rawPlans = masterMenu.plans;
+    if (!rawPlans || rawPlans.length === 0) return;
+
+    const masterState = extractMasterPlansSyncState(rawPlans);
+    if (!masterState || masterState.combined.length === 0) return;
+
+    const prevSig = localStorage.getItem(MASTER_SASARAN_SIG_STORAGE_KEY);
+    if (prevSig === masterState.signature) return;
+
+    localStorage.setItem(MASTER_SASARAN_SIG_STORAGE_KEY, masterState.signature);
+
+    const currentGroups =
+      appliedConfig.categoryGroupsByGroup?.[activeGroupKey] ||
+      buildDefaultGroupsForTabGroup(activeGroupKey);
+    const reconciled = reconcileGroupsWithMasterSasaranIds(currentGroups, masterState);
+
+    const isSameGroups =
+      reconciled.length === currentGroups.length &&
+      reconciled.every(
+        (g, idx) =>
+          g.id === currentGroups[idx].id &&
+          g.title === currentGroups[idx].title &&
+          g.porsi === currentGroups[idx].porsi &&
+          g.sasaranIds.length === currentGroups[idx].sasaranIds.length &&
+          g.sasaranIds.every((id, j) => id === currentGroups[idx].sasaranIds[j])
+      );
+
+    if (!isSameGroups) {
+      setDraftCategoryGroupsByGroup((prev) => ({
+        ...prev,
+        [activeGroupKey]: reconciled,
+      }));
+      setAppliedConfig((prev) => ({
+        ...prev,
+        confirmed: true,
+        layoutMode: "per_kategori",
+        scope: "all",
+        categoryGroupsByGroup: {
+          ...prev.categoryGroupsByGroup,
+          [activeGroupKey]: reconciled,
+        },
+      }));
+    }
+  }, [masterMenu.plans, masterMenu.lastSentAt]);
+
+  // Sync Food Cost -> Master Menu when user edits selected Kelompok Sasaran in Food Cost
+  const syncFoodCostCategoriesToMasterMenu = (nextGroups: FoodCostCategoryGroup[]) => {
+    if (!onMasterMenuChange) return;
+    const basePlans = normalizedMasterMenu.plans || [];
+    if (basePlans.length === 0) return;
+
+    const selectedUnion = Array.from(new Set(nextGroups.flatMap((g) => g.sasaranIds)));
+    const selectedSet = new Set(selectedUnion);
+    const selectedStdIds = selectedUnion.filter((id) => !isAlergiSasaranId(id));
+    const selectedAlgIds = selectedUnion.filter((id) => isAlergiSasaranId(id));
+
+    let nextPlans: MasterMenuPlan[] = basePlans.map((plan) => {
+      const planIsAlergi =
+        plan.dietType === "Alergi" || (plan.sasaranIds || []).some((id) => isAlergiSasaranId(id));
+
+      if (isUntouchedDefaultAlergiPlan(plan) && selectedAlgIds.length === 0) {
+        return plan;
+      }
+
+      const keptIds: string[] = [];
+      (plan.sasaranIds || []).forEach((rawId) => {
+        const canonical = planIsAlergi && !isAlergiSasaranId(rawId) ? `alergi_${rawId}` : rawId;
+        if (selectedSet.has(canonical) && !keptIds.includes(canonical)) {
+          keptIds.push(canonical);
+        }
+      });
+
+      return {
+        ...plan,
+        sasaranIds: keptIds,
+      };
+    });
+
+    const assignedAfterPrune = new Set(nextPlans.flatMap((p) => p.sasaranIds));
+
+    // Assign any newly selected standard IDs to the best matching non-alergi plan
+    const missingStd = selectedStdIds.filter((id) => !assignedAfterPrune.has(id));
+    if (missingStd.length > 0) {
+      missingStd.forEach((sId) => {
+        let targetIdx = -1;
+        if (MPASI_SASARAN_IDS.includes(sId)) {
+          targetIdx = nextPlans.findIndex(
+            (p) => p.dietType === "MP-ASI" || p.id === "plan_mpasi"
+          );
+        } else if (TIGAB_SASARAN_IDS.includes(sId)) {
+          targetIdx = nextPlans.findIndex(
+            (p) =>
+              p.dietType !== "Alergi" &&
+              (p.id === "plan_tigab_standar" ||
+                p.sasaranIds.some((pid) => TIGAB_SASARAN_IDS.includes(pid)))
+          );
+        }
+        if (targetIdx < 0) {
+          targetIdx = nextPlans.findIndex(
+            (p) => p.id === normalizedMasterMenu.activePlanId && p.dietType !== "Alergi"
+          );
+        }
+        if (targetIdx < 0) {
+          targetIdx = nextPlans.findIndex((p) => p.dietType !== "Alergi");
+        }
+        if (targetIdx < 0) targetIdx = 0;
+
+        if (nextPlans[targetIdx]) {
+          nextPlans[targetIdx] = {
+            ...nextPlans[targetIdx],
+            sasaranIds: [...nextPlans[targetIdx].sasaranIds, sId],
+          };
+        }
+      });
+    }
+
+    // Assign any newly selected Alergi IDs to an Alergi plan (or create one / attach to active plan)
+    const missingAlg = selectedAlgIds.filter((id) => !assignedAfterPrune.has(id));
+    if (missingAlg.length > 0) {
+      let algPlanIdx = nextPlans.findIndex((p) => p.dietType === "Alergi");
+      if (algPlanIdx < 0) {
+        algPlanIdx = nextPlans.findIndex(
+          (p) => p.id === normalizedMasterMenu.activePlanId
+        );
+      }
+      if (algPlanIdx < 0) algPlanIdx = 0;
+      if (nextPlans[algPlanIdx]) {
+        nextPlans[algPlanIdx] = {
+          ...nextPlans[algPlanIdx],
+          sasaranIds: Array.from(new Set([...nextPlans[algPlanIdx].sasaranIds, ...missingAlg])),
+        };
+      }
+    }
+
+    // Keep auto-generated titles aligned when sasaranIds change
+    nextPlans = nextPlans.map((plan, idx) => {
+      const oldPlan = basePlans[idx];
+      if (!oldPlan) return plan;
+      const oldAuto = buildCategoryLabelFromIds(oldPlan.sasaranIds || []);
+      const isDefaultOrAutoTitle =
+        !oldPlan.title ||
+        oldPlan.title === oldAuto ||
+        oldPlan.title === "BELUM ADA KATEGORI";
+      if (isDefaultOrAutoTitle) {
+        return {
+          ...plan,
+          title: buildCategoryLabelFromIds(plan.sasaranIds),
+        };
+      }
+      return plan;
+    });
+
+    const nextSyncState = extractMasterPlansSyncState(nextPlans);
+    if (nextSyncState) {
+      localStorage.setItem(MASTER_SASARAN_SIG_STORAGE_KEY, nextSyncState.signature);
+    }
+
+    const updatedMasterMenu = syncMasterMenuToLegacy({
+      ...normalizedMasterMenu,
+      plans: nextPlans,
+    });
+    onMasterMenuChange(updatedMasterMenu);
+  };
 
   const rawDateStr = currentDayData.tanggal || scheduleDates[dayIndex] || "";
   const currentCalendarDate = rawDateStr
@@ -2126,6 +2521,7 @@ export default function FoodCostTab({
     }
     const nextGroups = currentGroups.filter((g) => g.id !== groupId);
     syncGroupsState(nextGroups, "per_kategori");
+    syncFoodCostCategoriesToMasterMenu(nextGroups);
     setMergeSelectedGroupIds((prev) => prev.filter((id) => id !== groupId));
   };
 
@@ -2138,7 +2534,9 @@ export default function FoodCostTab({
       porsi: resolveDefaultPorsiForSasaran(sId),
       sasaranIds: [sId],
     };
-    syncGroupsState([...currentGroups, newGroup], "per_kategori");
+    const nextGroups = [...currentGroups, newGroup];
+    syncGroupsState(nextGroups, "per_kategori");
+    syncFoodCostCategoriesToMasterMenu(nextGroups);
   };
 
   const handleResetToSingleCategories = (allWithAlergi = false) => {
@@ -2151,12 +2549,13 @@ export default function FoodCostTab({
         }))
       : buildDefaultGroupsForTabGroup(activeGroupKey);
     syncGroupsState(nextGroups, "per_kategori");
+    syncFoodCostCategoriesToMasterMenu(nextGroups);
     setDraftLayoutMode("per_kategori");
     setMergeSelectedGroupIds([]);
     setFcNotice({
       type: "info",
       text: allWithAlergi
-        ? `Menampilkan seluruh ${nextGroups.length} kategori sasaran (Standar & Diet Alergi, masing-masing 1 Food Cost).`
+        ? `Menampilkan seluruh ${nextGroups.length} kategori sasaran (Standar & Diet Alergi, masing-masing 1 Food Cost) dan menyinkronkan ke Master Menu.`
         : `Masing-masing 1 kategori Food Cost aktif + grup Kategori Alergi sesuai kelompok terpilih.`,
     });
   };
@@ -2179,10 +2578,12 @@ export default function FoodCostTab({
         });
         return;
       }
-      syncGroupsState([...currentGroups, ...alergiGroupsToAdd], "per_kategori");
+      const nextGroups = [...currentGroups, ...alergiGroupsToAdd];
+      syncGroupsState(nextGroups, "per_kategori");
+      syncFoodCostCategoriesToMasterMenu(nextGroups);
       setFcNotice({
         type: "success",
-        text: `Berhasil menambahkan ${alergiGroupsToAdd.length} panel Kategori Alergi ke Food Cost.`,
+        text: `Berhasil menambahkan ${alergiGroupsToAdd.length} panel Kategori Alergi ke Food Cost & Master Menu.`,
       });
       return;
     }
@@ -2193,10 +2594,12 @@ export default function FoodCostTab({
       porsi: resolveDefaultPorsiForSasaran(a.id),
       sasaranIds: [a.id],
     }));
-    syncGroupsState([...currentGroups, ...newAlergiGroups], "per_kategori");
+    const nextGroups = [...currentGroups, ...newAlergiGroups];
+    syncGroupsState(nextGroups, "per_kategori");
+    syncFoodCostCategoriesToMasterMenu(nextGroups);
     setFcNotice({
       type: "success",
-      text: `Berhasil menambahkan ${newAlergiGroups.length} Kategori Alergi dari Tabel 2 ke panel Food Cost.`,
+      text: `Berhasil menambahkan ${newAlergiGroups.length} Kategori Alergi dari Tabel 2 ke panel Food Cost & Master Menu.`,
     });
   };
 
@@ -2217,14 +2620,16 @@ export default function FoodCostTab({
         text: `Belum ada kategori dengan jumlah PM > 0 pada Hari Ke-${selectedDay}. Menampilkan semua kategori default kelompok.`,
       });
       syncGroupsState(baseGroups, "per_kategori");
+      syncFoodCostCategoriesToMasterMenu(baseGroups);
       return;
     }
     syncGroupsState(positiveGroups, "per_kategori");
+    syncFoodCostCategoriesToMasterMenu(positiveGroups);
     setDraftLayoutMode("per_kategori");
     setMergeSelectedGroupIds([]);
     setFcNotice({
       type: "success",
-      text: `Menampilkan ${positiveGroups.length} kategori (Standar & Diet Alergi) yang memiliki Penerima Manfaat (PM > 0) di Tabel 2.`,
+      text: `Menampilkan ${positiveGroups.length} kategori (Standar & Diet Alergi) yang memiliki Penerima Manfaat (PM > 0) dan menyinkronkan ke Master Menu.`,
     });
   };
 
@@ -2387,15 +2792,49 @@ export default function FoodCostTab({
     const targetScope = options?.scope || "all";
 
     if (isPerKategoriMode) {
+      const buildBahanForMenuItem = (
+        menuItemToMap: MenuItem | undefined,
+        porsi: "besar" | "kecil",
+        prefix: string
+      ): BahanMakananInput[] => {
+        if (!menuItemToMap || !composeMenuName(menuItemToMap)) return [];
+        const comps = [
+          { text: menuItemToMap.karbohidrat, defaultTkpi: "beras_giling", defaultBeratPb: 80, defaultBeratPk: 50, defaultUrtPb: "1 piring", defaultUrtPk: "1/2 piring" },
+          { text: menuItemToMap.laukHewani, defaultTkpi: "daging_ayam_tanpa_kulit", defaultBeratPb: 65, defaultBeratPk: 40, defaultUrtPb: "1 potong md", defaultUrtPk: "1 potong kcl" },
+          { text: menuItemToMap.laukNabati, defaultTkpi: "tempe_kedelai", defaultBeratPb: 30, defaultBeratPk: 20, defaultUrtPb: "1 potong", defaultUrtPk: "1/2 potong" },
+          { text: menuItemToMap.sayur, defaultTkpi: "wortel_segar", defaultBeratPb: 40, defaultBeratPk: 25, defaultUrtPb: "1/2 gelas", defaultUrtPk: "1/3 gelas" },
+          { text: menuItemToMap.buah || menuItemToMap.buahSusu, defaultTkpi: "pisang_ambon", defaultBeratPb: 100, defaultBeratPk: 80, defaultUrtPb: "1 buah", defaultUrtPk: "1 buah kcl" },
+          ...(menuItemToMap.susu ? [{ text: menuItemToMap.susu, defaultTkpi: "susu_bubuk_fullcream", defaultBeratPb: 25, defaultBeratPk: 20, defaultUrtPb: "1 kotak/gls", defaultUrtPk: "1 kotak kcl" }] : [])
+        ];
+        const list: BahanMakananInput[] = [];
+        comps.forEach((comp, idx) => {
+          if (!comp.text || comp.text.trim() === "" || comp.text.toLowerCase().includes("tidak ada") || comp.text.toLowerCase() === "-") {
+            return;
+          }
+          const tkpiId = matchTkpi(comp.text, comp.defaultTkpi);
+          const hargaDb = standardPrices[tkpiId] || 20000;
+          list.push({
+            id: `${prefix}_auto_${idx}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
+            tkpiId,
+            beratBB: porsi === "besar" ? comp.defaultBeratPb : comp.defaultBeratPk,
+            urt: porsi === "besar" ? comp.defaultUrtPb : comp.defaultUrtPk,
+            hargaSatuan: hargaDb,
+          });
+        });
+        return list;
+      };
+
       let updatedCount = 0;
       const nextEntries = resolvedCategoryEntries.map((entry) => {
         if (targetScope !== "all" && entry.porsi !== targetScope) return entry;
         if (options?.onlyIfEmpty && (entry.bahanList || []).length > 0) return entry;
-        const sourceBahan = entry.porsi === "besar" ? pbBahan : pkBahan;
+        const entryMenuItem = resolveCategoryMenuItem(entry) || menuItem;
+        const mappedList = buildBahanForMenuItem(entryMenuItem, entry.porsi, `mm_${entry.id}`);
+        if (mappedList.length === 0) return entry;
         updatedCount++;
         return {
           ...entry,
-          bahanList: cloneBahanListFresh(sourceBahan, `mm_${entry.id}`),
+          bahanList: mappedList,
         };
       });
       if (updatedCount > 0) {
@@ -2403,7 +2842,7 @@ export default function FoodCostTab({
         if (!options?.silent) {
           setFcNotice({
             type: "success",
-            text: `Berhasil memetakan ${pbBahan.length} komponen menu "${namaMenuHariIni}" ke ${updatedCount} tabel kategori Food Cost.`,
+            text: `Berhasil memetakan komponen menu Master Menu ke ${updatedCount} tabel kategori Food Cost.`,
           });
         }
       }
@@ -2435,42 +2874,11 @@ export default function FoodCostTab({
   };
 
   const handleOpenCategoryConfirmModal = () => {
-    if (draftLayoutMode === "per_kategori") {
-      const currentGroups = draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
-      const filteredGroups = currentGroups.filter((g) => draftScope === "all" || g.porsi === draftScope);
-      if (filteredGroups.length === 0) {
-        setFcNotice({
-          type: "warning",
-          text: "Pilih minimal 1 kategori Food Cost sebelum melakukan konfirmasi.",
-        });
-        return;
-      }
-      setFcNotice(null);
-      setShowCategoryConfirmModal(true);
-      return;
-    }
-
-    const missingKecil = (draftScope === "kecil" || draftScope === "all") && draftKecilIds.length === 0;
-    const missingBesar = (draftScope === "besar" || draftScope === "all") && draftBesarIds.length === 0;
-
-    if (draftScope === "kecil" && missingKecil) {
+    const currentGroups = draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+    if (currentGroups.length === 0) {
       setFcNotice({
         type: "warning",
-        text: "Pilih minimal 1 kategori sasaran Porsi Kecil sebelum melakukan konfirmasi.",
-      });
-      return;
-    }
-    if (draftScope === "besar" && missingBesar) {
-      setFcNotice({
-        type: "warning",
-        text: "Pilih minimal 1 kategori sasaran Porsi Besar sebelum melakukan konfirmasi.",
-      });
-      return;
-    }
-    if (draftScope === "all" && missingKecil && missingBesar) {
-      setFcNotice({
-        type: "warning",
-        text: "Pilih minimal 1 kategori Porsi Kecil atau Porsi Besar terlebih dahulu sebelum konfirmasi.",
+        text: "Pilih minimal 1 kategori Food Cost sebelum melakukan konfirmasi.",
       });
       return;
     }
@@ -2479,41 +2887,33 @@ export default function FoodCostTab({
   };
 
   const handleConfirmApplyFoodCost = () => {
-    const resolvedKecilIds = draftScope === "besar" ? draftKecilIds : draftKecilIds;
-    const resolvedBesarIds = draftScope === "kecil" ? draftBesarIds : draftBesarIds;
+    const currentGroups =
+      draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
 
     setAppliedConfig((prev) => ({
       ...prev,
       confirmed: true,
-      layoutMode: draftLayoutMode,
-      scope: draftScope,
-      kecilIds: resolvedKecilIds,
-      besarIds: resolvedBesarIds,
+      layoutMode: "per_kategori",
+      scope: "all",
+      kecilIds: draftKecilIds,
+      besarIds: draftBesarIds,
       categoryGroupsByGroup: draftCategoryGroupsByGroup,
     }));
+    syncFoodCostCategoriesToMasterMenu(currentGroups);
     updateDayData({
       ...currentDayData,
-      activeMode: draftLayoutMode === "per_kategori" ? "kategori" : "porsi",
+      activeMode: "kategori",
     });
     setShowCategoryConfirmModal(false);
     setIsSelectorExpanded(false);
 
     if (autoFillOnConfirm && selectedGroup !== "custom") {
-      autoMatchFromMasterMenu({ silent: true, onlyIfEmpty: true, scope: draftScope });
+      autoMatchFromMasterMenu({ silent: true, onlyIfEmpty: true, scope: "all" });
     }
-
-    const modeLabel =
-      draftLayoutMode === "per_kategori"
-        ? "Masing-Masing 1 Kategori"
-        : draftScope === "kecil"
-          ? "Gabung Porsi Kecil"
-          : draftScope === "besar"
-            ? "Gabung Porsi Besar"
-            : "Gabung Semua Porsi (Kecil & Besar)";
 
     setFcNotice({
       type: "success",
-      text: `Konfirmasi berhasil! Menampilkan Food Cost dengan mode: ${modeLabel}.`,
+      text: `Konfirmasi berhasil! Menampilkan ${currentGroups.length} panel Food Cost dan menyinkronkan ke Master Menu.`,
     });
 
     setTimeout(() => {
@@ -2727,7 +3127,10 @@ export default function FoodCostTab({
       .sort((a, b) => b.costPerPortion - a.costPerPortion)
       .slice(0, 5);
 
-    setChangeMenuNameInput(namaMenuHariIni);
+    const matchingEntry = scope.startsWith("cat_")
+      ? resolvedCategoryEntries.find((e) => `cat_${e.id}` === scope)
+      : undefined;
+    setChangeMenuNameInput(matchingEntry ? resolveCategoryMenuName(matchingEntry) : namaMenuHariIni);
     setChangeMenuModal({
       isOpen: true,
       scope,
@@ -2937,6 +3340,8 @@ export default function FoodCostTab({
         };
         const entryBuffer = entry.bufferPct !== undefined ? entry.bufferPct : (currentDayData.bufferPct ?? 5);
 
+        const entryMenuName = resolveCategoryMenuName(entry) || "-";
+
         const sheetData: any[][] = [];
         sheetData.push([kopLine1]);
         sheetData.push([kopLine2]);
@@ -2944,7 +3349,7 @@ export default function FoodCostTab({
         sheetData.push([kopLine4]);
         sheetData.push([]);
         sheetData.push([`LAPORAN FOOD COST (ANALISIS BIAYA & GIZI) - ${entry.title.toUpperCase()} (${entry.porsi === "besar" ? "PORSI BESAR" : "PORSI KECIL"})`]);
-        sheetData.push(["Siklus Hari Ke:", selectedDay, "Kategori:", selectedType, "Menu:", namaMenuHariIni]);
+        sheetData.push(["Siklus Hari Ke:", selectedDay, "Kategori:", selectedType, "Menu:", entryMenuName]);
         sheetData.push(["Jumlah Penerima Manfaat (PM):", pmCount, "Penerima Manfaat"]);
         sheetData.push([]);
         sheetData.push([
@@ -2958,7 +3363,7 @@ export default function FoodCostTab({
         activeItems.forEach((b) => {
           sheetData.push([
             kriteriaPmText,
-            namaMenuHariIni || "-",
+            entryMenuName,
             b.nama,
             b.beratBB,
             b.urt,
@@ -3968,6 +4373,10 @@ export default function FoodCostTab({
     const tableKey = `cat_${entry.id}`;
     const bbHighlight = !isPrint && Boolean(pastedHighlightMap[tableKey]);
     const kriteriaPmText = entry.kriteriaPm !== undefined ? entry.kriteriaPm : entry.title;
+    const autoMenuName = resolveCategoryAutoMenuName(entry);
+    const resolvedMenuText =
+      entry.customMenuName !== undefined ? entry.customMenuName : autoMenuName || namaMenuHariIni;
+    const isCustomMenuOverride = entry.customMenuName !== undefined;
 
     if (items.length === 0) {
       if (isPrint) {
@@ -4079,7 +4488,46 @@ export default function FoodCostTab({
                 )}
                 {idx === 0 && (
                   <td rowSpan={items.length} className="p-1 border border-black text-center font-bold bg-[#F2F2F2] align-middle text-[10px] w-[110px] min-w-[110px] break-words text-slate-950">
-                    {namaMenuHariIni || "-"}
+                    {isPrint ? (
+                      <span className="block p-1 text-[10px] font-bold text-slate-950 break-words">
+                        {resolvedMenuText || "-"}
+                      </span>
+                    ) : (
+                      <div className="flex flex-col items-center gap-1 w-full">
+                        <textarea
+                          value={resolvedMenuText}
+                          onChange={(e) =>
+                            updateCategoryEntry(entry.id, (cur) => ({
+                              ...cur,
+                              customMenuName: e.target.value,
+                            }))
+                          }
+                          className="w-full text-center bg-transparent hover:bg-white/70 focus:bg-white border-0 font-bold text-[10px] text-slate-950 focus:ring-1 focus:ring-indigo-500 p-1 rounded resize-none overflow-hidden"
+                          rows={3}
+                          placeholder={autoMenuName || "Isi Nama Menu..."}
+                          title="Nama menu mengikuti Master Menu secara otomatis, atau ubah langsung di sini"
+                        />
+                        {isCustomMenuOverride && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateCategoryEntry(entry.id, (cur) => ({
+                                ...cur,
+                                customMenuName: undefined,
+                              }))
+                            }
+                            className="px-1.5 py-0.5 rounded bg-indigo-50 hover:bg-indigo-100 text-[9px] font-extrabold text-indigo-700 border border-indigo-200 transition cursor-pointer no-print"
+                            title={
+                              autoMenuName
+                                ? `Ikuti Master Menu: "${autoMenuName}"`
+                                : "Kembalikan sinkronisasi otomatis Master Menu"
+                            }
+                          >
+                            Ikuti Master
+                          </button>
+                        )}
+                      </div>
+                    )}
                   </td>
                 )}
                 <td className="p-1 border border-black font-semibold w-[160px] min-w-[160px] text-center">
@@ -5389,33 +5837,20 @@ export default function FoodCostTab({
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <h4 className="text-xs font-black text-slate-900 uppercase tracking-wide">
-                      Pilih & Pilah Kategori Food Cost
+                      Pilih &amp; Pilah Kategori Food Cost
                     </h4>
                     {appliedConfig.confirmed ? (
-                      isPerKategoriMode ? (
-                        <span className="px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-black uppercase">
-                          Aktif: Masing-Masing Kategori ({resolvedCategoryEntries.length} Panel Food Cost)
-                        </span>
-                      ) : (
-                        <span className="px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-800 border border-indigo-200 text-[10px] font-black uppercase">
-                          Aktif: Gabung{" "}
-                          {appliedConfig.scope === "kecil"
-                            ? "Porsi Kecil"
-                            : appliedConfig.scope === "besar"
-                              ? "Porsi Besar"
-                              : "Semua Porsi (Kecil & Besar)"}
-                        </span>
-                      )
+                      <span className="px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-800 border border-emerald-200 text-[10px] font-black uppercase">
+                        Aktif: {resolvedCategoryEntries.length} Panel Food Cost (Tersinkron Master Menu)
+                      </span>
                     ) : (
                       <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-800 border border-amber-200 text-[10px] font-black uppercase">
-                        Menunggu Pemilihan & Konfirmasi
+                        Menunggu Pemilihan &amp; Konfirmasi
                       </span>
                     )}
                   </div>
                   <p className="text-[11px] text-slate-500 mt-0.5">
-                    {isPerKategoriMode
-                      ? "Tampilan default: masing-masing 1 kategori sasaran memiliki panel Food Cost sendiri. Anda dapat mencentang & menyatukan beberapa kategori menjadi 1 Food Cost kapan saja."
-                      : "Mode gabung per porsi: seluruh kategori Porsi Kecil dan Porsi Besar digabung menjadi maksimal 2 tabel Food Cost."}
+                    Pemilihan kelompok sasaran &amp; nama menu tersinkronisasi otomatis dengan Master Menu. Di Food Cost Anda bebas memecah per kategori atau menyatukan beberapa kategori terpilih menjadi 1 Food Cost.
                   </p>
                 </div>
               </div>
@@ -5441,510 +5876,251 @@ export default function FoodCostTab({
 
             {isSelectorExpanded && (
               <div className="p-5 space-y-5">
-                {/* Step 1: Layout Mode Switcher & Scope Filter */}
-                <div className="space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">
-                      1. Pilih Mode Panel Food Cost
-                    </span>
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase mr-1">Filter Porsi:</span>
-                      {(
-                        [
-                          { id: "all", label: "Semua Porsi" },
-                          { id: "kecil", label: "Hanya Porsi Kecil" },
-                          { id: "besar", label: "Hanya Porsi Besar" },
-                        ] as const
-                      ).map((sc) => (
-                        <button
-                          key={sc.id}
-                          type="button"
-                          onClick={() => {
-                            handleSelectDraftScope(sc.id);
-                            if (draftLayoutMode === "per_kategori") {
-                              setAppliedConfig((prev) => ({
-                                ...prev,
-                                confirmed: true,
-                                layoutMode: "per_kategori",
-                                scope: sc.id,
-                              }));
-                            }
-                          }}
-                          className={`px-2.5 py-1 rounded-lg text-[10px] font-extrabold border transition cursor-pointer ${
-                            draftScope === sc.id
-                              ? "bg-slate-900 text-white border-slate-900"
-                              : "bg-white text-slate-600 border-slate-200 hover:border-slate-300"
-                          }`}
-                        >
-                          {sc.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
+                {/* Step 1: Per-Kategori + Selective Merge UI */}
+                {(() => {
+                  const currentGroups =
+                    draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+                  const assignedIds = new Set(currentGroups.flatMap((g) => g.sasaranIds));
+                  const omittedCategories = ALL_KATEGORI_WITH_ALERGI.filter((s) => !assignedIds.has(s.id));
 
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <button
-                      type="button"
-                      onClick={() => handleSwitchLayoutMode("per_kategori")}
-                      className={`p-3.5 rounded-xl border text-left transition cursor-pointer ${
-                        draftLayoutMode === "per_kategori"
-                          ? "bg-emerald-50 border-emerald-500 ring-2 ring-emerald-500/20"
-                          : "bg-slate-50/70 border-slate-200 hover:border-emerald-300"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-black text-emerald-950 uppercase flex items-center gap-1.5">
-                          <Layers className="w-3.5 h-3.5 text-emerald-600" />
-                          Masing-Masing 1 Kategori
-                        </span>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800">
-                          Bisa Satukan Pilihan
-                        </span>
+                  return (
+                    <div className="space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
+                            1. Kelola Kelompok Sasaran &amp; Satukan Kategori Terpilih
+                          </span>
+                          <p className="text-[11px] text-slate-500">
+                            Centang minimal 2 kartu kategori (Standar maupun{" "}
+                            <strong className="text-orange-700">Diet Alergi</strong>) lalu klik{" "}
+                            <strong className="text-indigo-700">Satukan Kategori Terpilih</strong> untuk menggabungkan jadi 1 Food Cost, atau klik <strong>Pisahkan</strong> untuk memecah kembali.
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={handleKeepOnlyPmPositiveCategories}
+                            className="px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[10px] font-extrabold transition cursor-pointer"
+                          >
+                            Hanya Ada PM &gt; 0
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleResetToSingleCategories(false)}
+                            className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 text-[10px] font-extrabold transition cursor-pointer"
+                          >
+                            Sesuai Kelompok + Alergi
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleResetToSingleCategories(true)}
+                            className="px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 text-[10px] font-extrabold transition cursor-pointer"
+                          >
+                            Semua 24 Kategori (Standar &amp; Alergi)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleAddAllAlergiCategories}
+                            className="px-2.5 py-1.5 rounded-lg bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-800 text-[10px] font-extrabold transition cursor-pointer"
+                          >
+                            + Kategori Alergi
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setShowCrossGroupPicker((prev) => !prev)}
+                            className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-extrabold transition cursor-pointer ${
+                              showCrossGroupPicker
+                                ? "bg-amber-100 border-amber-300 text-amber-900"
+                                : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                            }`}
+                          >
+                            + Tambah Kategori Lainnya ({omittedCategories.length})
+                          </button>
+                        </div>
                       </div>
-                      <p className="text-[11px] text-slate-600 mt-1">
-                        Setiap kategori penerima manfaat tampil terpisah 1 Food Cost. Centang 2+ kategori di bawah jika ingin menyatukannya menjadi 1 Food Cost.
-                      </p>
-                    </button>
 
-                    <button
-                      type="button"
-                      onClick={() => handleSwitchLayoutMode("gabung_porsi")}
-                      className={`p-3.5 rounded-xl border text-left transition cursor-pointer ${
-                        draftLayoutMode === "gabung_porsi"
-                          ? "bg-indigo-50 border-indigo-500 ring-2 ring-indigo-500/20"
-                          : "bg-slate-50/70 border-slate-200 hover:border-indigo-300"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-xs font-black text-indigo-950 uppercase flex items-center gap-1.5">
-                          <Combine className="w-3.5 h-3.5 text-indigo-600" />
-                          Gabung Semua per Porsi (Besar & Kecil)
-                        </span>
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded bg-indigo-100 text-indigo-800">
-                          2 Panel Gabungan
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-600 mt-1">
-                        Menggabungkan seluruh kategori Porsi Kecil dan Porsi Besar ke dalam 2 tabel Food Cost gabungan (Besar & Kecil).
-                      </p>
-                    </button>
-                  </div>
-                </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+                        {currentGroups.map((g) => {
+                          const isChecked = mergeSelectedGroupIds.includes(g.id);
+                          const autoPm = getEntryAutoPmCount(g.sasaranIds, g.porsi);
+                          const isMerged = g.sasaranIds.length > 1;
+                          const isAlergiGroup = g.sasaranIds.some((id) => isAlergiSasaranId(id));
 
-                {/* Step 2A: Per-Kategori + Selective Merge UI */}
-                {draftLayoutMode === "per_kategori" ? (
-                  (() => {
-                    const currentGroups =
-                      draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
-                    const assignedIds = new Set(currentGroups.flatMap((g) => g.sasaranIds));
-                    const omittedCategories = ALL_KATEGORI_WITH_ALERGI.filter((s) => !assignedIds.has(s.id));
-
-                    return (
-                      <div className="space-y-3 pt-2 border-t border-slate-100">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div>
-                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
-                              2. Kelola Panel Kategori & Satukan Kategori Terpilih
-                            </span>
-                            <p className="text-[11px] text-slate-500">
-                              Centang minimal 2 kartu kategori (Standar maupun{" "}
-                              <strong className="text-orange-700">Diet Alergi</strong>) lalu klik{" "}
-                              <strong className="text-indigo-700">Satukan Kategori Terpilih</strong> untuk menggabungkan jadi 1 Food Cost.
-                            </p>
-                          </div>
-
-                          <div className="flex flex-wrap items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={handleKeepOnlyPmPositiveCategories}
-                              className="px-2.5 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[10px] font-extrabold transition cursor-pointer"
-                            >
-                              Hanya Ada PM &gt; 0
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleResetToSingleCategories(false)}
-                              className="px-2.5 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 text-[10px] font-extrabold transition cursor-pointer"
-                            >
-                              Sesuai Kelompok + Alergi
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleResetToSingleCategories(true)}
-                              className="px-2.5 py-1.5 rounded-lg bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 text-[10px] font-extrabold transition cursor-pointer"
-                            >
-                              Semua 24 Kategori (Standar &amp; Alergi)
-                            </button>
-                            <button
-                              type="button"
-                              onClick={handleAddAllAlergiCategories}
-                              className="px-2.5 py-1.5 rounded-lg bg-orange-50 hover:bg-orange-100 border border-orange-200 text-orange-800 text-[10px] font-extrabold transition cursor-pointer"
-                            >
-                              + Kategori Alergi
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => setShowCrossGroupPicker((prev) => !prev)}
-                              className={`px-2.5 py-1.5 rounded-lg border text-[10px] font-extrabold transition cursor-pointer ${
-                                showCrossGroupPicker
-                                  ? "bg-amber-100 border-amber-300 text-amber-900"
-                                  : "bg-white border-slate-200 text-slate-600 hover:bg-slate-50"
+                          return (
+                            <div
+                              key={g.id}
+                              className={`rounded-xl border p-3 transition flex flex-col justify-between gap-2 ${
+                                isChecked
+                                  ? "bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 shadow-xs"
+                                  : isAlergiGroup
+                                    ? "bg-orange-50/50 border-orange-300"
+                                    : isMerged
+                                      ? "bg-amber-50/50 border-amber-300"
+                                      : "bg-slate-50/60 border-slate-200 hover:border-slate-300"
                               }`}
                             >
-                              + Tambah Kategori Lainnya ({omittedCategories.length})
+                              <div className="flex items-start justify-between gap-2">
+                                <label className="flex items-start gap-2 cursor-pointer min-w-0 flex-1">
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() => toggleMergeSelection(g.id)}
+                                    className="mt-0.5 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500 shrink-0"
+                                  />
+                                  <div className="min-w-0">
+                                    <span className="text-xs font-black text-slate-900 block break-words leading-snug">
+                                      {g.title}
+                                    </span>
+                                    <div className="flex flex-wrap items-center gap-1 mt-1">
+                                      <span
+                                        className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase ${
+                                          g.porsi === "besar"
+                                            ? "bg-amber-100 text-amber-800"
+                                            : "bg-cyan-100 text-cyan-800"
+                                        }`}
+                                      >
+                                        {g.porsi === "besar" ? "Porsi Besar" : "Porsi Kecil"}
+                                      </span>
+                                      {isAlergiGroup && (
+                                        <span className="px-1.5 py-0.5 rounded bg-orange-100 text-orange-800 text-[9px] font-black uppercase">
+                                          Diet Alergi
+                                        </span>
+                                      )}
+                                      <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-[9px] font-mono font-bold text-slate-700">
+                                        {autoPm} PM
+                                      </span>
+                                      {isMerged && (
+                                        <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-black">
+                                          Gabungan {g.sasaranIds.length}
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+                                </label>
+
+                                <div className="flex items-center gap-1 shrink-0">
+                                  {isMerged && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSplitMergedGroup(g.id)}
+                                      title="Pisahkan kembali menjadi kategori masing-masing"
+                                      className="px-2 py-1 rounded-lg bg-white hover:bg-amber-100 border border-amber-300 text-amber-800 text-[10px] font-extrabold flex items-center gap-1 cursor-pointer transition"
+                                    >
+                                      <Split className="w-3 h-3" />
+                                      Pisahkan
+                                    </button>
+                                  )}
+                                  {currentGroups.length > 1 && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRemoveGroupFromActive(g.id)}
+                                      title="Hapus kategori ini dari tampilan & sinkronkan ke Master Menu"
+                                      className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer"
+                                    >
+                                      <X className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+
+                              {isMerged && (
+                                <div className="text-[10px] text-slate-600 bg-white/80 rounded-lg px-2 py-1 border border-amber-200/70 font-semibold">
+                                  Termasuk: {g.sasaranIds.map((id) => getSasaranLabel(id)).join(", ")}
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Merge Selected Categories Action Bar */}
+                      {mergeSelectedGroupIds.length >= 2 && (
+                        <div className="p-3.5 rounded-xl bg-indigo-50 border-2 border-indigo-300 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                          <div className="flex flex-col sm:flex-row sm:items-center gap-2 flex-1">
+                            <span className="text-xs font-black text-indigo-950 shrink-0">
+                              {mergeSelectedGroupIds.length} Kategori Dipilih:
+                            </span>
+                            <input
+                              type="text"
+                              value={mergeCustomTitle}
+                              onChange={(e) => setMergeCustomTitle(e.target.value)}
+                              placeholder="Nama Food Cost gabungan (opsional, kosongkan agar otomatis)"
+                              className="flex-1 bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
+                            />
+                            <select
+                              value={mergeCustomPorsi}
+                              onChange={(e) => setMergeCustomPorsi(e.target.value as "auto" | "kecil" | "besar")}
+                              className="bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800 focus:outline-none"
+                            >
+                              <option value="auto">Plafon &amp; Porsi Otomatis</option>
+                              <option value="besar">Tetapkan Porsi Besar</option>
+                              <option value="kecil">Tetapkan Porsi Kecil</option>
+                            </select>
+                          </div>
+                          <div className="flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              onClick={handleMergeSelectedDraftGroups}
+                              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-black flex items-center gap-1.5 shadow-xs transition cursor-pointer"
+                            >
+                              <Combine className="w-3.5 h-3.5" />
+                              Satukan {mergeSelectedGroupIds.length} Kategori Terpilih menjadi 1 Food Cost
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setMergeSelectedGroupIds([])}
+                              className="px-3 py-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 rounded-xl text-xs font-bold transition cursor-pointer"
+                            >
+                              Batal Pilih
                             </button>
                           </div>
                         </div>
+                      )}
 
-                        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-                          {currentGroups.map((g) => {
-                            const isChecked = mergeSelectedGroupIds.includes(g.id);
-                            const autoPm = getEntryAutoPmCount(g.sasaranIds, g.porsi);
-                            const isMerged = g.sasaranIds.length > 1;
-                            const isAlergiGroup = g.sasaranIds.some((id) => isAlergiSasaranId(id));
-                            const isHiddenByScope = draftScope !== "all" && g.porsi !== draftScope;
-
-                            return (
-                              <div
-                                key={g.id}
-                                className={`rounded-xl border p-3 transition flex flex-col justify-between gap-2 ${
-                                  isChecked
-                                    ? "bg-indigo-50/80 border-indigo-400 ring-2 ring-indigo-500/20 shadow-xs"
-                                    : isAlergiGroup
-                                      ? "bg-orange-50/50 border-orange-300"
-                                      : isMerged
-                                        ? "bg-amber-50/50 border-amber-300"
-                                        : "bg-slate-50/60 border-slate-200 hover:border-slate-300"
-                                } ${isHiddenByScope ? "opacity-55" : ""}`}
-                              >
-                                <div className="flex items-start justify-between gap-2">
-                                  <label className="flex items-start gap-2 cursor-pointer min-w-0 flex-1">
-                                    <input
-                                      type="checkbox"
-                                      checked={isChecked}
-                                      onChange={() => toggleMergeSelection(g.id)}
-                                      className="mt-0.5 rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500 shrink-0"
-                                    />
-                                    <div className="min-w-0">
-                                      <span className="text-xs font-black text-slate-900 block break-words leading-snug">
-                                        {g.title}
-                                      </span>
-                                      <div className="flex flex-wrap items-center gap-1 mt-1">
-                                        <span
-                                          className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase ${
-                                            g.porsi === "besar"
-                                              ? "bg-amber-100 text-amber-800"
-                                              : "bg-cyan-100 text-cyan-800"
-                                          }`}
-                                        >
-                                          {g.porsi === "besar" ? "Porsi Besar" : "Porsi Kecil"}
-                                        </span>
-                                        {isAlergiGroup && (
-                                          <span className="px-1.5 py-0.5 rounded bg-orange-100 text-orange-800 text-[9px] font-black uppercase">
-                                            Diet Alergi
-                                          </span>
-                                        )}
-                                        <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-[9px] font-mono font-bold text-slate-700">
-                                          {autoPm} PM
-                                        </span>
-                                        {isMerged && (
-                                          <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[9px] font-black">
-                                            Gabungan {g.sasaranIds.length}
-                                          </span>
-                                        )}
-                                      </div>
-                                    </div>
-                                  </label>
-
-                                  <div className="flex items-center gap-1 shrink-0">
-                                    {isMerged && (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleSplitMergedGroup(g.id)}
-                                        title="Pisahkan kembali menjadi kategori masing-masing"
-                                        className="px-2 py-1 rounded-lg bg-white hover:bg-amber-100 border border-amber-300 text-amber-800 text-[10px] font-extrabold flex items-center gap-1 cursor-pointer transition"
-                                      >
-                                        <Split className="w-3 h-3" />
-                                        Pisahkan
-                                      </button>
-                                    )}
-                                    {currentGroups.length > 1 && (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleRemoveGroupFromActive(g.id)}
-                                        title="Sembunyikan kategori ini dari tampilan"
-                                        className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition cursor-pointer"
-                                      >
-                                        <X className="w-3.5 h-3.5" />
-                                      </button>
-                                    )}
-                                  </div>
-                                </div>
-
-                                {isMerged && (
-                                  <div className="text-[10px] text-slate-600 bg-white/80 rounded-lg px-2 py-1 border border-amber-200/70 font-semibold">
-                                    Termasuk: {g.sasaranIds.map((id) => getSasaranLabel(id)).join(", ")}
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          })}
+                      {/* Omitted / Cross-Group & Alergi Categories Picker */}
+                      {(showCrossGroupPicker || omittedCategories.length > 0) && omittedCategories.length > 0 && (
+                        <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
+                          <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
+                            Tambahkan Kategori Lain / Kategori Alergi ke Panel Food Cost &amp; Master Menu:
+                          </span>
+                          <div className="flex flex-wrap gap-1.5">
+                            {omittedCategories.map((s) => {
+                              const defPorsi = resolveDefaultPorsiForSasaran(s.id);
+                              const cnt = getSasaranPmCount(s.id, defPorsi);
+                              const isAlg = !!s.isAlergi;
+                              return (
+                                <button
+                                  key={s.id}
+                                  type="button"
+                                  onClick={() => handleAddSingleCategoryToActive(s.id)}
+                                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold transition cursor-pointer inline-flex items-center gap-1 ${
+                                    isAlg
+                                      ? "bg-orange-50/70 hover:bg-orange-100 border-orange-200 text-orange-900"
+                                      : "bg-white hover:bg-indigo-50 border-slate-200 hover:border-indigo-300 text-slate-700 hover:text-indigo-800"
+                                  }`}
+                                >
+                                  <Plus className={`w-3 h-3 ${isAlg ? "text-orange-600" : "text-indigo-600"}`} />
+                                  {s.label}
+                                  <span className={`text-[10px] font-mono ${isAlg ? "text-orange-700" : "text-slate-400"}`}>
+                                    ({cnt})
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
                         </div>
-
-                        {/* Merge Selected Categories Action Bar */}
-                        {mergeSelectedGroupIds.length >= 2 && (
-                          <div className="p-3.5 rounded-xl bg-indigo-50 border-2 border-indigo-300 flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-                            <div className="flex flex-col sm:flex-row sm:items-center gap-2 flex-1">
-                              <span className="text-xs font-black text-indigo-950 shrink-0">
-                                {mergeSelectedGroupIds.length} Kategori Dipilih:
-                              </span>
-                              <input
-                                type="text"
-                                value={mergeCustomTitle}
-                                onChange={(e) => setMergeCustomTitle(e.target.value)}
-                                placeholder="Nama Food Cost gabungan (opsional, kosongkan agar otomatis)"
-                                className="flex-1 bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-semibold text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/30"
-                              />
-                              <select
-                                value={mergeCustomPorsi}
-                                onChange={(e) => setMergeCustomPorsi(e.target.value as "auto" | "kecil" | "besar")}
-                                className="bg-white border border-indigo-200 rounded-lg px-2.5 py-1.5 text-xs font-bold text-slate-800 focus:outline-none"
-                              >
-                                <option value="auto">Plafon &amp; Porsi Otomatis</option>
-                                <option value="besar">Tetapkan Porsi Besar</option>
-                                <option value="kecil">Tetapkan Porsi Kecil</option>
-                              </select>
-                            </div>
-                            <div className="flex items-center gap-2 shrink-0">
-                              <button
-                                type="button"
-                                onClick={handleMergeSelectedDraftGroups}
-                                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-black flex items-center gap-1.5 shadow-xs transition cursor-pointer"
-                              >
-                                <Combine className="w-3.5 h-3.5" />
-                                Satukan {mergeSelectedGroupIds.length} Kategori Terpilih menjadi 1 Food Cost
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setMergeSelectedGroupIds([])}
-                                className="px-3 py-2 bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 rounded-xl text-xs font-bold transition cursor-pointer"
-                              >
-                                Batal Pilih
-                              </button>
-                            </div>
-                          </div>
-                        )}
-
-                        {/* Omitted / Cross-Group & Alergi Categories Picker */}
-                        {(showCrossGroupPicker || omittedCategories.length > 0) && omittedCategories.length > 0 && (
-                          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200/80 space-y-2">
-                            <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider block">
-                              Tambahkan Kategori Lain / Kategori Alergi ke Panel Food Cost:
-                            </span>
-                            <div className="flex flex-wrap gap-1.5">
-                              {omittedCategories.map((s) => {
-                                const defPorsi = resolveDefaultPorsiForSasaran(s.id);
-                                const cnt = getSasaranPmCount(s.id, defPorsi);
-                                const isAlg = !!s.isAlergi;
-                                return (
-                                  <button
-                                    key={s.id}
-                                    type="button"
-                                    onClick={() => handleAddSingleCategoryToActive(s.id)}
-                                    className={`px-2.5 py-1 rounded-lg border text-[11px] font-bold transition cursor-pointer inline-flex items-center gap-1 ${
-                                      isAlg
-                                        ? "bg-orange-50/70 hover:bg-orange-100 border-orange-200 text-orange-900"
-                                        : "bg-white hover:bg-indigo-50 border-slate-200 hover:border-indigo-300 text-slate-700 hover:text-indigo-800"
-                                    }`}
-                                  >
-                                    <Plus className={`w-3 h-3 ${isAlg ? "text-orange-600" : "text-indigo-600"}`} />
-                                    {s.label}
-                                    <span className={`text-[10px] font-mono ${isAlg ? "text-orange-700" : "text-slate-400"}`}>
-                                      ({cnt})
-                                    </span>
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })()
-                ) : (
-                  /* Step 2B: Separated Porsi Kecil & Porsi Besar Checklists (Gabung per Porsi) */
-                  <div className="space-y-2 pt-2 border-t border-slate-100">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="text-[10px] font-black text-slate-500 uppercase tracking-wider">
-                        2. Pilah Kategori Penerima Manfaat yang Diterapkan (Mode Gabung per Porsi)
-                      </span>
-                      {onNavigateToPM && (
-                        <button
-                          type="button"
-                          onClick={onNavigateToPM}
-                          className="text-[11px] font-bold text-indigo-600 hover:text-indigo-800 cursor-pointer"
-                        >
-                          Ubah Klasifikasi Porsi di Data PM →
-                        </button>
                       )}
                     </div>
+                  );
+                })()}
 
-                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                      {/* Porsi Kecil Categories Card */}
-                      <div
-                        className={`rounded-xl border p-4 space-y-3 transition ${
-                          draftScope === "besar"
-                            ? "bg-slate-50 border-slate-200 opacity-55"
-                            : "bg-indigo-50/40 border-indigo-200"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2 border-b border-indigo-200/60 pb-2">
-                          <div>
-                            <span className="text-xs font-black text-indigo-950 uppercase">
-                              Kategori Porsi Kecil
-                            </span>
-                            <p className="text-[10px] text-indigo-700 font-semibold">
-                              Plafon {formatRupiah(activeTargetPriceKecil)}/porsi · Terpilih {draftKecilIds.length}/{defaultKecilIds.length}
-                            </p>
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              disabled={draftScope === "besar"}
-                              onClick={() => setDraftKecilIds(defaultKecilIds)}
-                              className="px-2.5 py-1 rounded-lg bg-white border border-indigo-200 text-[10px] font-bold text-indigo-700 hover:bg-indigo-50 disabled:opacity-50 cursor-pointer"
-                            >
-                              Pilih Semua
-                            </button>
-                            <button
-                              type="button"
-                              disabled={draftScope === "besar"}
-                              onClick={() => setDraftKecilIds([])}
-                              className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
-                            >
-                              Kosongkan
-                            </button>
-                          </div>
-                        </div>
-
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          {defaultKecilIds.map((sId) => {
-                            const checked = draftKecilIds.includes(sId);
-                            const label = getSasaranLabel(sId);
-                            const count = getSasaranPmCount(sId, "kecil");
-                            return (
-                              <label
-                                key={sId}
-                                className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border text-xs cursor-pointer transition ${
-                                  checked
-                                    ? "bg-white border-indigo-400 text-indigo-950 font-bold shadow-2xs"
-                                    : "bg-white/60 border-slate-200 text-slate-600 font-medium"
-                                }`}
-                              >
-                                <span className="flex items-center gap-2 min-w-0">
-                                  <input
-                                    type="checkbox"
-                                    disabled={draftScope === "besar"}
-                                    checked={checked}
-                                    onChange={() => toggleDraftCategory("kecil", sId)}
-                                    className="rounded border-indigo-300 text-indigo-600 focus:ring-indigo-500"
-                                  />
-                                  <span className="truncate">{label}</span>
-                                </span>
-                                <span className="text-[10px] font-mono font-bold text-indigo-700 shrink-0">
-                                  {count} PM
-                                </span>
-                              </label>
-                            );
-                          })}
-                        </div>
-                      </div>
-
-                      {/* Porsi Besar Categories Card */}
-                      <div
-                        className={`rounded-xl border p-4 space-y-3 transition ${
-                          draftScope === "kecil"
-                            ? "bg-slate-50 border-slate-200 opacity-55"
-                            : "bg-cyan-50/40 border-cyan-200"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2 border-b border-cyan-200/60 pb-2">
-                          <div>
-                            <span className="text-xs font-black text-cyan-950 uppercase">
-                              Kategori Porsi Besar
-                            </span>
-                            <p className="text-[10px] text-cyan-800 font-semibold">
-                              Plafon {formatRupiah(activeTargetPriceBesar)}/porsi · Terpilih {draftBesarIds.length}/{defaultBesarIds.length}
-                            </p>
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              disabled={draftScope === "kecil"}
-                              onClick={() => setDraftBesarIds(defaultBesarIds)}
-                              className="px-2.5 py-1 rounded-lg bg-white border border-cyan-200 text-[10px] font-bold text-cyan-800 hover:bg-cyan-50 disabled:opacity-50 cursor-pointer"
-                            >
-                              Pilih Semua
-                            </button>
-                            <button
-                              type="button"
-                              disabled={draftScope === "kecil"}
-                              onClick={() => setDraftBesarIds([])}
-                              className="px-2.5 py-1 rounded-lg bg-white border border-slate-200 text-[10px] font-bold text-slate-600 hover:bg-slate-100 disabled:opacity-50 cursor-pointer"
-                            >
-                              Kosongkan
-                            </button>
-                          </div>
-                        </div>
-
-                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                          {defaultBesarIds.map((sId) => {
-                            const checked = draftBesarIds.includes(sId);
-                            const label = getSasaranLabel(sId);
-                            const count = getSasaranPmCount(sId, "besar");
-                            return (
-                              <label
-                                key={sId}
-                                className={`flex items-center justify-between gap-2 px-3 py-2 rounded-lg border text-xs cursor-pointer transition ${
-                                  checked
-                                    ? "bg-white border-cyan-500 text-cyan-950 font-bold shadow-2xs"
-                                    : "bg-white/60 border-slate-200 text-slate-600 font-medium"
-                                }`}
-                              >
-                                <span className="flex items-center gap-2 min-w-0">
-                                  <input
-                                    type="checkbox"
-                                    disabled={draftScope === "kecil"}
-                                    checked={checked}
-                                    onChange={() => toggleDraftCategory("besar", sId)}
-                                    className="rounded border-cyan-300 text-cyan-600 focus:ring-cyan-500"
-                                  />
-                                  <span className="truncate">{label}</span>
-                                </span>
-                                <span className="text-[10px] font-mono font-bold text-cyan-800 shrink-0">
-                                  {count} PM
-                                </span>
-                              </label>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* Step 3: Confirmation CTA */}
+                {/* Step 2: Confirmation CTA */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pt-3 border-t border-slate-100">
                   <div className="text-[11px] text-slate-600 font-semibold">
-                    Mode aktif dipilih:{" "}
+                    Panel aktif dipilih:{" "}
                     <span className="font-black text-slate-900">
-                      {draftLayoutMode === "per_kategori"
-                        ? `Masing-Masing 1 Kategori (${(draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey)).filter((g) => draftScope === "all" || g.porsi === draftScope).length} Panel)`
-                        : draftScope === "kecil"
-                          ? `Gabung Porsi Kecil (${draftKecilIds.length} kategori)`
-                          : draftScope === "besar"
-                            ? `Gabung Porsi Besar (${draftBesarIds.length} kategori)`
-                            : `Gabung Semua Food Cost (${draftKecilIds.length} Kecil + ${draftBesarIds.length} Besar)`}
+                      {(draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey)).length} Panel Kategori Food Cost
                     </span>
                   </div>
                   <button
@@ -6319,12 +6495,11 @@ export default function FoodCostTab({
               resolvedCategoryEntries.length === 0 ? (
                 <div className="bg-slate-50 border-2 border-dashed border-slate-200 rounded-2xl p-8 text-center space-y-3">
                   <p className="text-xs font-bold text-slate-600">
-                    Tidak ada kategori Food Cost yang cocok dengan filter porsi saat ini.
+                    Belum ada kelompok sasaran Food Cost yang dipilih saat ini.
                   </p>
                   <button
                     type="button"
                     onClick={() => {
-                      handleSelectDraftScope("all");
                       setAppliedConfig((prev) => ({ ...prev, scope: "all", confirmed: true }));
                       handleResetToSingleCategories(false);
                     }}
@@ -6432,6 +6607,11 @@ export default function FoodCostTab({
                             <span className="text-slate-800 font-bold">{formatRupiah(Math.round(entryActualTotal))}</span>
                             {" · "}
                             Jumlah: <span className="text-slate-900 font-black">{entryPm} PM</span>
+                            {" · "}
+                            Menu:{" "}
+                            <span className="text-indigo-800 font-bold">
+                              {resolveCategoryMenuName(entry) || "-"}
+                            </span>
                           </p>
 
                           {isMergedEntry && (
@@ -7358,7 +7538,7 @@ export default function FoodCostTab({
                           LAPORAN KOMPONEN BAHAN BAKU &amp; FOOD COST - {entry.title.toUpperCase()}
                         </h3>
                         <p className="text-xs font-bold text-slate-700 uppercase">
-                          SIKLUS HARI KE-{selectedDay} ({selectedType}) | NAMA MENU: {namaMenuHariIni || "-"} | PORSI:{" "}
+                          SIKLUS HARI KE-{selectedDay} ({selectedType}) | NAMA MENU: {resolveCategoryMenuName(entry) || "-"} | PORSI:{" "}
                           {entry.porsi.toUpperCase()} | JUMLAH PM: {entryPm} ORANG
                         </p>
                       </div>
@@ -8174,14 +8354,23 @@ export default function FoodCostTab({
                 <button
                   type="button"
                   onClick={() => {
-                    updateDayData({ ...currentDayData, namaMenu: changeMenuNameInput.trim() });
+                    const nextName = changeMenuNameInput.trim();
+                    if (changeMenuModal.scope.startsWith("cat_")) {
+                      const entryId = changeMenuModal.scope.slice(4);
+                      updateCategoryEntry(entryId, (cur) => ({
+                        ...cur,
+                        customMenuName: nextName,
+                      }));
+                    } else {
+                      updateDayData({ ...currentDayData, namaMenu: nextName });
+                    }
                     const targetEl = document.getElementById(`fc-block-${changeMenuModal.scope}`);
                     setChangeMenuModal(null);
                     if (targetEl) targetEl.scrollIntoView({ behavior: "smooth", block: "start" });
                   }}
                   className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition cursor-pointer shrink-0"
                 >
-                  Simpan & Edit Bahan
+                  Simpan &amp; Edit Bahan
                 </button>
               </div>
             </div>
@@ -8282,90 +8471,43 @@ export default function FoodCostTab({
 
             <div className="space-y-3 bg-slate-50 p-4 rounded-2xl border border-slate-200/80 text-xs">
               <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-200">
-                <span className="font-bold text-slate-500 uppercase text-[10px]">Mode Tampilan:</span>
+                <span className="font-bold text-slate-500 uppercase text-[10px]">Tampilan &amp; Sinkronisasi:</span>
                 <span className="font-black text-slate-900">
-                  {draftLayoutMode === "per_kategori"
-                    ? "Masing-Masing 1 Kategori (Bisa Gabungan Pilihan)"
-                    : draftScope === "kecil"
-                      ? "Gabung Porsi Kecil"
-                      : draftScope === "besar"
-                        ? "Gabung Porsi Besar"
-                        : "Gabung Semua Porsi (Kecil & Besar)"}
+                  Per Kategori / Gabungan Pilihan (Tersinkron Master Menu)
                 </span>
               </div>
 
-              {draftLayoutMode === "per_kategori" ? (
-                (() => {
-                  const groups = (
-                    draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey)
-                  ).filter((g) => draftScope === "all" || g.porsi === draftScope);
-                  const totalPmPreview = groups.reduce(
-                    (sum, g) => sum + getEntryAutoPmCount(g.sasaranIds, g.porsi),
-                    0
-                  );
-                  return (
-                    <div className="space-y-1.5 max-h-48 overflow-y-auto">
-                      <div className="flex items-center justify-between">
-                        <span className="font-black text-emerald-800 uppercase text-[10px]">
-                          Panel Kategori Aktif ({groups.length})
-                        </span>
-                        <span className="font-mono font-bold text-emerald-800">{totalPmPreview} PM</span>
-                      </div>
-                      <div className="space-y-1">
-                        {groups.map((g) => (
-                          <div
-                            key={g.id}
-                            className="flex items-center justify-between bg-white px-2.5 py-1.5 rounded-lg border border-slate-200 text-[11px]"
-                          >
-                            <span className="font-bold text-slate-800">{g.title}</span>
-                            <span className="font-mono font-bold text-slate-600">
-                              {g.porsi === "besar" ? "Besar" : "Kecil"} · {getEntryAutoPmCount(g.sasaranIds, g.porsi)} PM
-                            </span>
-                          </div>
-                        ))}
-                      </div>
+              {(() => {
+                const groups =
+                  draftCategoryGroupsByGroup[activeGroupKey] || buildDefaultGroupsForTabGroup(activeGroupKey);
+                const totalPmPreview = groups.reduce(
+                  (sum, g) => sum + getEntryAutoPmCount(g.sasaranIds, g.porsi),
+                  0
+                );
+                return (
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                    <div className="flex items-center justify-between">
+                      <span className="font-black text-emerald-800 uppercase text-[10px]">
+                        Panel Kategori Aktif ({groups.length})
+                      </span>
+                      <span className="font-mono font-bold text-emerald-800">{totalPmPreview} PM</span>
                     </div>
-                  );
-                })()
-              ) : (
-                <>
-                  {(draftScope === "kecil" || draftScope === "all") && (
                     <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <span className="font-black text-indigo-800 uppercase text-[10px]">
-                          Kategori Porsi Kecil ({draftKecilIds.length})
-                        </span>
-                        <span className="font-mono font-bold text-indigo-800">
-                          {draftKecilIds.reduce((sum, id) => sum + getSasaranPmCount(id, "kecil"), 0)} PM
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-700 font-medium">
-                        {draftKecilIds.length > 0
-                          ? draftKecilIds.map((id) => getSasaranLabel(id)).join(", ")
-                          : "-"}
-                      </p>
+                      {groups.map((g) => (
+                        <div
+                          key={g.id}
+                          className="flex items-center justify-between bg-white px-2.5 py-1.5 rounded-lg border border-slate-200 text-[11px]"
+                        >
+                          <span className="font-bold text-slate-800">{g.title}</span>
+                          <span className="font-mono font-bold text-slate-600">
+                            {g.porsi === "besar" ? "Besar" : "Kecil"} · {getEntryAutoPmCount(g.sasaranIds, g.porsi)} PM
+                          </span>
+                        </div>
+                      ))}
                     </div>
-                  )}
-
-                  {(draftScope === "besar" || draftScope === "all") && (
-                    <div className="space-y-1 pt-1">
-                      <div className="flex items-center justify-between">
-                        <span className="font-black text-cyan-800 uppercase text-[10px]">
-                          Kategori Porsi Besar ({draftBesarIds.length})
-                        </span>
-                        <span className="font-mono font-bold text-cyan-800">
-                          {draftBesarIds.reduce((sum, id) => sum + getSasaranPmCount(id, "besar"), 0)} PM
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-700 font-medium">
-                        {draftBesarIds.length > 0
-                          ? draftBesarIds.map((id) => getSasaranLabel(id)).join(", ")
-                          : "-"}
-                      </p>
-                    </div>
-                  )}
-                </>
-              )}
+                  </div>
+                );
+              })()}
             </div>
 
             {selectedGroup !== "custom" && namaMenuHariIni && (

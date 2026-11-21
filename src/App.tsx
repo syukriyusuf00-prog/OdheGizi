@@ -3853,6 +3853,7 @@ export default function App() {
             foodCostDays={foodCostDays}
             tkpiList={tkpiList}
             masterMenu={masterMenu}
+            onMasterMenuChange={setMasterMenu}
             harianPM={harianPM}
             onFoodCostDaysChange={setFoodCostDays}
             profile={profile}
